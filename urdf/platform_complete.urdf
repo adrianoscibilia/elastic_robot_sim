@@ -1,0 +1,271 @@
+<?xacro version = "1.0"?>
+<robot name = "tecnobody" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <!-- Define PI constant -->
+  <xacro:property name="PI" value="3.141592653589793"/>
+  
+  <!-- Define materials -->
+  <material name="white">
+    <color rgba="1 1 1 1"/>
+  </material>
+
+  <material name="black">
+    <color rgba="0.1 0.1 0.1 1"/>
+  </material>
+
+  <material name= "red">
+    <color rgba="1 0 0 0"/>
+  </material>
+
+  <material name="grey_transparent">
+    <color rgba="0.5 0.5 0.5 0.4"/>
+  </material>
+
+  <!--Define parameters-->
+  <xacro:property name="radius" value="0.1"/>
+  <xacro:property name="col_height" value="2.5"/>
+  <xacro:property name="z_height" value="2"/>
+  <xacro:property name="beam_lenght" value="4"/>
+
+  <!-- Define world link -->
+  <link name="world"/>
+
+  <!--Define fixed structure links-->
+  <link name="col1">
+    <visual>
+      <geometry>
+        <cylinder length="${col_height}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="18.0"/><inertia ixx="9.59625" ixy="0" ixz="0" iyy="9.59625" iyz="0" izz="0.09"/></inertial>
+  </link>
+
+  <link name="col2">
+    <visual>
+      <geometry>
+        <cylinder length="${col_height}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="18.0"/><inertia ixx="9.59625" ixy="0" ixz="0" iyy="9.59625" iyz="0" izz="0.09"/></inertial>
+  </link>
+
+  <link name="col3">
+    <visual>
+      <geometry>
+        <cylinder length="${col_height}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="18.0"/><inertia ixx="9.59625" ixy="0" ixz="0" iyy="9.59625" iyz="0" izz="0.09"/></inertial>
+  </link>
+
+  <link name="beam0">
+    <visual>
+      <geometry>
+        <cylinder length="${beam_lenght}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="12.0"/><inertia ixx="16.03" ixy="0" ixz="0" iyy="16.03" iyz="0" izz="0.06"/></inertial>
+  </link>
+
+  <link name="beam1">
+    <visual>
+      <geometry>
+        <cylinder length="${beam_lenght}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="12.0"/><inertia ixx="16.03" ixy="0" ixz="0" iyy="16.03" iyz="0" izz="0.06"/></inertial>
+  </link>
+
+  <link name="beam2">
+    <visual>
+      <geometry>
+        <cylinder length="${beam_lenght}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="12.0"/><inertia ixx="16.03" ixy="0" ixz="0" iyy="16.03" iyz="0" izz="0.06"/></inertial>
+  </link>
+
+  <link name="beam3">
+    <visual>
+      <geometry>
+        <cylinder length="${beam_lenght}" radius="${radius}"/>
+      </geometry>
+      <material name="grey_transparent"/>
+    </visual>
+  <inertial><mass value="12.0"/><inertia ixx="16.03" ixy="0" ixz="0" iyy="16.03" iyz="0" izz="0.06"/></inertial>
+  </link>
+
+  <!-- Define base_link -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <cylinder length="${col_height}" radius="${radius}"/>
+      </geometry>
+      <material name="white"/>
+    </visual>
+  <inertial><mass value="20.0"/><inertia ixx="10.6625" ixy="0" ixz="0" iyy="10.6625" iyz="0" izz="0.1"/></inertial>
+  </link>
+
+  <!-- Define link1 -->
+  <link name="link1">
+    <visual>
+      <geometry>
+        <box size="0.1 0.1 0.1"/>
+      </geometry>
+      <material name="white"/>
+    </visual>
+  <inertial><mass value="0.2"/><inertia ixx="0.000333333333" ixy="0" ixz="0" iyy="0.000333333333" iyz="0" izz="0.000333333333"/></inertial>
+  </link>
+
+  <link name="link1_beam">
+    <visual>
+      <geometry>
+        <cylinder length="${beam_lenght}" radius="${radius}"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+  <inertial><mass value="0.6"/><inertia ixx="0.8015" ixy="0" ixz="0" iyy="0.8015" iyz="0" izz="0.003"/></inertial>
+  </link>
+
+  <!-- Define link2 -->
+  <link name="link2">
+    <visual>
+      <geometry>
+        <box size="0.1 0.1 0.1"/>
+      </geometry>
+      <material name="white"/>
+    </visual>
+  <inertial><mass value="0.2"/><inertia ixx="0.000333333333" ixy="0" ixz="0" iyy="0.000333333333" iyz="0" izz="0.000333333333"/></inertial>
+  </link>
+
+  <!-- Define link3 -->
+  <link name="link3">
+    <visual>
+      <geometry>
+        <cylinder length="${z_height}" radius="${radius}"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+  <inertial><mass value="0.97"/><inertia ixx="0.325925" ixy="0" ixz="0" iyy="0.325925" iyz="0" izz="0.00485"/></inertial>
+  </link>
+
+  <!--Define fixed structure joints-->
+  <joint name="col1_joint" type="fixed">
+    <parent link="world"/>
+    <child link="col1"/>
+    <origin xyz="${-beam_lenght} 0 0" rpy="0 0 ${PI/2.0}"/>
+  </joint>
+
+  <joint name="col2_joint" type="fixed">
+    <parent link="world"/>
+    <child link="col2"/>
+    <origin xyz="${-beam_lenght} ${-beam_lenght} 0" rpy="0 0 ${PI/2.0}"/>
+  </joint>
+
+  <joint name="col3_joint" type="fixed">
+    <parent link="world"/>
+    <child link="col3"/>
+    <origin xyz="0 ${-beam_lenght} 0" rpy="0 0 ${PI/2.0}"/>
+  </joint>
+
+  <joint name="beam0_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="beam0"/>
+    <origin xyz="0 ${-beam_lenght/2} ${col_height/2}" rpy="${PI/2.0} 0 0"/>
+  </joint>
+
+  <joint name="beam1_joint" type="fixed">
+    <parent link="col1"/>
+    <child link="beam1"/>
+    <origin xyz="${-beam_lenght/2} 0 ${col_height/2}" rpy="0 ${PI/2.0} 0"/>
+  </joint>
+
+  <joint name="beam2_joint" type="fixed">
+    <parent link="col2"/>
+    <child link="beam2"/>
+    <origin xyz="0 ${-beam_lenght/2} ${col_height/2}" rpy="${PI/2.0} 0 0"/>
+  </joint>
+
+  <joint name="beam3_joint" type="fixed">
+    <parent link="col3"/>
+    <child link="beam3"/>
+    <origin xyz="${beam_lenght/2} 0 ${col_height/2}" rpy="0 ${PI/2.0} 0"/>
+  </joint>
+
+  <!-- Define active joints -->
+  <joint name="base2world" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 ${-PI/2.0}"/>
+  </joint>
+
+  <joint name="joint_y" type="prismatic">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 ${-beam_lenght/2} ${col_height/2}" rpy="${-PI/2.0} 0 ${PI}"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="${-beam_lenght/2+2*radius}" upper="${beam_lenght/2-2*radius}" effort="1000" velocity="1" acceleration="0.5"/>
+  </joint>
+
+  <joint name="joint_y_fixed" type="fixed">
+    <parent link="link1"/>
+    <child link="link1_beam"/>
+    <origin xyz="-${beam_lenght/2} 0 0" rpy="0 ${PI/2.0} ${PI}"/>
+  </joint>
+
+  <joint name="joint_x" type="prismatic">
+    <parent link="link1_beam"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="${-beam_lenght/2+2*radius}" upper="${beam_lenght/2-2*radius}" effort="1000" velocity="1" acceleration="0.5"/>
+  </joint>
+
+  <joint name="joint_z" type="prismatic">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0 0 0" rpy="-${PI/2.0} 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="${-z_height/2}" upper="${z_height/2}" effort="1000" velocity="1" acceleration="0.5"/>
+  </joint>
+
+  <joint name="flange_joint" type="fixed">
+    <parent link="link3"/>
+    <child link="flange_link"/>
+    <origin xyz="0 0 ${-z_height/2}" rpy="0 ${PI} ${-PI/2.0}"/>
+  </joint>
+
+  <joint name="joint_yaw" type="revolute">
+    <parent link="flange_link"/>
+    <child link="ft_link"/>
+    <origin xyz="0 0 0.04" rpy="0 0 ${PI}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-${PI}" upper="${PI}" effort="1000" velocity="1"/>
+  </joint>
+
+  <!-- Inertial definitions for end-effector links -->
+  <link name="flange_link">
+  <inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  </link>
+
+  <link name="ft_link">
+  <inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  </link>
+
+  <link name="ee_link">
+  <inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  </link>
+
+  <joint name="ee_joint" type="fixed">
+    <parent link="ft_link"/>
+    <child link="ee_link"/>
+    <origin xyz="0 0 0.07" rpy="0 0 0"/>
+  </joint>
+
+</robot>
