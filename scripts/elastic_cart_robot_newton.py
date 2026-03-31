@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import re
 from datetime import datetime
@@ -56,11 +57,11 @@ SEED = settings["simulation"]["seed"]
 CUT_OFF_TIME = settings["simulation"]["cut_off_time"]
 
 DRIVE_X_STIFFNESS = settings["elastic_drives"]["drive_x"]["stiffness"]
-DRIVE_X_DAMPING = settings["elastic_drives"]["drive_x"]["damping"]
+DRIVE_X_DAMPING_RATIO = settings["elastic_drives"]["drive_x"]["damping_ratio"]
 DRIVE_Y_STIFFNESS = settings["elastic_drives"]["drive_y"]["stiffness"]
-DRIVE_Y_DAMPING = settings["elastic_drives"]["drive_y"]["damping"]
+DRIVE_Y_DAMPING_RATIO = settings["elastic_drives"]["drive_y"]["damping_ratio"]
 DRIVE_Z_STIFFNESS = settings["elastic_drives"]["drive_z"]["stiffness"]
-DRIVE_Z_DAMPING = settings["elastic_drives"]["drive_z"]["damping"]
+DRIVE_Z_DAMPING_RATIO = settings["elastic_drives"]["drive_z"]["damping_ratio"]
 PAYLOAD = settings["elastic_drives"]["payload"]
 PAYLOAD_BOX_SIZE = 0.15
 
@@ -75,6 +76,18 @@ MASS_LINK_Y_MOTOR = 1.5
 MASS_LINK_Y = 2.0
 MASS_LINK_Z_MOTOR = 0.5
 MASS_LINK_Z = 0.5
+
+# Approximate moving masses seen by each elastic axis, used to convert the
+# damping ratio into a physical damping coefficient via d = 2 * zeta * sqrt(k * m).
+EFFECTIVE_AXIS_MASS = {
+    "x": 1.2,
+    "y": 1.8,
+    "z": 1.0,
+}
+
+DRIVE_X_DAMPING = 2.0 * DRIVE_X_DAMPING_RATIO * math.sqrt(DRIVE_X_STIFFNESS * EFFECTIVE_AXIS_MASS["x"])
+DRIVE_Y_DAMPING = 2.0 * DRIVE_Y_DAMPING_RATIO * math.sqrt(DRIVE_Y_STIFFNESS * EFFECTIVE_AXIS_MASS["y"])
+DRIVE_Z_DAMPING = 2.0 * DRIVE_Z_DAMPING_RATIO * math.sqrt(DRIVE_Z_STIFFNESS * EFFECTIVE_AXIS_MASS["z"])
 
 URDF_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "urdf", "platform_complete.urdf")
 
@@ -150,12 +163,13 @@ def debug_kinematics(ref_pos, ref_vel, pos, vel, time):
     plt.tight_layout()
 
 
-def debug_dynamics(tau_x, tau_y, tau_z, tau_x_nom, tau_y_nom, tau_z_nom, time):
+def debug_dynamics(tau_x, tau_y, tau_z, time, tau_x_nom, tau_y_nom, tau_z_nom, plot_nominal=False):
     plt.figure(figsize=(12, 4))
 
     plt.subplot(1, 3, 1)
     plt.plot(time, tau_x, label="Tau X")
-    plt.plot(time, tau_x_nom, label="Tau X (Nominal)", linestyle="dashed")
+    if plot_nominal:
+        plt.plot(time, tau_x_nom, label="Tau X (Nominal)", linestyle="dashed")
     plt.title("Torque - X")
     plt.ylabel("Torque (N*m)")
     plt.legend()
@@ -163,7 +177,8 @@ def debug_dynamics(tau_x, tau_y, tau_z, tau_x_nom, tau_y_nom, tau_z_nom, time):
 
     plt.subplot(1, 3, 2)
     plt.plot(time, tau_y, label="Tau Y")
-    plt.plot(time, tau_y_nom, label="Tau Y (Nominal)", linestyle="dashed")
+    if plot_nominal:
+        plt.plot(time, tau_y_nom, label="Tau Y (Nominal)", linestyle="dashed")
     plt.title("Torque - Y")
     plt.ylabel("Torque (N*m)")
     plt.legend()
@@ -171,7 +186,8 @@ def debug_dynamics(tau_x, tau_y, tau_z, tau_x_nom, tau_y_nom, tau_z_nom, time):
 
     plt.subplot(1, 3, 3)
     plt.plot(time, tau_z, label="Tau Z")
-    plt.plot(time, tau_z_nom, label="Tau Z (Nominal)", linestyle="dashed")
+    if plot_nominal:
+        plt.plot(time, tau_z_nom, label="Tau Z (Nominal)", linestyle="dashed")
     plt.title("Torque - Z")
     plt.ylabel("Torque (N*m)")
     plt.legend()

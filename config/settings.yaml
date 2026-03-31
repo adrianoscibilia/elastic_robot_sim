@@ -1,17 +1,17 @@
 elastic_drives:
   drive_x:
-    damping: 82.68
+    damping_ratio: 0.49
     stiffness: 5977.08
   drive_y:
-    damping: 154.18
+    damping_ratio: 0.68
     stiffness: 7162.08
   drive_z:
-    damping: 148.82
+    damping_ratio: 1.20
     stiffness: 3861.11
   payload: 3.0
 simulation:
-  ref_mode: 2
-  seed: 1076
-  sim_time: 40.0
+  ref_mode: 2 # 0: stand_still, 1: sinusoidal, 2: PTP sequence
+  seed: -1 # -1 for random seed, otherwise specify an integer
+  sim_time: 10.0
   time_step: 0.01
   cut_off_time: 2.0

@@ -42,22 +42,22 @@ STIFFNESS_INTERVALS = {
     "joint_z": (2500.0, 7000.0),
 }
 
-# Approximate moving masses seen by each elastic axis from the current URDF and
-# Newton model structure. These are used only to sample physically consistent
-# damping values via c = 2 * zeta * sqrt(k * m).
-EFFECTIVE_AXIS_MASS = {
-    "joint_x": 1.2,
-    "joint_y": 1.8,
-    "joint_z": 1.0,
-}
-
 # Sample damping ratios rather than raw damping values so the resulting robot
 # configurations span underdamped to slightly overdamped responses in a more
-# meaningful way.
+# meaningful way.  The actual damping coefficient is computed at simulation time
+# inside elastic_cart_robot_newton.py via d = 2 * zeta * sqrt(k * m).
 DAMPING_RATIO_INTERVALS = {
     "joint_x": (0.45, 1.05),
     "joint_y": (0.45, 1.05),
     "joint_z": (0.55, 1.20),
+}
+
+# Mapping from internal joint names to the config drive keys expected by
+# elastic_cart_robot_newton.py.
+JOINT_TO_DRIVE = {
+    "joint_x": "drive_x",
+    "joint_y": "drive_y",
+    "joint_z": "drive_z",
 }
 
 PAYLOAD_INTERVAL = (0.0, 6.0)
@@ -80,10 +80,8 @@ def sample_stiffness(axis_name):
     return 10.0 ** RNG.uniform(math.log10(lower), math.log10(upper))
 
 
-def sample_damping(axis_name, stiffness):
-    zeta = sample_uniform(DAMPING_RATIO_INTERVALS[axis_name])
-    mass = EFFECTIVE_AXIS_MASS[axis_name]
-    return 2.0 * zeta * math.sqrt(stiffness * mass)
+def sample_damping_ratio(axis_name):
+    return sample_uniform(DAMPING_RATIO_INTERVALS[axis_name])
 
 
 def build_payload_levels():
@@ -129,11 +127,11 @@ def main():
             robot_params = {}
             for jname in joint_names:
                 k = round(sample_stiffness(jname), 2)
-                d = round(sample_damping(jname, k), 2)
-                robot_params[jname] = {"stiffness": k, "damping": d}
+                zeta = round(sample_damping_ratio(jname), 4)
+                robot_params[jname] = {"stiffness": k, "damping_ratio": zeta}
 
             param_str = " ".join(
-                f"{jn}=(k={robot_params[jn]['stiffness']:.2f}, d={robot_params[jn]['damping']:.2f})"
+                f"{jn}=(k={robot_params[jn]['stiffness']:.2f}, zeta={robot_params[jn]['damping_ratio']:.4f})"
                 for jn in joint_names
             )
             print(f"\nRobot {robot_idx + 1}/{ROBOT_CONFIG_COUNT}: {param_str}")
@@ -144,10 +142,9 @@ def main():
             for trial_idx, (payload, ref_mode) in enumerate(trial_plan):
                 config = copy.deepcopy(base_config)
 
-                if "joints" not in config["elastic_drives"]:
-                    config["elastic_drives"]["joints"] = {}
                 for jname in joint_names:
-                    config["elastic_drives"]["joints"][jname] = robot_params[jname]
+                    drive_key = JOINT_TO_DRIVE[jname]
+                    config["elastic_drives"][drive_key] = robot_params[jname]
 
                 config["elastic_drives"]["payload"] = payload
                 config["simulation"]["ref_mode"] = ref_mode
