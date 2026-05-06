@@ -1226,10 +1226,10 @@ def main():
             np.array(tau_plt)[:, 0],
             np.array(tau_plt)[:, 1],
             np.array(tau_plt)[:, 2],
+            time_history,
             np.array(tau_nom_plt)[:, 0],
             np.array(tau_nom_plt)[:, 1],
             np.array(tau_nom_plt)[:, 2],
-            time_history,
         )
         plt.show()
 

@@ -10,6 +10,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 newton_python = os.path.join(
     project_root,
     "..",
+    "venvs",
     "env_newton",
     "Scripts",
     "python.exe",
@@ -26,8 +27,6 @@ settings_file = os.path.join(
     "config",
     "settings.yaml",
 )
-
-warp_cache_path = os.path.join(project_root, ".warp_cache_newton")
 
 # -----------------------------
 # Parameter intervals
@@ -63,9 +62,9 @@ JOINT_TO_DRIVE = {
 PAYLOAD_INTERVAL = (0.0, 6.0)
 REF_MODES = [1, 2]  # 1 sinusoidal, 2 ptp
 RNG = random.Random(42)
-ROBOT_CONFIG_COUNT = 100
+ROBOT_CONFIG_COUNT = 10
 TRIALS_PER_ROBOT = 10
-PAYLOAD_LEVEL_COUNT = 5
+PAYLOAD_LEVEL_COUNT = 0
 
 
 def sample_uniform(interval):
@@ -93,10 +92,16 @@ def build_payload_levels():
 
 
 def build_trial_plan():
-    payload_levels = build_payload_levels()
     plan = []
-    for payload in payload_levels:
-        for ref_mode in REF_MODES:
+    if PAYLOAD_LEVEL_COUNT != 0:
+        payload_levels = build_payload_levels()
+        for payload in payload_levels:
+            for ref_mode in REF_MODES:
+                plan.append((payload, ref_mode))
+    else:
+        for _ in range(TRIALS_PER_ROBOT):
+            payload = 0.0
+            ref_mode = RNG.choice(REF_MODES)
             plan.append((payload, ref_mode))
     if len(plan) != TRIALS_PER_ROBOT:
         raise ValueError(
@@ -115,9 +120,7 @@ N_EXPERIMENTS = ROBOT_CONFIG_COUNT * TRIALS_PER_ROBOT
 
 def main():
     subprocess_env = os.environ.copy()
-    subprocess_env["WARP_CACHE_PATH"] = warp_cache_path
 
-    os.makedirs(warp_cache_path, exist_ok=True)
     trial_plan_template = build_trial_plan()
 
     try:
