@@ -1,0 +1,121 @@
+<!--
+  MJCF template for the elastic cart robot (MuJoCo backend).
+
+  This file is NOT loaded directly by MuJoCo. It is read by
+  elastic_cart_robot_mujoco.py, which replaces every $PLACEHOLDER
+  (written as NAME in this file) with a value derived from
+  settings.yaml / sim_common.py, then passes the result to
+  mujoco.MjModel.from_xml_string().
+
+  Parameters substituted at load time
+  ─────────────────────────────────────────────────────────────────
+  timestep            simulation time step (s)
+  xy_range            joint range for X and Y slides, e.g. "-1.8 1.8"
+  z_range             joint range for Z slide,  e.g. "-1.0 1.0"
+
+  mass_link_x_motor / inertia_x_motor   X motor link mass and inertia diagonal
+  mass_link_x       / inertia_x         X elastic link
+  mass_link_y_motor / inertia_y_motor   Y motor link
+  mass_link_y       / inertia_y         Y elastic link
+  mass_link_z_motor / inertia_z_motor   Z motor link
+  mass_link_z       / inertia_z         Z elastic link
+
+  drive_x_stiffness / drive_x_damping   elastic joint X spring/damper
+  drive_y_stiffness / drive_y_damping   elastic joint Y spring/damper
+  drive_z_stiffness / drive_z_damping   elastic joint Z spring/damper
+
+  motor_kp            PD position gain  (actuator gainprm)
+  motor_kd            PD velocity gain  (actuator biasprm)
+  motor_flim          actuator force limit
+
+  payload_body        optional <body name="payload">...</body> block, or empty
+-->
+<mujoco model="elastic_cart">
+
+  <option timestep="{timestep}" gravity="0 0 -9.81" integrator="implicitfast"/>
+
+  <worldbody>
+
+    <!-- ── X axis ─────────────────────────────────────────────────── -->
+    <body name="link_x_motor">
+      <joint name="joint_x_motor" type="slide" axis="1 0 0"
+             range="{xy_range}" damping="0"/>
+      <inertial mass="{mass_link_x_motor}" pos="0 0 0"
+                diaginertia="{inertia_x_motor} {inertia_x_motor} {inertia_x_motor}"/>
+      <geom type="box" size="0.10 0.10 0.10"
+            rgba="0.3 0.5 0.8 0.9" contype="0" conaffinity="0"/>
+
+      <body name="link_x">
+        <joint name="joint_x_elastic" type="slide" axis="1 0 0"
+               stiffness="{drive_x_stiffness}" damping="{drive_x_damping}"/>
+        <inertial mass="{mass_link_x}" pos="0 0 0"
+                  diaginertia="{inertia_x} {inertia_x} {inertia_x}"/>
+        <geom type="box" size="0.09 0.09 0.09"
+              rgba="0.4 0.7 0.9 0.9" contype="0" conaffinity="0"/>
+
+        <!-- ── Y axis ───────────────────────────────────────────── -->
+        <body name="link_y_motor">
+          <joint name="joint_y_motor" type="slide" axis="0 1 0"
+                 range="{xy_range}" damping="0"/>
+          <inertial mass="{mass_link_y_motor}" pos="0 0 0"
+                    diaginertia="{inertia_y_motor} {inertia_y_motor} {inertia_y_motor}"/>
+          <geom type="box" size="0.08 0.08 0.08"
+                rgba="0.6 0.3 0.8 0.9" contype="0" conaffinity="0"/>
+
+          <body name="link_y">
+            <joint name="joint_y_elastic" type="slide" axis="0 1 0"
+                   stiffness="{drive_y_stiffness}" damping="{drive_y_damping}"/>
+            <inertial mass="{mass_link_y}" pos="0 0 0"
+                      diaginertia="{inertia_y} {inertia_y} {inertia_y}"/>
+            <geom type="box" size="0.07 0.07 0.07"
+                  rgba="0.7 0.5 0.9 0.9" contype="0" conaffinity="0"/>
+
+            <!-- ── Z axis ─────────────────────────────────────── -->
+            <body name="link_z_motor">
+              <joint name="joint_z_motor" type="slide" axis="0 0 1"
+                     range="{z_range}" damping="0"/>
+              <inertial mass="{mass_link_z_motor}" pos="0 0 0"
+                        diaginertia="{inertia_z_motor} {inertia_z_motor} {inertia_z_motor}"/>
+              <geom type="box" size="0.06 0.06 0.06"
+                    rgba="0.9 0.5 0.3 0.9" contype="0" conaffinity="0"/>
+
+              <body name="link_z">
+                <joint name="joint_z_elastic" type="slide" axis="0 0 1"
+                       stiffness="{drive_z_stiffness}" damping="{drive_z_damping}"/>
+                <inertial mass="{mass_link_z}" pos="0 0 0"
+                          diaginertia="{inertia_z} {inertia_z} {inertia_z}"/>
+                <geom type="box" size="0.05 0.05 0.05"
+                      rgba="0.9 0.8 0.3 0.9" contype="0" conaffinity="0"/>
+                {payload_body}
+              </body>
+
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+  </worldbody>
+
+  <!--
+    PD actuators on motor joints.
+    Force = motor_kp * (ctrl - q) - motor_kd * qd
+    Velocity feedforward: ctrl = pos_ref + (motor_kd / motor_kp) * vel_ref
+    → Force = motor_kp * (pos_ref - q) + motor_kd * (vel_ref - qd)
+  -->
+  <actuator>
+    <general name="act_x" joint="joint_x_motor"
+             gaintype="fixed"  gainprm="{motor_kp}"
+             biastype="affine" biasprm="0 -{motor_kp} -{motor_kd}"
+             forcerange="-{motor_flim} {motor_flim}"/>
+    <general name="act_y" joint="joint_y_motor"
+             gaintype="fixed"  gainprm="{motor_kp}"
+             biastype="affine" biasprm="0 -{motor_kp} -{motor_kd}"
+             forcerange="-{motor_flim} {motor_flim}"/>
+    <general name="act_z" joint="joint_z_motor"
+             gaintype="fixed"  gainprm="{motor_kp}"
+             biastype="affine" biasprm="0 -{motor_kp} -{motor_kd}"
+             forcerange="-{motor_flim} {motor_flim}"/>
+  </actuator>
+
+</mujoco>
