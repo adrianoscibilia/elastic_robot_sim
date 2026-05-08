@@ -11,7 +11,7 @@ elastic_drives:
   payload: 0.0
 simulation:
   ref_mode: 2
-  seed: 1345
+  seed: -1
   sim_time: 15.0
   time_step: 0.01
   cut_off_time: 2.0

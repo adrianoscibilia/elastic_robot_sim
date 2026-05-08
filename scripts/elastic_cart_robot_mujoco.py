@@ -23,9 +23,11 @@ Run with:
 import argparse
 import os
 import sys
+import time
 
 import matplotlib.pyplot as plt
 import mujoco
+import mujoco.viewer
 import numpy as np
 import pandas as pd
 
@@ -269,7 +271,16 @@ def main():
     # Simulation loop (with optional passive viewer)
     # ------------------------------------------------------------------
     def _run_loop(viewer=None):
-        for _ in range(num_steps):
+        if viewer is not None:
+            # Give the viewer thread time to finish initializing the GLFW
+            # window before we start querying is_running() or calling sync().
+            time.sleep(0.2)
+
+        wall_start = time.perf_counter()
+        for step_idx in range(num_steps):
+            # Stop early if the viewer window is closed by the user
+            if viewer is not None and not viewer.is_running():
+                break
             t = float(data.time)
 
             # ── Read & noise state ───────────────────────────────────
@@ -336,9 +347,16 @@ def main():
             ref_vel = np.array([vel_x, vel_y, vel_z])
             tau_nominal = stiffness_vector * (ref_pos - q_link) + damping_vector * (ref_vel - dq_link)
 
-            # ── Viewer sync ─────────────────────────────────────────
+            # ── Viewer sync + real-time pacing ──────────────────────
             if viewer is not None:
                 viewer.sync()
+                # Sleep for the remainder of the current timestep so that
+                # the viewer renders at roughly real-time speed.
+                elapsed = time.perf_counter() - wall_start
+                sim_time_target = (step_idx + 1) * TIME_STEP
+                sleep_dt = sim_time_target - elapsed
+                if sleep_dt > 0:
+                    time.sleep(sleep_dt)
 
             # ── Record ──────────────────────────────────────────────
             if t >= CUT_OFF_TIME:
@@ -373,9 +391,14 @@ def main():
         try:
             with mujoco.viewer.launch_passive(model, data) as viewer:
                 _run_loop(viewer=viewer)
-        except AttributeError:
-            # mujoco.viewer not available (older build or no display)
-            print("MuJoCo viewer not available, running headless.")
+                # Simulation finished — keep the window open so the user can
+                # inspect the final state.  Close the window to continue.
+                print("Simulation complete. Close the viewer window to exit.")
+                while viewer.is_running():
+                    viewer.sync()
+                    time.sleep(0.1)
+        except Exception as exc:
+            print(f"MuJoCo viewer unavailable ({type(exc).__name__}: {exc}), running headless.")
             _run_loop(viewer=None)
 
     # ------------------------------------------------------------------
