@@ -40,6 +40,20 @@ def _load_settings():
         return yaml.load(f, Loader=SafeLoader)
 
 
+def _get_z_stiffness(settings: dict) -> float:
+    """Read Z-axis stiffness from settings.yaml regardless of format."""
+    drives = settings["elastic_drives"]
+    # New format: elastic_drives.joints.joint_z.stiffness
+    joints = drives.get("joints", {})
+    if "joint_z" in joints:
+        return float(joints["joint_z"]["stiffness"])
+    # Current format: elastic_drives.drive_z.stiffness
+    if "drive_z" in drives:
+        return float(drives["drive_z"]["stiffness"])
+    # Fallback: top-level defaults block
+    return float(drives.get("defaults", {}).get("stiffness", 5000.0))
+
+
 def _configure_robot_module(settings, payload):
     robot_sim.SIM_TIME = SIM_TIME_SECONDS
     robot_sim.TIME_STEP = settings["simulation"]["time_step"]
@@ -128,13 +142,13 @@ def _measure_static_deflection(payload):
         "equilibrium_std_m": equilibrium_std,
         "equilibrium_velocity_rms_m_s": equilibrium_velocity_rms,
         "all_finite": bool(np.all(np.isfinite(z_positions)) and np.all(np.isfinite(z_velocities))),
-        "stiffness_n_m": float(settings["elastic_drives"].get("joints", {}).get("joint_z", settings["elastic_drives"]["defaults"])["stiffness"]),
+        "stiffness_n_m": _get_z_stiffness(settings),
     }
 
 
 def main():
     settings = _load_settings()
-    stiffness = float(settings["elastic_drives"].get("joints", {}).get("joint_z", settings["elastic_drives"]["defaults"])["stiffness"])
+    stiffness = _get_z_stiffness(settings)
 
     print("Vertical deflection payload sweep")
     print("=" * 72)

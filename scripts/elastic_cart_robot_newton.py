@@ -88,6 +88,12 @@ SHOW_PLOT = args.plot
 HEADLESS = args.headless
 SHOW_GROUND = args.show_ground
 
+# Placeholders settable by tests / external callers for per-axis overrides.
+# The simulation ignores these when empty; the elastic parameters are read from
+# sim_common globals (which are loaded from config/settings.yaml).
+ELASTIC_DEFAULTS: dict = {}
+ELASTIC_JOINT_OVERRIDES: dict = {}
+
 
 def _configure_solver_check(solver):
     """Check if solver needs explicit IK evaluation."""
@@ -616,23 +622,24 @@ def _build_platform_from_urdf():
     target_builder.add_ground_plane(height=ground_height, cfg=ground_cfg, label="ground")
 
     axis_meta = {
-        "x": {"motor_joint": "joint_x", "elastic_joint": "elastic_joint_x"},
-        "y": {"motor_joint": "joint_y", "elastic_joint": "elastic_joint_y"},
-        "z": {"motor_joint": "joint_z", "elastic_joint": "elastic_joint_z"},
+        "joint_x": {"motor_joint": "joint_x", "elastic_joint": "elastic_joint_x"},
+        "joint_y": {"motor_joint": "joint_y", "elastic_joint": "elastic_joint_y"},
+        "joint_z": {"motor_joint": "joint_z", "elastic_joint": "elastic_joint_z"},
     }
 
     dof_index_map = {}
-    for axis_name, labels in axis_meta.items():
+    for joint_name, labels in axis_meta.items():
         motor_joint_idx = joint_index_map[labels["motor_joint"]]
         elastic_joint_idx = joint_index_map[labels["elastic_joint"]]
-        dof_index_map[axis_name] = {
+        dof_index_map[joint_name] = {
             "motor": target_builder.joint_qd_start[motor_joint_idx],
             "elastic": target_builder.joint_qd_start[elastic_joint_idx],
         }
 
     model = target_builder.finalize()
     model.set_gravity((0.0, 0.0, -9.81))
-    return model, dof_index_map
+    joint_names = ["joint_x", "joint_y", "joint_z"]
+    return model, dof_index_map, joint_names
 
 
 def _new_solver(model):
@@ -723,7 +730,7 @@ def build_model():
 
 def main():
     seed = set_random_seed(SEED)
-    model, dof_index_map = build_model()
+    model, dof_index_map, _joint_names = build_model()
     reference_limits = _reference_limits_from_model(model)
     _request_effort_state_attributes(model)
 
@@ -761,9 +768,9 @@ def main():
     initial_joint_q = _get_numpy(state_in.joint_q).reshape(-1)
     initial_motor_reference = np.array(
         [
-            float(initial_joint_q[dof_index_map["x"]["motor"]]),
-            float(initial_joint_q[dof_index_map["y"]["motor"]]),
-            float(initial_joint_q[dof_index_map["z"]["motor"]]),
+            float(initial_joint_q[dof_index_map["joint_x"]["motor"]]),
+            float(initial_joint_q[dof_index_map["joint_y"]["motor"]]),
+            float(initial_joint_q[dof_index_map["joint_z"]["motor"]]),
         ],
         dtype=float,
     )
@@ -820,33 +827,33 @@ def main():
         dq_meas = dq + np.random.normal(0.0, ENCODER_NOISE_VEL, size=dq.shape)
         q_motor = np.array(
             [
-                q_meas[dof_index_map["x"]["motor"]],
-                q_meas[dof_index_map["y"]["motor"]],
-                q_meas[dof_index_map["z"]["motor"]],
+                q_meas[dof_index_map["joint_x"]["motor"]],
+                q_meas[dof_index_map["joint_y"]["motor"]],
+                q_meas[dof_index_map["joint_z"]["motor"]],
             ],
             dtype=float,
         )
         q_link = np.array(
             [
-                q_meas[dof_index_map["x"]["elastic"]],
-                q_meas[dof_index_map["y"]["elastic"]],
-                q_meas[dof_index_map["z"]["elastic"]],
+                q_meas[dof_index_map["joint_x"]["elastic"]],
+                q_meas[dof_index_map["joint_y"]["elastic"]],
+                q_meas[dof_index_map["joint_z"]["elastic"]],
             ],
             dtype=float,
         )
         dq_motor = np.array(
             [
-                dq_meas[dof_index_map["x"]["motor"]],
-                dq_meas[dof_index_map["y"]["motor"]],
-                dq_meas[dof_index_map["z"]["motor"]],
+                dq_meas[dof_index_map["joint_x"]["motor"]],
+                dq_meas[dof_index_map["joint_y"]["motor"]],
+                dq_meas[dof_index_map["joint_z"]["motor"]],
             ],
             dtype=float,
         )
         dq_link = np.array(
             [
-                dq_meas[dof_index_map["x"]["elastic"]],
-                dq_meas[dof_index_map["y"]["elastic"]],
-                dq_meas[dof_index_map["z"]["elastic"]],
+                dq_meas[dof_index_map["joint_x"]["elastic"]],
+                dq_meas[dof_index_map["joint_y"]["elastic"]],
+                dq_meas[dof_index_map["joint_z"]["elastic"]],
             ],
             dtype=float,
         )
@@ -871,12 +878,12 @@ def main():
 
         joint_targets[:] = 0.0
         joint_target_velocities[:] = 0.0
-        joint_targets[dof_index_map["x"]["motor"]] = ref_x
-        joint_targets[dof_index_map["y"]["motor"]] = ref_y
-        joint_targets[dof_index_map["z"]["motor"]] = ref_z
-        joint_target_velocities[dof_index_map["x"]["motor"]] = vel_x
-        joint_target_velocities[dof_index_map["y"]["motor"]] = vel_y
-        joint_target_velocities[dof_index_map["z"]["motor"]] = vel_z
+        joint_targets[dof_index_map["joint_x"]["motor"]] = ref_x
+        joint_targets[dof_index_map["joint_y"]["motor"]] = ref_y
+        joint_targets[dof_index_map["joint_z"]["motor"]] = ref_z
+        joint_target_velocities[dof_index_map["joint_x"]["motor"]] = vel_x
+        joint_target_velocities[dof_index_map["joint_y"]["motor"]] = vel_y
+        joint_target_velocities[dof_index_map["joint_z"]["motor"]] = vel_z
         getattr(control, control_target_attr).assign(joint_targets)
         control.joint_target_vel.assign(joint_target_velocities)
 
@@ -898,17 +905,17 @@ def main():
         )
         tau_motor = np.array(
             [
-                tau_meas[dof_index_map["x"]["motor"]],
-                tau_meas[dof_index_map["y"]["motor"]],
-                tau_meas[dof_index_map["z"]["motor"]],
+                tau_meas[dof_index_map["joint_x"]["motor"]],
+                tau_meas[dof_index_map["joint_y"]["motor"]],
+                tau_meas[dof_index_map["joint_z"]["motor"]],
             ],
             dtype=float,
         )
         tau_link = np.array(
             [
-                tau_meas[dof_index_map["x"]["elastic"]],
-                tau_meas[dof_index_map["y"]["elastic"]],
-                tau_meas[dof_index_map["z"]["elastic"]],
+                tau_meas[dof_index_map["joint_x"]["elastic"]],
+                tau_meas[dof_index_map["joint_y"]["elastic"]],
+                tau_meas[dof_index_map["joint_z"]["elastic"]],
             ],
             dtype=float,
         )
