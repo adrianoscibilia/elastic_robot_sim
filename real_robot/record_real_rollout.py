@@ -10,7 +10,7 @@ The node:
   1. Loads a saved TrajectoryConfig (produced by the calibration framework).
   2. Samples the trajectory onto the configured time grid and sends it to
      joint_trajectory_controller via the FollowJointTrajectory action.
-  3. Subscribes to /joint_states and /ft_sensor/wrench.
+  3. Subscribes to /joint_states and /ft_sensor_command_broadcaster/wrench.
   4. Resamples both streams onto the common time grid.
   5. Writes real.parquet + meta.json under the output directory.
 
@@ -39,8 +39,9 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.action import ActionClient
+    from builtin_interfaces.msg import Duration
     from control_msgs.action import FollowJointTrajectory
-    from trajectory_msgs.msg import JointTrajectoryPoint
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from sensor_msgs.msg import JointState
     from geometry_msgs.msg import WrenchStamped
     _HAS_ROS = True
@@ -75,7 +76,7 @@ if _HAS_ROS:
             self,
             traj_config: TrajectoryConfig,
             output_dir: str,
-            ft_topic: str = "/ft_sensor/wrench",
+            ft_topic: str = "/ft_sensor_command_broadcaster/wrench",
         ) -> None:
             super().__init__("real_robot_recorder")
             self._traj_config = traj_config
@@ -137,9 +138,6 @@ if _HAS_ROS:
             n = int(np.ceil(self._traj_config.sim_time / dt))
             times = np.arange(n) * dt
 
-            from control_msgs.action import FollowJointTrajectory as FJT
-            from trajectory_msgs.msg import JointTrajectory
-
             jt = JointTrajectory()
             jt.joint_names = JOINT_NAMES
             for t_s in times:
@@ -149,14 +147,13 @@ if _HAS_ROS:
                 pt.velocities = dq.tolist()
                 sec = int(t_s)
                 nanosec = int((t_s - sec) * 1e9)
-                from builtin_interfaces.msg import Duration
                 dur = Duration()
                 dur.sec = sec
                 dur.nanosec = nanosec
                 pt.time_from_start = dur
                 jt.points.append(pt)
 
-            goal = FJT.Goal()
+            goal = FollowJointTrajectory.Goal()
             goal.trajectory = jt
 
             self._t0 = self.get_clock().now().nanoseconds * 1e-9
@@ -279,7 +276,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--ft-topic", default="/ft_sensor/wrench",
+        "--ft-topic", default="/ft_sensor_command_broadcaster/wrench",
         help="ROS 2 topic for force/torque data.",
     )
     parser.add_argument(
