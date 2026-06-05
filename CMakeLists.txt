@@ -15,12 +15,15 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
-# Install ROS 2 executables:
-#   ros2 run elastic_robot_sim record_real_rollout.py  — single trajectory
-#   ros2 run elastic_robot_sim collect_dataset         — full dataset collection loop
-install(PROGRAMS
-  real_robot/record_real_rollout.py
-  scripts/collect_dataset.py
+# Install ROS 2 executables without the .py suffix (ros2 run matches by exact name):
+#   ros2 run elastic_robot_sim record_real_rollout  — single trajectory
+#   ros2 run elastic_robot_sim collect_dataset      — full dataset collection loop
+install(PROGRAMS real_robot/record_real_rollout.py
+  RENAME record_real_rollout
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(PROGRAMS scripts/collect_dataset.py
+  RENAME collect_dataset
   DESTINATION lib/${PROJECT_NAME}
 )
 

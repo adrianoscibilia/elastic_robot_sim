@@ -47,7 +47,7 @@ Trajectories are fully reproducible: all random draws use a seeded `numpy` RNG, 
 
 ## Building the ROS 2 Package
 
-The package uses `ament_cmake` and integrates with `colcon`.  Only `collect_dataset.py`, `record_real_rollout.py`, and the `elastic_sim` Python library are installed; all other simulation scripts are left untouched.
+The package uses `ament_cmake` and integrates with `colcon`.  Only `collect_dataset` and `record_real_rollout` (installed without the `.py` suffix) and the `elastic_sim` Python library are installed; all other simulation scripts are left untouched.
 
 ```bash
 # Source ROS 2 first, then build
@@ -153,12 +153,12 @@ data/recordings/session_01/
 
 ```bash
 # Execute one pre-generated trajectory and record
-ros2 run elastic_robot_sim record_real_rollout.py \
+ros2 run elastic_robot_sim record_real_rollout \
     --traj-config data/rollouts/traj_m2_s42/trajectory.json \
     --output-dir  data/rollouts/traj_m2_s42/
 
 # Dry-run: plan only, no motion
-ros2 run elastic_robot_sim record_real_rollout.py \
+ros2 run elastic_robot_sim record_real_rollout \
     --traj-config data/rollouts/traj_m2_s42/trajectory.json \
     --output-dir  data/rollouts/traj_m2_s42/ \
     --dry-run

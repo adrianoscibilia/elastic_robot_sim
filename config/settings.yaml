@@ -28,9 +28,10 @@ collection:
   sim_time: 15.0            # seconds per trajectory
   master_seed: null         # null = random; set an integer for reproducible sessions
   joint_limits:
-    x: [-1.8, 1.8]          # meters
-    y: [-1.8, 1.8]
-    z: [-1.0, 1.0]
+    x: [-0.7, 0.7]          # meters
+    y: [-0.7, 0.8]
+    z: [-0.2, 0.25]
   payload: 0.0              # kg attached to end-effector during collection
   output_dir: data/recordings/session_latest  # default output directory
   ft_topic: /ft_sensor_command_broadcaster/wrench
+  speed_override: 50        # % of nominal trajectory speed (1–100); start low!

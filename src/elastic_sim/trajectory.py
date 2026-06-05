@@ -32,6 +32,12 @@ class TrajectoryConfig:
     joint_limits: dict[str, tuple[float, float]]
     step_duration: float = 2.0  # only used by PTP
     params: dict = field(default_factory=dict)  # generated coefficients / points
+    speed_override: float = 100.0  # % of nominal speed sent to the robot (1–100)
+
+    @property
+    def real_duration(self) -> float:
+        """Actual wall-clock duration on the robot: sim_time / (speed_override / 100)."""
+        return self.sim_time / max(0.01, self.speed_override / 100.0)
 
     def to_dict(self) -> dict:
         return {
@@ -41,6 +47,7 @@ class TrajectoryConfig:
             "joint_limits": {k: list(v) for k, v in self.joint_limits.items()},
             "step_duration": self.step_duration,
             "params": self.params,
+            "speed_override": self.speed_override,
         }
 
     @classmethod
@@ -52,6 +59,7 @@ class TrajectoryConfig:
             joint_limits={k: tuple(v) for k, v in d["joint_limits"].items()},
             step_duration=float(d.get("step_duration", 2.0)),
             params=d.get("params", {}),
+            speed_override=float(d.get("speed_override", 100.0)),
         )
 
     def save(self, path: str) -> None:
@@ -156,7 +164,8 @@ def make_sinusoidal_trajectory(
         lo, hi = lims[ax]
         offset = (hi + lo) / 2.0
         amp_max = (hi - lo) * 0.4
-        amp = float(rng.uniform(0.2, amp_max))
+        amp_min = (hi - lo) * 0.1
+        amp = float(rng.uniform(amp_min, amp_max))
         freq = float(rng.uniform(0.5, 3.0))
         phase = float(rng.choice([np.pi / 2.0, -np.pi / 2.0]))
         p[ax] = {"amp": amp, "freq": freq, "phase": phase, "offset": offset, "cos": cos}

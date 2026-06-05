@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """ROS 2 node: record a single real-robot rollout for sim-to-real calibration.
 
 Usage (ROS 2 Jazzy, sourced workspace):
@@ -70,6 +71,10 @@ def main() -> None:
         help="ROS 2 topic for force/torque data.",
     )
     parser.add_argument(
+        "--speed-override", type=float, default=30.0, metavar="PCT",
+        help="Trajectory speed as %% of nominal (1–100).",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Plan only — do not send motion commands to the robot.",
     )
@@ -99,7 +104,8 @@ def main() -> None:
 
     rclpy.init()
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.output_file))
-    node = RealRobotRecorder(config, output_dir, ft_topic=args.ft_topic)
+    node = RealRobotRecorder(config, output_dir, ft_topic=args.ft_topic,
+                             speed_override=args.speed_override)
     try:
         ok = node.send_trajectory()
         if ok:

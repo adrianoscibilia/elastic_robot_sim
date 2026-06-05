@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Collect real-robot calibration data: trajectory configs + real recordings.
 
 Reads default parameters from config/settings.yaml (collection section).
@@ -6,6 +7,12 @@ Every CLI argument overrides the corresponding settings.yaml value.
 The script generates random sinusoidal / PTP trajectories, saves their
 configs (with seeds) for full reproducibility, then executes each one on
 the real robot via ROS 2 and records the joint/force signals.
+
+Motor lifecycle:
+  - Motors are enabled ONCE before the first trajectory via
+    /ethercat_checker/start_motors (Trigger).
+  - Motors are disabled ONCE after the last trajectory (or on interrupt/error)
+    via /ethercat_checker/stop_motors (Trigger).
 
 The resulting files are the ground truth used by run_calibration.py:
 
@@ -30,6 +37,9 @@ ros2 run elastic_robot_sim collect_dataset \\
 ros2 run elastic_robot_sim collect_dataset \\
     --output-dir data/recordings/session_01 \\
     --modes ptp --sim-time 12.0
+
+# Skip motor enable/disable (e.g. motors already on, or dry testing)
+ros2 run elastic_robot_sim collect_dataset --no-motor-control
 
 # Point at a different settings file
 ros2 run elastic_robot_sim collect_dataset \\
@@ -60,10 +70,67 @@ from elastic_sim.trajectory import make_ptp_trajectory, make_sinusoidal_trajecto
 _HAS_ROS = False
 try:
     import rclpy
+    from rclpy.node import Node
+    from std_srvs.srv import Trigger
     from elastic_sim.ros_recorder import RealRobotRecorder, FT_TOPIC_DEFAULT
     _HAS_ROS = True
 except ImportError:
     FT_TOPIC_DEFAULT = "/ft_sensor_command_broadcaster/wrench"
+
+
+# ---------------------------------------------------------------------------
+# Motor controller node (session-level, created once)
+# ---------------------------------------------------------------------------
+
+if _HAS_ROS:
+    class MotorController(Node):
+        """Thin node that wraps /ethercat_checker/start_motors and stop_motors."""
+
+        _START_SRV = "/ethercat_checker/start_motors"
+        _STOP_SRV  = "/ethercat_checker/stop_motors"
+
+        def __init__(self) -> None:
+            super().__init__("dataset_motor_controller")
+            self._start = self.create_client(Trigger, self._START_SRV)
+            self._stop  = self.create_client(Trigger, self._STOP_SRV)
+
+        def enable(self, timeout: float = 15.0) -> bool:
+            """Call start_motors. Returns True on success."""
+            self.get_logger().info("Waiting for start_motors service...")
+            if not self._start.wait_for_service(timeout_sec=timeout):
+                self.get_logger().error(
+                    f"{self._START_SRV} not available after {timeout:.0f} s."
+                )
+                return False
+            future = self._start.call_async(Trigger.Request())
+            rclpy.spin_until_future_complete(self, future)
+            result: Trigger.Response = future.result()
+            if result.success:
+                self.get_logger().info("Motors enabled.")
+            else:
+                self.get_logger().error(
+                    f"start_motors returned failure: {result.message}"
+                )
+            return result.success
+
+        def disable(self, timeout: float = 15.0) -> bool:
+            """Call stop_motors. Returns True on success (best-effort in finally)."""
+            self.get_logger().info("Waiting for stop_motors service...")
+            if not self._stop.wait_for_service(timeout_sec=timeout):
+                self.get_logger().error(
+                    f"{self._STOP_SRV} not available after {timeout:.0f} s."
+                )
+                return False
+            future = self._stop.call_async(Trigger.Request())
+            rclpy.spin_until_future_complete(self, future)
+            result: Trigger.Response = future.result()
+            if result.success:
+                self.get_logger().info("Motors disabled.")
+            else:
+                self.get_logger().error(
+                    f"stop_motors returned failure: {result.message}"
+                )
+            return result.success
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +196,14 @@ def _parse_args() -> argparse.Namespace:
         "--ft-topic", default=None,
         help="ROS 2 force-torque topic name.",
     )
+    p.add_argument(
+        "--speed-override", type=float, default=None, metavar="PCT",
+        help="Trajectory speed as %% of nominal (1–100). Default from settings.yaml.",
+    )
+    p.add_argument(
+        "--no-motor-control", action="store_true",
+        help="Skip motor enable/disable (use when motors are already on, or for dry testing).",
+    )
     return p.parse_args()
 
 
@@ -162,10 +237,15 @@ def main() -> None:
         args.ft_topic if args.ft_topic is not None
         else col.get("ft_topic", FT_TOPIC_DEFAULT)
     )
+    speed_override: float = (
+        args.speed_override if args.speed_override is not None
+        else float(col.get("speed_override", 30.0))
+    )
     output_dir: str = (
         args.output_dir if args.output_dir is not None
         else col.get("output_dir", "data/recordings/session_latest")
     )
+    motor_control: bool = not args.no_motor_control
 
     raw_limits = col.get(
         "joint_limits", {"x": [-1.8, 1.8], "y": [-1.8, 1.8], "z": [-1.0, 1.0]}
@@ -183,6 +263,8 @@ def main() -> None:
     print(f"Joint limits    : {joint_limits}")
     print(f"Master seed     : {master_seed if master_seed is not None else 'random'}")
     print(f"F/T topic       : {ft_topic}")
+    print(f"Speed override  : {speed_override:.0f}%")
+    print(f"Motor control   : {'enabled' if motor_control else 'disabled (--no-motor-control)'}")
     print(f"Trajectories    : {'unlimited (Ctrl-C to stop)' if infinite else num_trajectories}")
 
     if not _HAS_ROS:
@@ -190,8 +272,24 @@ def main() -> None:
         sys.exit(1)
 
     rclpy.init()
+    motors: MotorController | None = None
     count = 0
+
     try:
+        # ------------------------------------------------------------------
+        # Enable motors once for the whole session
+        # ------------------------------------------------------------------
+        if motor_control:
+            motors = MotorController()
+            print("\n[motors] Enabling motors...")
+            if not motors.enable():
+                print("[motors] ERROR: failed to enable motors — aborting.")
+                sys.exit(1)
+            print("[motors] Motors enabled.\n")
+
+        # ------------------------------------------------------------------
+        # Trajectory collection loop
+        # ------------------------------------------------------------------
         while infinite or count < num_trajectories:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             seed = rng.randint(0, 2**31 - 1)
@@ -217,7 +315,7 @@ def main() -> None:
             # Execute on real robot and record
             real_out = os.path.join(output_dir, f"real_{ts}.parquet")
             print("  [real] Connecting to action server...", flush=True)
-            node = RealRobotRecorder(traj.config, ft_topic=ft_topic)
+            node = RealRobotRecorder(traj.config, ft_topic=ft_topic, speed_override=speed_override)
             try:
                 ok = node.send_trajectory()
                 if ok:
@@ -234,7 +332,16 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print(f"\nInterrupted after {count} completed recordings.")
+
     finally:
+        # ------------------------------------------------------------------
+        # Disable motors once after all trajectories (or on error/interrupt)
+        # ------------------------------------------------------------------
+        if motor_control and motors is not None:
+            print("\n[motors] Disabling motors...")
+            motors.disable()
+            motors.destroy_node()
+
         rclpy.shutdown()
 
     print(f"\nCollection complete: {count} trajectories saved to {output_dir}")
