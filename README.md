@@ -92,44 +92,39 @@ python scripts/record_rollouts.py --backends mujoco \
 
 Saves to `data/rollouts/traj_m<mode>_s<seed>/` with one parquet file per backend.
 
-#### Option B — Continuous dataset collection (sims + real robot)
+#### Option B — Continuous real-robot data collection
 
 ```bash
-# 10 random trajectories: both sims + real robot, save with datetime stamps
-python scripts/collect_dataset.py \
-    --backends newton mujoco real \
-    --num-trajectories 10 \
-    --output-dir data/recordings/session_01
+# 10 random trajectories with settings from config/settings.yaml
+python scripts/collect_dataset.py --output-dir data/recordings/session_01
 
-# Sim-only, run until Ctrl-C
+# Override specific settings on the CLI
 python scripts/collect_dataset.py \
-    --backends newton mujoco \
-    --num-trajectories 0 \
-    --output-dir data/recordings/sim_only
-
-# Use previously calibrated params for the sim
-python scripts/collect_dataset.py \
-    --backends newton real \
-    --params calibrated_newton.yaml \
+    --output-dir data/recordings/session_01 \
     --num-trajectories 20 \
-    --output-dir data/recordings/newton_cal
+    --modes ptp \
+    --sim-time 12.0
+
+# Point at a different settings file
+python scripts/collect_dataset.py \
+    --output-dir data/recordings/session_01 \
+    --settings config/settings_robot2.yaml
 ```
 
 For each trajectory the script:
-1. Picks a random mode (sinusoidal / PTP) and random seed
-2. Saves `trajectory_TS.json`
-3. **Starts the real robot as a background subprocess** (it executes in real-time, ~15 s)
-4. **Runs the simulators sequentially** while the robot is moving (they finish in 1–2 s)
-5. Waits for the robot subprocess to exit; if it fails, the sim files are kept
+1. Reads parameters from `config/settings.yaml` (joint limits, duration, modes, seed policy, ROS 2 settings)
+2. Picks a random mode (sinusoidal / PTP) and a random seed
+3. Saves `trajectory_TS.json` — the seed and waypoints are stored so the exact same trajectory can be replayed in the simulator later
+4. Executes on the real robot via `record_real_rollout.py` and records joint states + F/T
+5. If the robot fails, the trajectory config is still kept (useful for debugging and for replaying in sim)
 
-Output layout (all files flat in `--output-dir`):
+Output layout:
 ```
 data/recordings/session_01/
-  trajectory_20240605_143022.json
-  newton_20240605_143022.parquet
-  mujoco_20240605_143022.parquet
-  real_20240605_143022.parquet
+  trajectory_20240605_143022.json   ← seed + waypoints, fully reproducible
+  real_20240605_143022.parquet      ← ground truth signals
   trajectory_20240605_143058.json
+  real_20240605_143058.parquet
   ...
 ```
 
@@ -154,34 +149,33 @@ Subscribes to `/joint_states` and `/ft_sensor/wrench`, sends `FollowJointTraject
 
 ### Sim-to-real calibration
 
+Defaults are read from `config/calibration.yaml`; all values can be overridden on the CLI.
+
 ```bash
-# CMA-ES, Newton vs real — from flat recordings directory
-python scripts/run_calibration.py \
-    --backend newton \
-    --recordings-dir data/recordings/session_01
+# Defaults from config/calibration.yaml, recordings from collect_dataset.py
+python scripts/run_calibration.py --recordings-dir data/recordings/session_01
 
-# Bayesian optimisation, MuJoCo vs real — from structured rollout store
+# Override backend and optimizer
 python scripts/run_calibration.py \
-    --backend mujoco --optimizer bo \
-    --rollouts-dir data/rollouts
-
-# Extra options
-python scripts/run_calibration.py \
-    --backend newton --optimizer cma \
     --recordings-dir data/recordings/session_01 \
-    --max-evals 300 \
-    --output calibrated_newton.yaml \
-    --no-payload \
-    --verbose
+    --backend mujoco --optimizer bo
+
+# Structured rollout store (from record_rollouts.py)
+python scripts/run_calibration.py --rollouts-dir data/rollouts
+
+# Extra overrides
+python scripts/run_calibration.py \
+    --recordings-dir data/recordings/session_01 \
+    --max-evals 300 --output calibrated_newton.yaml --no-payload --verbose
 ```
 
 The script:
 1. Loads all `(real rollout, trajectory config)` pairs from the recordings
-2. Splits them into train / validation sets (80 / 20 by default)
-3. Runs the chosen optimizer to minimise the normalised RMSE between sim and real
+2. Splits them into train / validation sets (`train_fraction` from `calibration.yaml`, default 80/20)
+3. For each optimizer evaluation: **re-runs the full simulation headlessly** from the saved trajectory seed, then compares against the real recording
 4. Validates on the held-out set
 5. Saves the best params to `calibrated_<backend>.yaml`
-6. Saves `<backend>_calibrated_TS.parquet` alongside the source files for visual comparison
+6. Saves `<backend>_calibrated_TS.parquet` alongside the recordings for visual comparison
 
 #### Optimizer backends
 
@@ -209,15 +203,17 @@ The optimizer tunes these 6 (or 7 with payload) scalar values:
 
 All values are normalised to `[-1, 1]` before being passed to the optimizer.
 
-The fidelity metric is a weighted normalised RMSE over position, velocity, and torque signals (configurable in `configs/calibration.yaml`).
+The fidelity metric is a weighted normalised RMSE over position, velocity, and torque signals (configurable in `config/calibration.yaml`).
 
 ---
 
 ## Configuration
 
+All configuration lives under `config/`.  There are two files:
+
 ### `config/settings.yaml`
 
-Runtime parameters for standalone simulation and dataset generation:
+Runtime parameters for standalone simulation, dataset generation, and data collection.
 
 ```yaml
 elastic_drives:
@@ -232,11 +228,24 @@ simulation:
   sim_time:     15.0     # seconds
   time_step:     0.01    # seconds
   cut_off_time:  2.0     # seconds to skip at the start of comparisons
+
+collection:
+  num_trajectories: 10          # 0 = run until Ctrl-C
+  modes: [sin, ptp]             # trajectory types to randomly sample
+  sim_time: 15.0                # seconds per trajectory
+  master_seed: null             # null = random; set integer for reproducible sessions
+  joint_limits:
+    x: [-1.8, 1.8]              # metres — stay within URDF hard limits
+    y: [-1.8, 1.8]
+    z: [-1.0, 1.0]
+  payload: 0.0                  # kg attached during collection
+  ros_python: python3           # Python executable with ROS 2 on its path
+  ft_topic: /ft_sensor/wrench
 ```
 
-### `configs/calibration.yaml`
+### `config/calibration.yaml`
 
-Optimizer hyper-parameters and metric weights for `run_calibration.py`.
+Optimizer hyper-parameters and metric weights for `run_calibration.py`.  Loaded automatically as defaults; every field can be overridden on the CLI.
 
 ---
 
@@ -261,10 +270,9 @@ Every rollout (sim or real) stores the following 24 time-series columns at 100 H
 ```
 elastic_robot_sim/
 ├── config/
-│   ├── settings.yaml              # Default sim parameters
+│   ├── settings.yaml              # Sim + collection parameters
+│   ├── calibration.yaml           # Calibration optimizer settings
 │   └── elastic_cart_mujoco.xml    # MuJoCo scene template
-├── configs/
-│   └── calibration.yaml           # Calibration optimizer settings
 ├── scripts/
 │   ├── sim_common.py              # Shared constants, trajectory generators, CSV utils
 │   ├── elastic_cart_robot_newton.py   # Newton standalone simulation
@@ -350,23 +358,22 @@ python scripts/run_dataset_generation.py
 ### B — Sim-to-real calibration
 
 ```bash
-# 1. Collect data (sims run in seconds; robot runs while they do)
-python scripts/collect_dataset.py \
-    --backends newton mujoco real \
-    --num-trajectories 15 \
-    --output-dir data/recordings/cal_run_01
+# Step 1: collect real-robot ground truth
+# (configure joint limits, duration, number of trajectories in config/settings.yaml)
+python scripts/collect_dataset.py --output-dir data/recordings/cal_run_01
+# → trajectory_TS.json + real_TS.parquet for each executed trajectory
 
-# 2. Calibrate Newton against real
+# Step 2a: calibrate Newton against real
+# (optimizer settings, metric weights, backend in config/calibration.yaml)
 python scripts/run_calibration.py \
-    --backend newton --optimizer cma \
     --recordings-dir data/recordings/cal_run_01 \
-    --output calibrated_newton.yaml
+    --backend newton --output calibrated_newton.yaml
+# → iteratively re-runs the sim from saved seeds, compares with real, tunes params
 
-# 3. Calibrate MuJoCo against real
+# Step 2b: calibrate MuJoCo against the same data
 python scripts/run_calibration.py \
-    --backend mujoco --optimizer cma \
     --recordings-dir data/recordings/cal_run_01 \
-    --output calibrated_mujoco.yaml
+    --backend mujoco --output calibrated_mujoco.yaml
 ```
 
 ### C — Compare Newton vs MuJoCo (no real robot)

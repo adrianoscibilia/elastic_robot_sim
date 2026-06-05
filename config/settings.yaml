@@ -9,9 +9,28 @@ elastic_drives:
     damping_ratio: 1.2
     stiffness: 3861.11
   payload: 0.0
+
 simulation:
-  ref_mode: 2
-  seed: -1
-  sim_time: 15.0
-  time_step: 0.01
-  cut_off_time: 2.0
+  ref_mode: 2       # 0=hold  1=sinusoidal  2=PTP
+  seed: -1          # -1 = random
+  sim_time: 15.0    # seconds
+  time_step: 0.01   # integration step (s)
+  cut_off_time: 2.0 # seconds to skip at start of comparisons
+
+# -----------------------------------------------------------------------
+# Data collection settings (used by scripts/collect_dataset.py)
+# -----------------------------------------------------------------------
+collection:
+  num_trajectories: 10      # 0 = run until Ctrl-C
+  modes:                    # trajectory modes to randomly sample
+    - sin                   # sinusoidal
+    - ptp                   # point-to-point with cubic blending
+  sim_time: 15.0            # seconds per trajectory
+  master_seed: null         # null = random; set an integer for reproducible sessions
+  joint_limits:
+    x: [-1.8, 1.8]          # meters
+    y: [-1.8, 1.8]
+    z: [-1.0, 1.0]
+  payload: 0.0              # kg attached to end-effector during collection
+  ros_python: python3       # Python executable that has ROS 2 packages on its path
+  ft_topic: /ft_sensor/wrench

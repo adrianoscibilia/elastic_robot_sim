@@ -4,20 +4,25 @@ Loads all rollouts that have a real.parquet file, splits them into
 train/validation sets, then runs the chosen optimizer to minimise the
 sim-vs-real fidelity loss.
 
+Default settings are read from config/calibration.yaml; every value can be
+overridden on the CLI.
+
 Usage examples
 --------------
-# CMA-ES, Newton backend, default settings
-python scripts/run_calibration.py --backend newton
+# Use defaults from config/calibration.yaml, flat recordings directory
+python scripts/run_calibration.py --recordings-dir data/recordings/session_01
 
-# Bayesian optimisation, MuJoCo backend
-python scripts/run_calibration.py --backend mujoco --optimizer bo
+# Override backend and optimizer
+python scripts/run_calibration.py \\
+    --recordings-dir data/recordings/session_01 \\
+    --backend mujoco --optimizer bo
 
-# Newton, only a specific rollout dir
-python scripts/run_calibration.py --backend newton \\
-    --rollouts-dir data/rollouts/traj_m2_s42
+# Structured rollout store (from record_rollouts.py)
+python scripts/run_calibration.py --rollouts-dir data/rollouts
 
-# Save calibrated params and validate
-python scripts/run_calibration.py --backend newton \\
+# Save output to a specific file
+python scripts/run_calibration.py \\
+    --recordings-dir data/recordings/session_01 \\
     --output calibrated_newton.yaml --max-evals 300
 """
 
@@ -28,6 +33,7 @@ import os
 import sys
 
 import numpy as np
+import yaml
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SRC = os.path.join(_REPO, "src")
@@ -44,51 +50,80 @@ from elastic_sim.trajectory import _trajectory_from_config
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Config loader
 # ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
+def _load_cal_config(path: str | None = None) -> dict:
+    if path is None:
+        path = os.path.join(_REPO, "config", "calibration.yaml")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+# ---------------------------------------------------------------------------
+# CLI  (config/calibration.yaml provides defaults; CLI overrides)
+# ---------------------------------------------------------------------------
+
+def _parse_args(cal: dict) -> argparse.Namespace:
+    sim_cfg  = cal.get("simulation", {})
+    data_cfg = cal.get("data", {})
+
     p = argparse.ArgumentParser(
-        description="Sim-to-real calibration: find RobotParams that match recorded real rollouts."
+        description=(
+            "Sim-to-real calibration: optimise RobotParams to match recorded real rollouts. "
+            "Defaults are read from config/calibration.yaml."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
-        "--backend", choices=["newton", "mujoco"], default="newton",
-        help="Simulator backend to calibrate (default: newton).",
+        "--config", default=None, metavar="PATH",
+        help="Path to a calibration YAML file (default: config/calibration.yaml).",
     )
     p.add_argument(
-        "--optimizer", choices=["cma", "bo", "skrl"], default="cma",
-        help="Optimization backend (default: cma).",
+        "--backend", choices=["newton", "mujoco"],
+        default=cal.get("backend", "newton"),
+        help="Simulator backend to calibrate.",
+    )
+    p.add_argument(
+        "--optimizer", choices=["cma", "bo", "skrl"],
+        default=cal.get("optimizer", "cma"),
+        help="Optimization backend.",
     )
     p.add_argument(
         "--rollouts-dir", default=None,
         help=(
-            "Path to a rollout store directory containing <traj_id>/ sub-dirs "
-            "(structured format).  Defaults to data/rollouts/."
+            "Path to a structured rollout store containing <traj_id>/ sub-dirs "
+            "(produced by record_rollouts.py)."
         ),
     )
     p.add_argument(
         "--recordings-dir", default=None,
         help=(
             "Path to a flat recordings directory produced by collect_dataset.py "
-            "(files: trajectory_TS.json + real_TS.parquet).  "
-            "Mutually exclusive with --rollouts-dir."
+            "(files: trajectory_TS.json + real_TS.parquet)."
         ),
     )
     p.add_argument(
-        "--train-fraction", type=float, default=0.8,
-        help="Fraction of rollouts used for optimisation (rest used for validation).",
+        "--train-fraction", type=float,
+        default=data_cfg.get("train_fraction", 0.8),
+        help="Fraction of rollouts used for optimisation (rest for validation).",
     )
     p.add_argument(
-        "--max-evals", type=int, default=200,
-        help="Maximum number of loss evaluations (default: 200).",
+        "--max-evals", type=int,
+        default=cal.get(cal.get("optimizer", "cma"), {}).get("max_evals", 200),
+        help="Maximum number of loss evaluations.",
     )
     p.add_argument(
-        "--cut-off-time", type=float, default=2.0,
-        help="Seconds of initial transient to skip in comparison (default: 2.0).",
+        "--cut-off-time", type=float,
+        default=sim_cfg.get("cut_off_time", 2.0),
+        help="Seconds of initial transient to skip in comparison.",
     )
     p.add_argument(
-        "--time-step", type=float, default=0.01,
-        help="Simulation time step (default: 0.01).",
+        "--time-step", type=float,
+        default=sim_cfg.get("time_step", 0.01),
+        help="Simulation integration step (s).",
     )
     p.add_argument(
         "--output", default=None,
@@ -109,11 +144,11 @@ def _parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Data loaders
 # ---------------------------------------------------------------------------
 
 def _load_rollouts(rollouts_dir: str, backend: str):
-    """Load all (real_rollout, traj_config) pairs from a structured rollout store."""
+    """Load (real_rollout, traj_config) pairs from a structured rollout store."""
     store = RolloutStore(rollouts_dir)
     pairs = []
     for traj_id in store.list_traj_ids():
@@ -132,8 +167,7 @@ def _load_rollouts_flat(recordings_dir: str):
     """Load (real_rollout, traj_config) pairs from a flat timestamped directory.
 
     Expects files named trajectory_TS.json + real_TS.parquet produced by
-    collect_dataset.py.  Returns (pairs, timestamps) where timestamps[i] is the
-    datetime string for pairs[i].
+    collect_dataset.py.  Returns (pairs, timestamps).
     """
     import glob
     import pandas as pd
@@ -144,8 +178,7 @@ def _load_rollouts_flat(recordings_dir: str):
     pairs: list[tuple] = []
     timestamps: list[str] = []
 
-    pattern = os.path.join(recordings_dir, "trajectory_*.json")
-    for traj_path in sorted(glob.glob(pattern)):
+    for traj_path in sorted(glob.glob(os.path.join(recordings_dir, "trajectory_*.json"))):
         fname = os.path.basename(traj_path)
         ts = fname[len("trajectory_"):-len(".json")]
         real_path = os.path.join(recordings_dir, f"real_{ts}.parquet")
@@ -162,10 +195,15 @@ def _load_rollouts_flat(recordings_dir: str):
     return pairs, timestamps
 
 
-def _make_optimizer(name: str, max_evals: int):
+# ---------------------------------------------------------------------------
+# Optimizer factory
+# ---------------------------------------------------------------------------
+
+def _make_optimizer(name: str, max_evals: int, cal: dict):
     if name == "cma":
         from elastic_sim.optimizers.cma_backend import CMAOptimizer
-        return CMAOptimizer(sigma0=0.3, max_evals=max_evals)
+        sigma0 = cal.get("cma", {}).get("sigma0", 0.3)
+        return CMAOptimizer(sigma0=sigma0, max_evals=max_evals)
     if name == "bo":
         from elastic_sim.optimizers.bo_backend import BayesianOptimizer
         return BayesianOptimizer()
@@ -175,15 +213,17 @@ def _make_optimizer(name: str, max_evals: int):
     raise ValueError(f"Unknown optimizer: {name}")
 
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
 def _validate(problem: SimCalibrationProblem, val_rollouts, cut_off_time: float):
-    """Report fidelity on the validation set using the current best params."""
     best_theta, best_train_loss = problem.best
     if best_theta is None:
         return
     print(f"\nValidation ({len(val_rollouts)} rollouts):")
     include_payload = len(best_theta) > 6
     params = RobotParams.denormalize(best_theta, include_payload=include_payload)
-    # Re-apply best params
     problem._ensure_model(params)
     val_losses = []
     for real_rollout, traj_config in val_rollouts:
@@ -201,7 +241,18 @@ def _validate(problem: SimCalibrationProblem, val_rollouts, cut_off_time: float)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = _parse_args()
+    # Two-pass: load config file first, then parse args using it as defaults
+    # (handle --config before full argparse so we can use it as defaults source)
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--config", default=None)
+    _known, _ = _pre.parse_known_args()
+    cal = _load_cal_config(_known.config)
+
+    args = _parse_args(cal)
+
+    # Re-load if --config was given explicitly (already loaded above, but keep path)
+    if args.config is not None:
+        cal = _load_cal_config(args.config)
 
     if args.rollouts_dir is not None and args.recordings_dir is not None:
         print("ERROR: Provide only one of --rollouts-dir or --recordings-dir.")
@@ -209,52 +260,56 @@ def main() -> None:
 
     print(f"Backend:   {args.backend}")
     print(f"Optimizer: {args.optimizer}")
+    print(f"Max evals: {args.max_evals}")
 
-    # ---- Flat recordings directory (collect_dataset.py output) ----
+    # ---- Load recordings ----
     _timestamps: list[str] = []
     if args.recordings_dir is not None:
         print(f"Recordings: {args.recordings_dir}  (flat timestamped format)")
         all_rollouts, _timestamps = _load_rollouts_flat(args.recordings_dir)
-        store = None  # no RolloutStore for flat format
+        store = None
         _flat_dir = args.recordings_dir
     else:
-        # ---- Structured rollout store (legacy / record_rollouts.py output) ----
         rollouts_dir = args.rollouts_dir or os.path.join(_REPO, "data", "rollouts")
         print(f"Rollouts:  {rollouts_dir}  (structured sub-dir format)")
         all_rollouts, store = _load_rollouts(rollouts_dir, args.backend)
         _flat_dir = None
 
     if not all_rollouts:
-        print("ERROR: No rollouts with real.parquet found. Record the real robot first.")
+        print("ERROR: No rollouts with real.parquet found.  Run collect_dataset.py first.")
         sys.exit(1)
     print(f"Found {len(all_rollouts)} real rollout(s).")
 
-    # Train / validation split
+    # ---- Train / validation split ----
     n_train = max(1, int(len(all_rollouts) * args.train_fraction))
-    train_rollouts = all_rollouts[:n_train]
-    val_rollouts = all_rollouts[n_train:]
+    train_rollouts   = all_rollouts[:n_train]
+    val_rollouts     = all_rollouts[n_train:]
     train_timestamps = _timestamps[:n_train] if _timestamps else []
     print(f"Train: {len(train_rollouts)}, Validation: {len(val_rollouts)}")
 
-    # Build calibration problem
+    # ---- Build calibration problem ----
+    weights = None
+    mw = cal.get("metric_weights", {})
+    if mw:
+        weights = {k: float(v) for k, v in mw.items()}
+
     problem = SimCalibrationProblem(
         train_rollouts,
         backend=args.backend,
+        weights=weights,
         noise=False,
         cut_off_time=args.cut_off_time,
         time_step=args.time_step,
     )
 
     include_payload = not args.no_payload
-    n_dims = problem.n_dims(include_payload)
-    bounds = RobotParams.bounds(include_payload)
-
-    # Use current settings.yaml as initial guess
-    x0 = RobotParams.from_yaml().normalize(include_payload)
+    n_dims  = problem.n_dims(include_payload)
+    bounds  = RobotParams.bounds(include_payload)
+    x0      = RobotParams.from_yaml().normalize(include_payload)
     print(f"Parameter dims: {n_dims}  (payload {'included' if include_payload else 'fixed'})")
 
-    # Run optimisation
-    optimizer = _make_optimizer(args.optimizer, args.max_evals)
+    # ---- Run optimisation ----
+    optimizer = _make_optimizer(args.optimizer, args.max_evals, cal)
     print(f"\nRunning {args.optimizer.upper()} (max_evals={args.max_evals})...")
     best_theta, history = optimizer.minimize(
         problem.loss, bounds, x0=x0,
@@ -264,7 +319,7 @@ def main() -> None:
     best_theta_prob, best_loss = problem.best
     print(f"\nBest loss (train): {best_loss:.6f}  after {len(history)} evaluations")
 
-    # Decode and display best params
+    # ---- Report best params ----
     best_params = RobotParams.denormalize(best_theta_prob, include_payload=include_payload)
     print("\nCalibrated parameters:")
     for ax_name, ax in [("x", best_params.drive_x), ("y", best_params.drive_y), ("z", best_params.drive_z)]:
@@ -272,23 +327,22 @@ def main() -> None:
     if include_payload:
         print(f"  payload: {best_params.payload:.3f} kg")
 
-    # Validate if we have held-out data
+    # ---- Validate ----
     if val_rollouts:
         _validate(problem, val_rollouts, args.cut_off_time)
 
-    # Save calibrated params
+    # ---- Save calibrated params ----
     output_path = args.output or os.path.join(_REPO, f"calibrated_{args.backend}.yaml")
     best_params.to_yaml(output_path)
     print(f"\nCalibrated params saved to {output_path}")
 
-    # Save best sim rollout for each training trajectory
+    # ---- Save calibrated sim rollouts alongside recordings ----
     print("\nSaving calibrated sim rollouts for all training trajectories...")
     problem._ensure_model(best_params)
-    for i, (real_rollout, traj_config) in enumerate(train_rollouts):
+    for i, (_, traj_config) in enumerate(train_rollouts):
         traj = _trajectory_from_config(traj_config)
         sim_rollout = problem._run_sim(traj)
         if _flat_dir is not None:
-            # Flat format: save as <backend>_calibrated_TS.parquet alongside the source files
             ts = train_timestamps[i] if i < len(train_timestamps) else f"idx{i:04d}"
             out_path = os.path.join(_flat_dir, f"{args.backend}_calibrated_{ts}.parquet")
             sim_rollout.to_dataframe().to_parquet(out_path, index=False)

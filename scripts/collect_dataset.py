@@ -1,41 +1,37 @@
-"""Collect a synchronized calibration dataset: sim (Newton/MuJoCo) + real robot.
+"""Collect real-robot calibration data: trajectory configs + real recordings.
 
-All backends share the same randomly-generated trajectory and the same
-datetime timestamp per recording, so::
+Reads default parameters from config/settings.yaml (collection section).
+Every CLI argument overrides the corresponding settings.yaml value.
 
-    newton_20240605_143022.parquet
-    mujoco_20240605_143022.parquet
-    real_20240605_143022.parquet
-    trajectory_20240605_143022.json
+The script generates random sinusoidal / PTP trajectories, saves their
+configs (with seeds) for full reproducibility, then executes each one on
+the real robot via ROS 2 and records the joint/force signals.
 
-are directly comparable.
+The resulting files are the ground truth used by run_calibration.py:
 
-The real robot is launched as a background subprocess (requires a ROS 2
-environment); if it fails or is absent the sim files for that recording are
-still valid.  Ctrl-C cleanly aborts between trajectories and terminates any
-in-flight robot subprocess.
+    data/recordings/<session>/
+        trajectory_20240605_143022.json   ← seed + waypoints for reproducibility
+        real_20240605_143022.parquet      ← recorded joint states + F/T
+        trajectory_20240605_143058.json
+        real_20240605_143058.parquet
+        ...
 
-Usage examples
---------------
-# Both sims + real robot, 10 random trajectories
+Usage
+-----
+# Use settings from config/settings.yaml
+python scripts/collect_dataset.py --output-dir data/recordings/session_01
+
+# Override specific settings on the CLI
 python scripts/collect_dataset.py \\
-    --backends newton mujoco real \\
-    --num-trajectories 10 \\
-    --output-dir data/recordings/session_01
-
-# Sim-only, run until Ctrl-C
-python scripts/collect_dataset.py \\
-    --backends newton mujoco \\
-    --num-trajectories 0 \\
-    --output-dir data/recordings/sim_only
-
-# Newton only, PTP trajectories, calibrated params
-python scripts/collect_dataset.py \\
-    --backends newton real \\
-    --modes ptp \\
-    --params calibrated_newton.yaml \\
+    --output-dir data/recordings/session_01 \\
     --num-trajectories 20 \\
-    --output-dir data/recordings/newton_cal
+    --modes ptp \\
+    --sim-time 12.0
+
+# Point at a different settings file
+python scripts/collect_dataset.py \\
+    --output-dir data/recordings/session_01 \\
+    --settings config/settings_robot2.yaml
 """
 
 from __future__ import annotations
@@ -48,6 +44,8 @@ import sys
 import time
 from datetime import datetime
 
+import yaml
+
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SRC = os.path.join(_REPO, "src")
 _SCRIPTS = os.path.join(_REPO, "scripts")
@@ -55,121 +53,74 @@ for _p in (_SRC, _SCRIPTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from elastic_sim.params import RobotParams
-from elastic_sim.rollout import RolloutResult
-from elastic_sim.trajectory import (
-    make_ptp_trajectory,
-    make_sinusoidal_trajectory,
-)
+from elastic_sim.trajectory import make_ptp_trajectory, make_sinusoidal_trajectory
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Settings loader
+# ---------------------------------------------------------------------------
+
+def _load_settings(path: str | None = None) -> dict:
+    if path is None:
+        path = os.path.join(_REPO, "config", "settings.yaml")
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# CLI  (all args are optional — settings.yaml provides the defaults)
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Record synchronized sim+real calibration data with timestamped files."
-    )
-    p.add_argument(
-        "--backends", nargs="+",
-        choices=["newton", "mujoco", "real"],
-        default=["newton", "mujoco"],
-        help="Backends to record (default: newton mujoco).",
-    )
-    p.add_argument(
-        "--num-trajectories", type=int, default=10,
-        metavar="N",
-        help="How many trajectories to collect (0 = run until Ctrl-C, default: 10).",
+        description=(
+            "Collect real-robot calibration recordings.  "
+            "Defaults are read from config/settings.yaml (collection section)."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "--output-dir", required=True,
-        help="Directory where all timestamped files are saved.",
+        help="Directory where trajectory JSON files and real.parquet files are saved.",
     )
     p.add_argument(
-        "--modes", nargs="+", choices=["sin", "ptp"], default=["sin", "ptp"],
-        help="Trajectory modes to sample randomly (default: sin ptp).",
+        "--settings", default=None, metavar="PATH",
+        help="Path to a settings YAML file (default: config/settings.yaml).",
     )
     p.add_argument(
-        "--sim-time", type=float, default=15.0,
-        help="Trajectory duration in seconds (default: 15.0).",
+        "--num-trajectories", type=int, default=None, metavar="N",
+        help="Number of trajectories to collect (0 = run until Ctrl-C).",
     )
     p.add_argument(
-        "--time-step", type=float, default=0.01,
-        help="Sim integration step in seconds (default: 0.01).",
+        "--modes", nargs="+", choices=["sin", "ptp"], default=None,
+        help="Trajectory modes to randomly sample.",
     )
     p.add_argument(
-        "--params", default=None,
-        help="Path to a YAML with RobotParams (default: config/settings.yaml).",
+        "--sim-time", type=float, default=None,
+        help="Duration of each trajectory in seconds.",
     )
     p.add_argument(
         "--master-seed", type=int, default=None,
-        help="Seed for the trajectory-seed RNG (default: random).",
+        help="Seed for the trajectory-seed RNG (overrides settings.yaml; null = random).",
     )
     p.add_argument(
-        "--noise", action="store_true",
-        help="Add sensor noise to sim measurements (off by default).",
+        "--ros-python", default=None,
+        help="Python executable used to launch real_robot/record_real_rollout.py.",
     )
     p.add_argument(
-        "--cut-off-time", type=float, default=0.0,
-        help="Skip the first N seconds of the recording (default: 0.0).",
-    )
-    p.add_argument(
-        "--ros-python", default="python3",
-        help=(
-            "Python executable used to launch real_robot/record_real_rollout.py. "
-            "Point this at the Python in your sourced ROS 2 workspace if needed."
-        ),
-    )
-    p.add_argument(
-        "--ft-topic", default="/ft_sensor/wrench",
-        help="ROS 2 topic for force/torque data (forwarded to the real robot recorder).",
+        "--ft-topic", default=None,
+        help="ROS 2 force-torque topic name.",
     )
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Sim runners
+# Robot subprocess
 # ---------------------------------------------------------------------------
-
-def _run_newton(
-    params: RobotParams, traj, *, noise: bool, cut_off_time: float, time_step: float
-) -> RolloutResult:
-    from elastic_sim.sim_runner import build_model, run_rollout
-    model, dof_map, _ = build_model(params)
-    return run_rollout(
-        model, dof_map, traj,
-        noise=noise, cut_off_time=cut_off_time, time_step=time_step,
-    )
-
-
-def _run_mujoco(
-    params: RobotParams, traj, *, noise: bool, cut_off_time: float, time_step: float
-) -> RolloutResult:
-    from elastic_sim.mujoco_runner import build_model, run_rollout
-    model, data, dof_map, act_map = build_model(params, time_step=time_step)
-    return run_rollout(
-        model, data, dof_map, act_map, traj,
-        noise=noise, cut_off_time=cut_off_time,
-    )
-
-
-_SIM_RUNNERS = {"newton": _run_newton, "mujoco": _run_mujoco}
-
-
-# ---------------------------------------------------------------------------
-# File I/O helpers
-# ---------------------------------------------------------------------------
-
-def _save_rollout(rollout: RolloutResult, path: str) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    rollout.to_dataframe().to_parquet(path, index=False)
-
 
 def _start_robot(
     traj_json: str, output_file: str, ros_python: str, ft_topic: str
 ) -> subprocess.Popen:
-    """Launch real_robot/record_real_rollout.py as a non-blocking subprocess."""
     script = os.path.join(_REPO, "real_robot", "record_real_rollout.py")
     cmd = [
         ros_python, script,
@@ -177,12 +128,7 @@ def _start_robot(
         "--output-file", output_file,
         "--ft-topic", ft_topic,
     ]
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 # ---------------------------------------------------------------------------
@@ -191,102 +137,73 @@ def _start_robot(
 
 def main() -> None:
     args = _parse_args()
+    settings = _load_settings(args.settings)
+    col = settings.get("collection", {})
+
+    # Resolve effective configuration (CLI wins over settings.yaml)
+    num_trajectories: int  = args.num_trajectories if args.num_trajectories is not None else col.get("num_trajectories", 10)
+    modes: list[str]       = args.modes            if args.modes is not None            else col.get("modes", ["sin", "ptp"])
+    sim_time: float        = args.sim_time          if args.sim_time is not None          else col.get("sim_time", 15.0)
+    master_seed            = args.master_seed       if args.master_seed is not None       else col.get("master_seed", None)
+    ros_python: str        = args.ros_python        if args.ros_python is not None        else col.get("ros_python", "python3")
+    ft_topic: str          = args.ft_topic          if args.ft_topic is not None          else col.get("ft_topic", "/ft_sensor/wrench")
+
+    raw_limits = col.get("joint_limits", {"x": [-1.8, 1.8], "y": [-1.8, 1.8], "z": [-1.0, 1.0]})
+    joint_limits = {ax: tuple(v) for ax, v in raw_limits.items()}
 
     os.makedirs(args.output_dir, exist_ok=True)
-    params = RobotParams.from_yaml(args.params)
 
-    # Joint limits from sim_common
-    from sim_common import MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_Z
-    joint_limits = {
-        "x": (-MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_XY),
-        "y": (-MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_XY),
-        "z": (-MOTOR_JOINT_LIMIT_Z, MOTOR_JOINT_LIMIT_Z),
-    }
+    rng = random.Random(master_seed)
+    infinite = num_trajectories == 0
 
-    sim_backends = [b for b in args.backends if b != "real"]
-    has_real = "real" in args.backends
-    rng = random.Random(args.master_seed)
+    print(f"Output dir      : {args.output_dir}")
+    print(f"Trajectory modes: {modes}")
+    print(f"Duration        : {sim_time} s")
+    print(f"Joint limits    : {joint_limits}")
+    print(f"Master seed     : {master_seed if master_seed is not None else 'random'}")
+    print(f"Trajectories    : {'unlimited (Ctrl-C to stop)' if infinite else num_trajectories}")
 
     count = 0
     robot_proc: subprocess.Popen | None = None
-    infinite = args.num_trajectories == 0
-
-    print(f"Output dir : {args.output_dir}")
-    print(f"Backends   : {args.backends}")
-    print(f"Modes      : {args.modes}")
-    print(f"Sim time   : {args.sim_time}s  time-step={args.time_step}s")
-    print(f"Trajectories: {'unlimited (Ctrl-C to stop)' if infinite else args.num_trajectories}")
 
     try:
-        while infinite or count < args.num_trajectories:
+        while infinite or count < num_trajectories:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             seed = rng.randint(0, 2**31 - 1)
-            mode_str = rng.choice(args.modes)
-            mode_id = 1 if mode_str == "sin" else 2
+            mode_str = rng.choice(modes)
 
             print(f"\n{'='*60}")
-            print(f"  Recording {count + 1}{'/' + str(args.num_trajectories) if not infinite else ''}"
+            print(f"  Recording {count + 1}{'/' + str(num_trajectories) if not infinite else ''}"
                   f"  ts={ts}  mode={mode_str}  seed={seed}")
 
-            # Generate trajectory
+            # Generate and save trajectory
             if mode_str == "sin":
-                traj = make_sinusoidal_trajectory(joint_limits, args.sim_time, seed)
+                traj = make_sinusoidal_trajectory(joint_limits, sim_time, seed)
             else:
-                traj = make_ptp_trajectory(joint_limits, args.sim_time, seed)
+                traj = make_ptp_trajectory(joint_limits, sim_time, seed)
 
             traj_json = os.path.join(args.output_dir, f"trajectory_{ts}.json")
             traj.config.save(traj_json)
-            print(f"  Trajectory → {os.path.basename(traj_json)}")
+            print(f"  Trajectory saved: trajectory_{ts}.json")
 
-            # ----------------------------------------------------------------
-            # Launch real robot in background BEFORE running sims.
-            # The robot takes real-time; sims finish in a few seconds.
-            # ----------------------------------------------------------------
-            robot_proc = None
+            # Execute on real robot
             real_out = os.path.join(args.output_dir, f"real_{ts}.parquet")
-            if has_real:
-                print("  [real] Launching robot subprocess...")
-                robot_proc = _start_robot(traj_json, real_out, args.ros_python, args.ft_topic)
+            print("  [real] Launching robot subprocess...", flush=True)
+            robot_proc = _start_robot(traj_json, real_out, ros_python, ft_topic)
 
-            # ----------------------------------------------------------------
-            # Run simulators sequentially (they run much faster than real-time)
-            # ----------------------------------------------------------------
-            for backend in sim_backends:
-                print(f"  [{backend}] Running simulation...", end="", flush=True)
-                t0 = time.monotonic()
-                try:
-                    rollout = _SIM_RUNNERS[backend](
-                        params, traj,
-                        noise=args.noise,
-                        cut_off_time=args.cut_off_time,
-                        time_step=args.time_step,
-                    )
-                    out = os.path.join(args.output_dir, f"{backend}_{ts}.parquet")
-                    _save_rollout(rollout, out)
-                    dt = time.monotonic() - t0
-                    print(f" {len(rollout.time)} steps in {dt:.1f}s → {os.path.basename(out)}")
-                except Exception as exc:
-                    print(f" ERROR: {exc}")
-
-            # ----------------------------------------------------------------
-            # Wait for real robot to finish
-            # ----------------------------------------------------------------
-            if robot_proc is not None:
-                print("  [real] Waiting for robot to finish...", end="", flush=True)
-                stdout, stderr = robot_proc.communicate()
-                if robot_proc.returncode == 0:
-                    print(f" done → {os.path.basename(real_out)}")
-                    if stdout.strip():
-                        for line in stdout.strip().splitlines():
-                            print(f"         {line}")
-                else:
-                    print(f" FAILED (exit {robot_proc.returncode})")
-                    if stderr.strip():
-                        # Print at most 5 lines of stderr
-                        for line in stderr.strip().splitlines()[:5]:
-                            print(f"         [stderr] {line}")
-                    print("  [real] Sim files are still valid for this recording.")
-                robot_proc = None
+            # Wait for the robot to finish executing the full trajectory
+            stdout, stderr = robot_proc.communicate()
+            if robot_proc.returncode == 0:
+                print(f"  [real] Saved: real_{ts}.parquet")
+                if stdout.strip():
+                    for line in stdout.strip().splitlines():
+                        print(f"         {line}")
+            else:
+                print(f"  [real] FAILED (exit {robot_proc.returncode}) — trajectory config kept for debugging")
+                if stderr.strip():
+                    for line in stderr.strip().splitlines()[:5]:
+                        print(f"         [stderr] {line}")
+            robot_proc = None
 
             count += 1
 
@@ -294,7 +211,6 @@ def main() -> None:
         print(f"\nInterrupted after {count} completed recordings.")
 
     finally:
-        # Terminate any in-flight robot subprocess
         if robot_proc is not None and robot_proc.poll() is None:
             print("  [real] Terminating robot subprocess...")
             robot_proc.terminate()
@@ -303,10 +219,10 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 robot_proc.kill()
 
-    print(f"\nDataset collection complete: {count} trajectories saved to {args.output_dir}")
+    print(f"\nCollection complete: {count} trajectories saved to {args.output_dir}")
     print(
-        "\nTo calibrate, run:\n"
-        f"  python scripts/run_calibration.py --backend newton "
+        "\nNext — run calibration:\n"
+        f"  python scripts/run_calibration.py "
         f"--recordings-dir {args.output_dir}"
     )
 

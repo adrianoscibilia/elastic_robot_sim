@@ -1,0 +1,43 @@
+# Sim-to-real calibration configuration
+# ----------------------------------------
+# Loaded by run_calibration.py as defaults; all values can be overridden on the CLI.
+
+# Simulator backend to calibrate against the real-robot recordings.
+# options: newton | mujoco
+backend: newton
+
+# Optimizer backend.
+# options: cma | bo | skrl
+optimizer: cma
+
+# Fidelity metric weights passed to compare().
+# Increase "force" if torque/force matching matters more than position.
+metric_weights:
+  position: 1.0
+  velocity: 0.3
+  force:    0.5
+
+# Simulation settings for calibration rollouts
+simulation:
+  noise: false          # disable sensor noise for cleaner loss landscape
+  cut_off_time: 2.0     # skip initial transient (seconds)
+  time_step: 0.01       # integration step (s); must match real-robot recording
+
+# Optimisation budget and split
+data:
+  train_fraction: 0.8   # fraction of rollouts used for optimisation (rest for validation)
+
+# Per-optimizer hyperparameters
+cma:
+  sigma0: 0.3           # initial step-size in normalised [-1, 1] space
+  max_evals: 300
+
+bo:
+  max_evals: 80
+  n_initial_points: 15
+  acq_func: EI          # EI | LCB | PI
+
+skrl:
+  algorithm: ppo        # ppo | sac
+  max_evals: 10000
+  device: cpu
