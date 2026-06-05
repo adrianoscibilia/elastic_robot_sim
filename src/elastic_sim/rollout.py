@@ -162,9 +162,19 @@ class RolloutStore:
             with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(rollout.metadata, f, indent=2)
 
-    def save_sim(self, traj_id: str, rollout: RolloutResult) -> None:
+    def save_sim(
+        self,
+        traj_id: str,
+        rollout: RolloutResult,
+        backend: str = "newton",
+        *,
+        calibrated: bool = False,
+    ) -> None:
+        """Save a sim rollout.  File name: <backend>[_calibrated].parquet."""
         d = self._ensure_dir(traj_id)
-        rollout.to_dataframe().to_parquet(os.path.join(d, "sim_best.parquet"), index=False)
+        suffix = "_calibrated" if calibrated else ""
+        fname = f"{backend}{suffix}.parquet"
+        rollout.to_dataframe().to_parquet(os.path.join(d, fname), index=False)
 
     # ------------------------------------------------------------------
     # Load
@@ -184,8 +194,16 @@ class RolloutStore:
                 meta = json.load(f)
         return RolloutResult.from_dataframe(df, metadata=meta)
 
-    def load_sim(self, traj_id: str) -> RolloutResult:
-        path = os.path.join(self._rollout_dir(traj_id), "sim_best.parquet")
+    def load_sim(
+        self,
+        traj_id: str,
+        backend: str = "newton",
+        *,
+        calibrated: bool = False,
+    ) -> RolloutResult:
+        """Load a sim rollout.  backend="newton"|"mujoco"; calibrated=True for post-calibration."""
+        suffix = "_calibrated" if calibrated else ""
+        path = os.path.join(self._rollout_dir(traj_id), f"{backend}{suffix}.parquet")
         return RolloutResult.from_dataframe(pd.read_parquet(path))
 
     def list_traj_ids(self) -> list[str]:
@@ -200,3 +218,18 @@ class RolloutStore:
         return os.path.exists(
             os.path.join(self._rollout_dir(traj_id), "real.parquet")
         )
+
+    def has_sim(self, traj_id: str, backend: str = "newton", *, calibrated: bool = False) -> bool:
+        suffix = "_calibrated" if calibrated else ""
+        return os.path.exists(
+            os.path.join(self._rollout_dir(traj_id), f"{backend}{suffix}.parquet")
+        )
+
+    def available_backends(self, traj_id: str) -> list[str]:
+        """Return which backend rollout files exist (excluding 'real')."""
+        d = self._rollout_dir(traj_id)
+        found = []
+        for name in ("newton", "mujoco"):
+            if os.path.exists(os.path.join(d, f"{name}.parquet")):
+                found.append(name)
+        return found

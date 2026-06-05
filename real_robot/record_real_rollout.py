@@ -172,8 +172,8 @@ if _HAS_ROS:
             rclpy.spin_until_future_complete(self, result_future)
             return True
 
-        def save_rollout(self) -> str:
-            """Resample and save real.parquet. Returns the output path."""
+        def save_rollout(self, output_file: str | None = None) -> str:
+            """Resample and save real.parquet (or output_file if given). Returns the output path."""
             traj_sim_time = self._traj_config.sim_time
             dt = 0.01  # 100 Hz recording grid
             grid = np.arange(0.0, traj_sim_time, dt)
@@ -237,11 +237,19 @@ if _HAS_ROS:
                 },
             )
 
-            traj_id = os.path.basename(self._output_dir.rstrip("/\\"))
-            store = RolloutStore(os.path.dirname(self._output_dir))
-            store.save_trajectory(traj_id, self._traj_config)
-            store.save_real(traj_id, rollout)
-            out_path = os.path.join(self._output_dir, "real.parquet")
+            if output_file is not None:
+                # Direct path: used by collect_dataset.py for timestamped flat layout
+                os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+                rollout.to_dataframe().to_parquet(output_file, index=False)
+                out_path = output_file
+            else:
+                # Legacy: save under output_dir as real.parquet
+                traj_id = os.path.basename(self._output_dir.rstrip("/\\"))
+                store = RolloutStore(os.path.dirname(self._output_dir))
+                store.save_trajectory(traj_id, self._traj_config)
+                store.save_real(traj_id, rollout)
+                out_path = os.path.join(self._output_dir, "real.parquet")
+
             self.get_logger().info(f"Rollout saved to {out_path}")
             return out_path
 
@@ -259,8 +267,16 @@ def main() -> None:
         help="Path to trajectory.json (produced by the calibration framework).",
     )
     parser.add_argument(
-        "--output-dir", required=True,
-        help="Directory where real.parquet and meta.json will be written.",
+        "--output-dir", default=None,
+        help="Directory where real.parquet will be written (legacy mode).",
+    )
+    parser.add_argument(
+        "--output-file", default=None,
+        help=(
+            "Exact path for the output parquet file, e.g. "
+            "data/recordings/session/real_20240605_143022.parquet. "
+            "Takes precedence over --output-dir."
+        ),
     )
     parser.add_argument(
         "--ft-topic", default="/ft_sensor/wrench",
@@ -272,8 +288,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.output_file is None and args.output_dir is None:
+        parser.error("Provide --output-file or --output-dir.")
+
     config = TrajectoryConfig.load(args.traj_config)
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     if args.dry_run:
         print("Dry run — trajectory loaded, no motion sent.")
@@ -291,13 +311,14 @@ def main() -> None:
         sys.exit(1)
 
     rclpy.init()
-    node = RealRobotRecorder(config, args.output_dir, ft_topic=args.ft_topic)
+    output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.output_file))
+    node = RealRobotRecorder(config, output_dir, ft_topic=args.ft_topic)
     try:
         ok = node.send_trajectory()
         if ok:
             # Give the last samples time to arrive
             rclpy.spin_once(node, timeout_sec=1.0)
-            node.save_rollout()
+            node.save_rollout(output_file=args.output_file)
         else:
             print("Trajectory execution failed.")
             sys.exit(1)

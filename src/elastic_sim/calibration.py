@@ -2,12 +2,17 @@
 
 Usage::
 
-    problem = SimCalibrationProblem(real_rollouts, weights={"position": 1.0})
-    loss = problem.loss(theta)  # theta is the normalised parameter vector
+    # Newton backend (default)
+    problem = SimCalibrationProblem(real_rollouts, backend="newton")
+    loss = problem.loss(theta)
+
+    # MuJoCo backend
+    problem = SimCalibrationProblem(real_rollouts, backend="mujoco")
+    loss = problem.loss(theta)
 
 The model is built once on the first call; subsequent calls use
-apply_params_inplace for speed (falls back to rebuild if in-place mutation
-fails, e.g. under the MuJoCo solver).
+apply_params_inplace for speed.  MuJoCo always supports in-place mutation;
+Newton falls back to a full rebuild if in-place fails (e.g. MuJoCo solver).
 """
 
 from __future__ import annotations
@@ -17,7 +22,9 @@ import numpy as np
 from .compare import compare
 from .params import RobotParams
 from .rollout import RolloutResult
-from .trajectory import Trajectory, _trajectory_from_config, TrajectoryConfig
+from .trajectory import _trajectory_from_config, TrajectoryConfig
+
+_SUPPORTED_BACKENDS = ("newton", "mujoco")
 
 
 class SimCalibrationProblem:
@@ -26,20 +33,21 @@ class SimCalibrationProblem:
     Args:
         real_rollouts:  List of (RolloutResult, TrajectoryConfig) pairs from the
                         real robot (Phase 1 data).
+        backend:        Simulator backend: "newton" (default) or "mujoco".
         weights:        Passed to compare(); controls position/velocity/force
                         trade-off in the loss.
         noise:          Whether to add sensor noise during sim rollouts.
-                        Default False for calibration (noise masks the true
-                        parameter sensitivity).
+                        Default False for calibration (noise masks parameter sensitivity).
         cut_off_time:   Seconds of initial transient to skip in comparison.
         time_step:      Simulation integration step (s).
-        rebuild_on_fail: If apply_params_inplace fails, rebuild model entirely.
+        rebuild_on_fail: (Newton only) If apply_params_inplace fails, rebuild model.
     """
 
     def __init__(
         self,
         real_rollouts: list[tuple[RolloutResult, TrajectoryConfig]],
         *,
+        backend: str = "newton",
         weights: dict[str, float] | None = None,
         noise: bool = False,
         cut_off_time: float = 0.0,
@@ -48,15 +56,20 @@ class SimCalibrationProblem:
     ) -> None:
         if not real_rollouts:
             raise ValueError("real_rollouts must be non-empty.")
+        if backend not in _SUPPORTED_BACKENDS:
+            raise ValueError(f"backend must be one of {_SUPPORTED_BACKENDS}, got '{backend}'.")
+
         self._real_rollouts = real_rollouts
+        self._backend = backend
         self._weights = weights
         self._noise = noise
         self._cut_off_time = cut_off_time
         self._time_step = time_step
         self._rebuild_on_fail = rebuild_on_fail
 
+        # Persistent simulator state (initialised on first loss() call)
         self._model = None
-        self._dof_index_map: dict | None = None
+        self._aux = None          # dof_index_map (Newton) or (data, dof_map, act_map) (MuJoCo)
         self._current_params: RobotParams | None = None
 
         self._n_evals: int = 0
@@ -66,20 +79,50 @@ class SimCalibrationProblem:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _ensure_model(self, params: RobotParams) -> tuple:
+    def _ensure_model(self, params: RobotParams) -> None:
+        if self._backend == "newton":
+            self._ensure_newton(params)
+        else:
+            self._ensure_mujoco(params)
+
+    def _ensure_newton(self, params: RobotParams) -> None:
         from .sim_runner import build_model, apply_params_inplace
-
         if self._model is None:
-            self._model, self._dof_index_map, _ = build_model(params)
-            self._current_params = params
-            return self._model, self._dof_index_map
-
-        # Try cheap in-place update first
-        ok = apply_params_inplace(self._model, params, self._dof_index_map)
-        if not ok and self._rebuild_on_fail:
-            self._model, self._dof_index_map, _ = build_model(params)
+            self._model, dof_map, _ = build_model(params)
+            self._aux = dof_map
+        else:
+            ok = apply_params_inplace(self._model, params, self._aux)
+            if not ok and self._rebuild_on_fail:
+                self._model, self._aux, _ = build_model(params)
         self._current_params = params
-        return self._model, self._dof_index_map
+
+    def _ensure_mujoco(self, params: RobotParams) -> None:
+        from .mujoco_runner import build_model, apply_params_inplace
+        if self._model is None:
+            self._model, data, dof_map, act_map = build_model(params, time_step=self._time_step)
+            self._aux = (data, dof_map, act_map)
+        else:
+            data, dof_map, act_map = self._aux
+            apply_params_inplace(self._model, data, params)
+        self._current_params = params
+
+    def _run_sim(self, traj) -> RolloutResult:
+        if self._backend == "newton":
+            from .sim_runner import run_rollout
+            return run_rollout(
+                self._model, self._aux, traj,
+                noise=self._noise,
+                cut_off_time=self._cut_off_time,
+                time_step=self._time_step,
+            )
+        else:
+            from .mujoco_runner import run_rollout
+            data, dof_map, act_map = self._aux
+            return run_rollout(
+                self._model, data, dof_map, act_map, traj,
+                noise=self._noise,
+                cut_off_time=self._cut_off_time,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -88,34 +131,19 @@ class SimCalibrationProblem:
     def loss(self, theta: np.ndarray) -> float:
         """Evaluate the aggregate fidelity loss for normalised param vector theta.
 
-        Steps:
-            1. Denormalize theta → RobotParams
-            2. Apply params (in-place or rebuild)
-            3. For each real rollout, run sim and compare
-            4. Return mean loss
-
         Args:
             theta: 1-D array in [-1, 1]^n (see RobotParams.bounds()).
 
         Returns:
             Scalar loss (lower = better).
         """
-        from .sim_runner import run_rollout
-
-        params = RobotParams.denormalize(
-            theta, include_payload=len(theta) > 6
-        )
-        model, dof_index_map = self._ensure_model(params)
+        params = RobotParams.denormalize(theta, include_payload=len(theta) > 6)
+        self._ensure_model(params)
 
         losses = []
         for real_rollout, traj_config in self._real_rollouts:
             traj = _trajectory_from_config(traj_config)
-            sim_rollout = run_rollout(
-                model, dof_index_map, traj,
-                noise=self._noise,
-                cut_off_time=self._cut_off_time,
-                time_step=self._time_step,
-            )
+            sim_rollout = self._run_sim(traj)
             result = compare(
                 sim_rollout, real_rollout,
                 self._weights,
@@ -127,6 +155,10 @@ class SimCalibrationProblem:
         self._n_evals += 1
         self._loss_history.append((theta.copy(), mean_loss))
         return mean_loss
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     def n_dims(self, include_payload: bool = True) -> int:
         """Dimension of the normalised parameter vector."""
