@@ -4,15 +4,23 @@ project(elastic_robot_sim)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 
-# Install elastic_sim so record_real_rollout.py can import it after installation.
-# All other simulation code (scripts/, tests/) is left untouched by colcon.
+# Install the elastic_sim Python library (required by both executables).
+# All other simulation code (scripts/sim backends, tests/) is left untouched.
 ament_python_install_package(elastic_sim
   PACKAGE_DIR src/elastic_sim
 )
 
-# Install the single ROS 2 node as an executable (ros2 run elastic_robot_sim record_real_rollout)
+# Install config/ so ament_index_python can locate settings.yaml at runtime.
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
+# Install ROS 2 executables:
+#   ros2 run elastic_robot_sim record_real_rollout.py  — single trajectory
+#   ros2 run elastic_robot_sim collect_dataset         — full dataset collection loop
 install(PROGRAMS
   real_robot/record_real_rollout.py
+  scripts/collect_dataset.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

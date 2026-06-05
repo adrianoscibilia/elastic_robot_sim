@@ -32,5 +32,5 @@ collection:
     y: [-1.8, 1.8]
     z: [-1.0, 1.0]
   payload: 0.0              # kg attached to end-effector during collection
-  ros_python: python3       # Python executable that has ROS 2 packages on its path
-  ft_topic: /ft_sensor/wrench
+  output_dir: data/recordings/session_latest  # default output directory
+  ft_topic: /ft_sensor_command_broadcaster/wrench

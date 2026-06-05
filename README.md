@@ -45,6 +45,20 @@ Trajectories are fully reproducible: all random draws use a seeded `numpy` RNG, 
 
 ---
 
+## Building the ROS 2 Package
+
+The package uses `ament_cmake` and integrates with `colcon`.  Only `collect_dataset.py`, `record_real_rollout.py`, and the `elastic_sim` Python library are installed; all other simulation scripts are left untouched.
+
+```bash
+# Source ROS 2 first, then build
+source /opt/ros/jazzy/setup.bash
+cd <workspace_root>
+colcon build --packages-select elastic_robot_sim
+source install/setup.bash
+```
+
+---
+
 ## Entry-Point Scripts
 
 ### Standalone simulation (single backend)
@@ -92,30 +106,37 @@ python scripts/record_rollouts.py --backends mujoco \
 
 Saves to `data/rollouts/traj_m<mode>_s<seed>/` with one parquet file per backend.
 
-#### Option B — Continuous real-robot data collection
+#### Option B — Continuous real-robot data collection (ROS 2)
+
+Requires a sourced workspace with `joint_trajectory_controller` running (launched by `run_platform_control.launch.py`).
 
 ```bash
-# 10 random trajectories with settings from config/settings.yaml
-python scripts/collect_dataset.py --output-dir data/recordings/session_01
+# Use all settings from config/settings.yaml (output_dir included)
+ros2 run elastic_robot_sim collect_dataset
+
+# Override output directory
+ros2 run elastic_robot_sim collect_dataset \
+    --output-dir data/recordings/session_01
 
 # Override specific settings on the CLI
-python scripts/collect_dataset.py \
+ros2 run elastic_robot_sim collect_dataset \
     --output-dir data/recordings/session_01 \
     --num-trajectories 20 \
     --modes ptp \
     --sim-time 12.0
 
 # Point at a different settings file
-python scripts/collect_dataset.py \
-    --output-dir data/recordings/session_01 \
-    --settings config/settings_robot2.yaml
+ros2 run elastic_robot_sim collect_dataset \
+    --settings /path/to/settings.yaml
 ```
 
-For each trajectory the script:
-1. Reads parameters from `config/settings.yaml` (joint limits, duration, modes, seed policy, ROS 2 settings)
+The output directory is created automatically if it does not exist.
+
+For each trajectory the node:
+1. Reads parameters from `config/settings.yaml` (joint limits, duration, modes, seed policy)
 2. Picks a random mode (sinusoidal / PTP) and a random seed
 3. Saves `trajectory_TS.json` — the seed and waypoints are stored so the exact same trajectory can be replayed in the simulator later
-4. Executes on the real robot via `record_real_rollout.py` and records joint states + F/T
+4. Executes on the real robot via the `FollowJointTrajectory` action client and records `/joint_states` + `/ft_sensor_command_broadcaster/wrench`
 5. If the robot fails, the trajectory config is still kept (useful for debugging and for replaying in sim)
 
 Output layout:
@@ -128,22 +149,22 @@ data/recordings/session_01/
   ...
 ```
 
-#### Real-robot recording (standalone, ROS 2 required)
+#### Real-robot recording (standalone, single trajectory)
 
 ```bash
-# Source ROS 2 workspace first, then:
-python real_robot/record_real_rollout.py \
+# Execute one pre-generated trajectory and record
+ros2 run elastic_robot_sim record_real_rollout.py \
     --traj-config data/rollouts/traj_m2_s42/trajectory.json \
     --output-dir  data/rollouts/traj_m2_s42/
 
 # Dry-run: plan only, no motion
-python real_robot/record_real_rollout.py \
+ros2 run elastic_robot_sim record_real_rollout.py \
     --traj-config data/rollouts/traj_m2_s42/trajectory.json \
     --output-dir  data/rollouts/traj_m2_s42/ \
     --dry-run
 ```
 
-Subscribes to `/joint_states` and `/ft_sensor/wrench`, sends `FollowJointTrajectory` to `joint_trajectory_controller`, and writes `real.parquet` resampled onto a 100 Hz grid.
+Subscribes to `/joint_states` and `/ft_sensor_command_broadcaster/wrench`, sends `FollowJointTrajectory` to `/joint_trajectory_controller/follow_joint_trajectory`, and writes `real.parquet` resampled onto a 100 Hz grid.
 
 ---
 
@@ -152,7 +173,7 @@ Subscribes to `/joint_states` and `/ft_sensor/wrench`, sends `FollowJointTraject
 Defaults are read from `config/calibration.yaml`; all values can be overridden on the CLI.
 
 ```bash
-# Defaults from config/calibration.yaml, recordings from collect_dataset.py
+# Defaults from config/calibration.yaml, recordings from collect_dataset
 python scripts/run_calibration.py --recordings-dir data/recordings/session_01
 
 # Override backend and optimizer
@@ -239,9 +260,15 @@ collection:
     y: [-1.8, 1.8]
     z: [-1.0, 1.0]
   payload: 0.0                  # kg attached during collection
-  ros_python: python3           # Python executable with ROS 2 on its path
-  ft_topic: /ft_sensor/wrench
+  output_dir: data/recordings/session_latest  # created automatically if missing
+  ft_topic: /ft_sensor_command_broadcaster/wrench
 ```
+
+When installed via `colcon build`, the active copy is at:
+```
+install/elastic_robot_sim/share/elastic_robot_sim/config/settings.yaml
+```
+Edit that file to change defaults without rebuilding.  Pass `--settings /path/to/file.yaml` to `collect_dataset` to use a different file entirely.
 
 ### `config/calibration.yaml`
 
@@ -280,9 +307,9 @@ elastic_robot_sim/
 │   ├── elastic_cart_robot_isaacsim.py # Isaac Sim standalone simulation
 │   ├── run_dataset_generation.py  # Batch synthetic dataset generation (Newton)
 │   ├── record_rollouts.py         # Record fixed-trajectory rollouts (sim backends)
-│   ├── collect_dataset.py         # Continuous synchronized collection (sim + real)
+│   ├── collect_dataset.py         # ROS 2 node: batch real-robot dataset collection
 │   └── run_calibration.py         # Sim-to-real calibration optimizer
-├── src/elastic_sim/               # Calibration framework library
+├── src/elastic_sim/               # Calibration framework library (installed via colcon)
 │   ├── params.py                  # RobotParams dataclass (normalize, bounds, YAML I/O)
 │   ├── trajectory.py              # Trajectory classes + factory functions
 │   ├── rollout.py                 # RolloutResult + RolloutStore (parquet I/O)
@@ -290,16 +317,19 @@ elastic_robot_sim/
 │   ├── sim_runner.py              # Newton programmatic API
 │   ├── mujoco_runner.py           # MuJoCo programmatic API
 │   ├── calibration.py             # SimCalibrationProblem (loss function)
+│   ├── ros_recorder.py            # RealRobotRecorder ROS 2 node (shared by both executables)
 │   └── optimizers/
 │       ├── base.py                # Optimizer ABC
 │       ├── cma_backend.py         # CMA-ES
 │       ├── bo_backend.py          # Bayesian optimisation
 │       └── skrl_backend.py        # skrl PPO/SAC
 ├── real_robot/
-│   └── record_real_rollout.py     # ROS 2 node: trajectory execution + recording
+│   └── record_real_rollout.py     # ROS 2 executable: single-trajectory recording
+├── CMakeLists.txt                 # ament_cmake build (installs elastic_sim + executables)
+├── package.xml                    # ROS 2 package manifest
 ├── data/                          # Generated CSV datasets
 ├── data/rollouts/                 # Structured rollout store (record_rollouts.py)
-├── data/recordings/               # Flat timestamped recordings (collect_dataset.py)
+├── data/recordings/               # Flat timestamped recordings (collect_dataset)
 ├── urdf/
 │   └── platform_complete.urdf     # Robot description
 └── tests/
@@ -336,11 +366,12 @@ scikit-optimize        # Bayesian optimisation
 skrl  gymnasium torch  # skrl PPO/SAC
 ```
 
-### Real robot recording
+### Real robot recording (ROS 2)
 ```
 # ROS 2 Jazzy with:
 #   joint_trajectory_controller
-#   control_msgs  trajectory_msgs  sensor_msgs  geometry_msgs
+#   control_msgs  trajectory_msgs  sensor_msgs  geometry_msgs  builtin_interfaces
+#   ament_cmake  ament_cmake_python  ament_index_python
 ```
 
 ---
@@ -358,19 +389,28 @@ python scripts/run_dataset_generation.py
 ### B — Sim-to-real calibration
 
 ```bash
-# Step 1: collect real-robot ground truth
-# (configure joint limits, duration, number of trajectories in config/settings.yaml)
-python scripts/collect_dataset.py --output-dir data/recordings/cal_run_01
+# Step 1: build and source the ROS 2 workspace
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select elastic_robot_sim
+source install/setup.bash
+
+# Step 2: edit collection settings
+nano install/elastic_robot_sim/share/elastic_robot_sim/config/settings.yaml
+
+# Step 3: launch the hardware stack (in a separate terminal)
+ros2 launch tecnobody_workbench run_platform_control.launch.py
+
+# Step 4: collect real-robot ground truth
+ros2 run elastic_robot_sim collect_dataset \
+    --output-dir data/recordings/cal_run_01
 # → trajectory_TS.json + real_TS.parquet for each executed trajectory
 
-# Step 2a: calibrate Newton against real
-# (optimizer settings, metric weights, backend in config/calibration.yaml)
+# Step 5a: calibrate Newton against real
 python scripts/run_calibration.py \
     --recordings-dir data/recordings/cal_run_01 \
     --backend newton --output calibrated_newton.yaml
-# → iteratively re-runs the sim from saved seeds, compares with real, tunes params
 
-# Step 2b: calibrate MuJoCo against the same data
+# Step 5b: calibrate MuJoCo against the same data
 python scripts/run_calibration.py \
     --recordings-dir data/recordings/cal_run_01 \
     --backend mujoco --output calibrated_mujoco.yaml
