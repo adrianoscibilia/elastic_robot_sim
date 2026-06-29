@@ -35,11 +35,15 @@ for p in (_SRC, _SCRIPTS):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import yaml
+
 from elastic_sim.params import RobotParams
 from elastic_sim.rollout import RolloutStore
 from elastic_sim.trajectory import (
     TrajectoryConfig,
     _trajectory_from_config,
+    load_trajectory_settings,
+    validate_trajectory_settings,
     make_ptp_trajectory,
     make_sinusoidal_trajectory,
     make_hold_trajectory,
@@ -132,26 +136,28 @@ def main() -> None:
     # Load params
     params = RobotParams.from_yaml(args.params)
 
+    # Load trajectory settings from yaml (single source of truth)
+    settings_path = args.params if args.params is not None else os.path.join(_REPO, "config", "settings.yaml")
+    with open(settings_path, encoding="utf-8") as _f:
+        _raw_settings = yaml.safe_load(_f)
+    tsettings = load_trajectory_settings(_raw_settings)
+    validate_trajectory_settings(tsettings)
+    time_step = _raw_settings.get("simulation", {}).get("time_step", 0.01)
+
     # Build or load trajectory config
     if args.traj_config is not None:
         print(f"Loading trajectory from {args.traj_config}")
         traj_config = TrajectoryConfig.load(args.traj_config)
         traj_id = os.path.basename(os.path.dirname(args.traj_config))
     else:
-        from sim_common import MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_Z
-        joint_limits = {
-            "x": (-MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_XY),
-            "y": (-MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_XY),
-            "z": (-MOTOR_JOINT_LIMIT_Z, MOTOR_JOINT_LIMIT_Z),
-        }
+        import numpy as np
         mode = args.mode
         if mode == 0:
-            import numpy as np
-            traj = make_hold_trajectory(np.zeros(3), args.sim_time, joint_limits)
+            traj = make_hold_trajectory(np.zeros(3), args.sim_time, tsettings)
         elif mode == 1:
-            traj = make_sinusoidal_trajectory(joint_limits, args.sim_time, args.seed)
+            traj = make_sinusoidal_trajectory(tsettings, args.sim_time, args.seed, time_step=time_step)
         else:
-            traj = make_ptp_trajectory(joint_limits, args.sim_time, args.seed)
+            traj = make_ptp_trajectory(tsettings, args.sim_time, args.seed, time_step=time_step)
         traj_config = traj.config
         traj_id = f"traj_m{mode}_s{args.seed}"
         print(f"Generated trajectory: mode={mode}, seed={args.seed}, sim_time={args.sim_time}s")

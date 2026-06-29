@@ -95,6 +95,7 @@ DRIVE_Z_DAMPING: float = 2.0 * DRIVE_Z_DAMPING_RATIO * math.sqrt(DRIVE_Z_STIFFNE
 # Motor joint travel limits derived from URDF properties:
 #   beam_lenght=4, radius=0.1  → ±(beam_lenght/2 - 2*radius) = ±1.8 m
 #   z_height=2                 → ±(z_height/2) = ±1.0 m
+# Fallback only — runtime joint limits come from settings.yaml trajectory.joint_limits.
 MOTOR_JOINT_LIMIT_XY: float = 1.8
 MOTOR_JOINT_LIMIT_Z: float = 1.0
 
@@ -253,57 +254,6 @@ def debug_dynamics(tau_x, tau_y, tau_z, time, tau_x_nom, tau_y_nom, tau_z_nom, p
     plt.grid()
 
     plt.tight_layout()
-
-# ---------------------------------------------------------------------------
-# Trajectory generators
-# ---------------------------------------------------------------------------
-
-def generate_random_trajectory_params(min_pos: float = -1.0, max_pos: float = 1.0, seed=None):
-    offset = (max_pos + min_pos) / 2
-    amplitude_max = (max_pos - min_pos) * 0.4
-    amplitude = np.random.uniform(0.2, amplitude_max)
-    frequency = np.random.uniform(0.5, 3.0)
-    rng = np.random.default_rng(seed)
-    phase = rng.choice([np.pi / 2, -np.pi / 2])
-    return amplitude, frequency, phase, offset
-
-
-def generate_random_ptp_sequence(joint_limits, sim_time, step_duration, min_distance=0.2):
-    n_segments = int(np.ceil(sim_time / step_duration))
-    q_start = np.array([(j[0] + j[1]) / 2 for j in joint_limits], dtype=float)
-    points = [q_start]
-
-    for _ in range(n_segments):
-        while True:
-            q_candidate = np.array(
-                [np.random.uniform(j[0], j[1]) for j in joint_limits],
-                dtype=float,
-            )
-            if np.linalg.norm(q_candidate - points[-1]) > min_distance:
-                points.append(q_candidate)
-                break
-
-    points = np.array(points)
-
-    def trajectory(t):
-        segment = int(t // step_duration)
-        if segment >= n_segments:
-            return points[-1], np.zeros(len(joint_limits))
-
-        tau = (t - segment * step_duration) / step_duration
-        tau = np.clip(tau, 0.0, 1.0)
-
-        q0 = points[segment]
-        q1 = points[segment + 1]
-
-        s = 3 * tau**2 - 2 * tau**3
-        ds = (6 * tau * (1 - tau)) / step_duration
-
-        q = q0 + s * (q1 - q0)
-        dq = ds * (q1 - q0)
-        return q, dq
-
-    return trajectory, points
 
 # ---------------------------------------------------------------------------
 # XACRO / URDF utilities

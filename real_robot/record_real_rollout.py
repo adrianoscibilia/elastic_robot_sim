@@ -75,6 +75,10 @@ def main() -> None:
         help="Trajectory speed as %% of nominal (1–100).",
     )
     parser.add_argument(
+        "--record-rate-hz", type=float, default=100.0,
+        help="Recording/resample rate in Hz (default: 100.0).",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Plan only — do not send motion commands to the robot.",
     )
@@ -90,7 +94,8 @@ def main() -> None:
     if args.dry_run:
         print("Dry run — trajectory loaded, no motion sent.")
         traj = _trajectory_from_config(config)
-        times, q_refs, dq_refs = traj.sample_grid(0.01)
+        dt = 1.0 / args.record_rate_hz
+        times, q_refs, dq_refs = traj.sample_grid(dt)
         print(f"  Trajectory: mode={config.mode}, sim_time={config.sim_time:.1f}s, "
               f"{len(times)} steps")
         print(f"  Position range X: [{q_refs[:,0].min():.3f}, {q_refs[:,0].max():.3f}] m")
@@ -104,8 +109,12 @@ def main() -> None:
 
     rclpy.init()
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.output_file))
-    node = RealRobotRecorder(config, output_dir, ft_topic=args.ft_topic,
-                             speed_override=args.speed_override)
+    node = RealRobotRecorder(
+        config, output_dir,
+        ft_topic=args.ft_topic,
+        speed_override=args.speed_override,
+        record_rate_hz=args.record_rate_hz,
+    )
     try:
         ok = node.send_trajectory()
         if ok:

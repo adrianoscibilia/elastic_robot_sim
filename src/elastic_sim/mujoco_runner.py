@@ -339,7 +339,7 @@ def run_rollout(
     az = int(act_index_map["joint_z"])
 
     time_step = float(model.opt.timestep)
-    sim_time = trajectory.config.sim_time
+    sim_time = trajectory.config.effective_sim_time
     num_steps = int(np.ceil(sim_time / time_step))
 
     time_list: list = []

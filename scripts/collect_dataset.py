@@ -65,7 +65,12 @@ _SRC = os.path.join(_REPO, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from elastic_sim.trajectory import make_ptp_trajectory, make_sinusoidal_trajectory
+from elastic_sim.trajectory import (
+    load_trajectory_settings,
+    validate_trajectory_settings,
+    make_ptp_trajectory,
+    make_sinusoidal_trajectory,
+)
 
 _HAS_ROS = False
 try:
@@ -208,6 +213,28 @@ def _parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
+# Robot subprocess
+# ---------------------------------------------------------------------------
+
+def _start_robot(
+    traj_json: str,
+    output_file: str,
+    ros_python: str,
+    ft_topic: str,
+    record_rate_hz: float,
+) -> subprocess.Popen:
+    script = os.path.join(_REPO, "real_robot", "record_real_rollout.py")
+    cmd = [
+        ros_python, script,
+        "--traj-config", traj_json,
+        "--output-file", output_file,
+        "--ft-topic", ft_topic,
+        "--record-rate-hz", str(record_rate_hz),
+    ]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -216,41 +243,20 @@ def main() -> None:
     settings = _load_settings(args.settings)
     col = settings.get("collection", {})
 
-    # CLI wins over settings.yaml
-    num_trajectories: int = (
-        args.num_trajectories if args.num_trajectories is not None
-        else col.get("num_trajectories", 10)
-    )
-    modes: list[str] = (
-        args.modes if args.modes is not None
-        else col.get("modes", ["sin", "ptp"])
-    )
-    sim_time: float = (
-        args.sim_time if args.sim_time is not None
-        else col.get("sim_time", 15.0)
-    )
-    master_seed = (
-        args.master_seed if args.master_seed is not None
-        else col.get("master_seed", None)
-    )
-    ft_topic: str = (
-        args.ft_topic if args.ft_topic is not None
-        else col.get("ft_topic", FT_TOPIC_DEFAULT)
-    )
-    speed_override: float = (
-        args.speed_override if args.speed_override is not None
-        else float(col.get("speed_override", 30.0))
-    )
-    output_dir: str = (
-        args.output_dir if args.output_dir is not None
-        else col.get("output_dir", "data/recordings/session_latest")
-    )
-    motor_control: bool = not args.no_motor_control
+    # Load and validate trajectory settings (single source of truth)
+    tsettings = load_trajectory_settings(settings)
+    validate_trajectory_settings(tsettings)
 
-    raw_limits = col.get(
-        "joint_limits", {"x": [-1.8, 1.8], "y": [-1.8, 1.8], "z": [-1.0, 1.0]}
-    )
-    joint_limits = {ax: tuple(v) for ax, v in raw_limits.items()}
+    # Resolve effective collection config (CLI wins over settings.yaml)
+    num_trajectories: int = args.num_trajectories if args.num_trajectories is not None else col.get("num_trajectories", 10)
+    modes: list[str]      = args.modes            if args.modes is not None            else col.get("modes", ["sin", "ptp"])
+    sim_time: float       = args.sim_time          if args.sim_time is not None          else col.get("sim_time", 15.0)
+    master_seed           = args.master_seed       if args.master_seed is not None       else col.get("master_seed", None)
+    ros_python: str       = args.ros_python        if args.ros_python is not None        else col.get("ros_python", "python3")
+    ft_topic: str         = args.ft_topic          if args.ft_topic is not None          else col.get("ft_topic", "/ft_sensor/wrench")
+    speed_override: float = col.get("speed_override", 100.0)
+    record_rate_hz: float = col.get("record_rate_hz", 100.0)
+    time_step: float      = settings.get("simulation", {}).get("time_step", 0.01)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -260,7 +266,10 @@ def main() -> None:
     print(f"Output dir      : {output_dir}")
     print(f"Trajectory modes: {modes}")
     print(f"Duration        : {sim_time} s")
-    print(f"Joint limits    : {joint_limits}")
+    print(f"Joint limits    : {dict(tsettings.joint_limits)}")
+    print(f"Peak vel limit  : {tsettings.peak_cartesian_velocity_ms} m/s")
+    print(f"Speed override  : {speed_override}%")
+    print(f"Record rate     : {record_rate_hz} Hz")
     print(f"Master seed     : {master_seed if master_seed is not None else 'random'}")
     print(f"F/T topic       : {ft_topic}")
     print(f"Speed override  : {speed_override:.0f}%")
@@ -302,11 +311,24 @@ def main() -> None:
                 f"  ts={ts}  mode={mode_str}  seed={seed}"
             )
 
-            # Generate and save trajectory config
+            # Generate and save trajectory — baked config is self-describing
             if mode_str == "sin":
-                traj = make_sinusoidal_trajectory(joint_limits, sim_time, seed)
+                traj = make_sinusoidal_trajectory(
+                    tsettings, sim_time, seed,
+                    speed_override=speed_override, time_step=time_step,
+                )
             else:
-                traj = make_ptp_trajectory(joint_limits, sim_time, seed)
+                traj = make_ptp_trajectory(
+                    tsettings, sim_time, seed,
+                    speed_override=speed_override, time_step=time_step,
+                )
+
+            cfg = traj.config
+            nom_peak = cfg.executed_peak_velocity_ms / cfg.global_speed_factor if cfg.global_speed_factor > 0 else 0.0
+            print(f"  speed: nominal_peak={nom_peak:.3f} "
+                  f"factor={cfg.global_speed_factor:.3f} "
+                  f"executed_peak={cfg.executed_peak_velocity_ms:.3f} m/s "
+                  f"duration={cfg.sim_time:.2f}s")
 
             traj_json = os.path.join(output_dir, f"trajectory_{ts}.json")
             traj.config.save(traj_json)

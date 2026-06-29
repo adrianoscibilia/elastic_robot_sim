@@ -4,7 +4,17 @@ import argparse
 import yaml
 from yaml import SafeLoader
 import os
+import sys
 from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+from elastic_sim.trajectory import (
+    load_trajectory_settings,
+    validate_trajectory_settings,
+    make_sinusoidal_trajectory,
+    make_ptp_trajectory,
+    make_hold_trajectory,
+)
 
 from warp import tau
 
@@ -159,92 +169,9 @@ def debug_dynamics(tau_x, tau_y, tau_z, tau_x_nom, tau_y_nom, tau_z_nom, time):
 ########################### Trajectory Generation ###############################
 #################################################################################
 
-def generate_random_trajectory_params(min_pos=-1.0, max_pos=1.0, seed=None):
-    """
-    Generate random sinusoidal trajectory parameters within joint limits.
-    
-    Args:
-        min_pos: minimum position limit
-        max_pos: maximum position limit
-    
-    Returns:
-        tuple: (amplitude, frequency, phase, offset)
-    """
-    # Center offset at middle of joint range
-    offset = (max_pos + min_pos) / 2
-    
-    # Amplitude limited to 80% of available range
-    amplitude_max = (max_pos - min_pos) * 0.4
-    amplitude = np.random.uniform(0.2, amplitude_max)
-    
-    # Random frequency between 0.5 and 3.0 rad/s
-    frequency = np.random.uniform(0.5, 3.0)
-    
-    # Random phase between 0 and 2*pi
-    rng = np.random.default_rng(seed)
-    phase = rng.choice([np.pi/2, -np.pi/2])
-    
-    return amplitude, frequency, phase, offset
-
-def generate_random_ptp_sequence(joint_limits, sim_time, step_duration, min_distance=0.2):
-    """
-    Generate a sequence of random PTP motions that exactly fills sim_time.
-
-    Args:
-        joint_limits: [(min,max), ...]
-        sim_time: total simulation time
-        step_duration: duration of each segment
-        min_distance: minimum joint-space distance between points
-
-    Returns:
-        trajectory(t) -> (q, dq)
-    """
-
-    n_segments = int(np.ceil(sim_time / step_duration))
-
-    # start from center of joint limits
-    q_start = np.array([(j[0] + j[1]) / 2 for j in joint_limits])
-
-    points = [q_start]
-
-    # generate random targets
-    for _ in range(n_segments):
-
-        while True:
-            q_candidate = np.array([
-                np.random.uniform(j[0], j[1]) for j in joint_limits
-            ])
-
-            if np.linalg.norm(q_candidate - points[-1]) > min_distance:
-                points.append(q_candidate)
-                break
-
-    points = np.array(points)
-
-    def trajectory(t):
-
-        # determine current segment
-        segment = int(t // step_duration)
-
-        if segment >= n_segments:
-            return points[-1], np.zeros(len(joint_limits))
-
-        tau = (t - segment * step_duration) / step_duration
-        tau = np.clip(tau, 0.0, 1.0)
-
-        q0 = points[segment]
-        q1 = points[segment + 1]
-
-        # cubic interpolation
-        s = 3 * tau**2 - 2 * tau**3
-        ds = (6 * tau * (1 - tau)) / step_duration
-
-        q = q0 + s * (q1 - q0)
-        dq = ds * (q1 - q0)
-
-        return q, dq
-
-    return trajectory, points
+# TODO (isaacsim): heavy isaaclab/isaacsim imports at the module top prevent running
+# this backend in CI. The trajectory math is imported from elastic_sim.trajectory
+# at runtime (below); only the isaaclab simulation loop itself remains here.
 
 #################################################################################
 ############################# Main Simulation Loop ##############################
@@ -510,31 +437,25 @@ def main():
     stiffness_vector = np.array([DRIVE_X_STIFFNESS, DRIVE_Y_STIFFNESS, DRIVE_Z_STIFFNESS])
     damping_vector = np.array([DRIVE_X_DAMPING, DRIVE_Y_DAMPING, DRIVE_Z_DAMPING])
 
-    # Generate Reference Trajectories
-    if REF_MODE == 1:
-        amp_x, freq_x, phase_x, offset_x = generate_random_trajectory_params(-1.25, 1.25, seed)
-        amp_y, freq_y, phase_y, offset_y = generate_random_trajectory_params(-1.25, 1.25, seed)
-        amp_z, freq_z, phase_z, offset_z = generate_random_trajectory_params(-1.0, 1.0, seed)
-
-        print(f"\nGenerated random trajectories:")
-        print(f"  X: amp={amp_x:.3f}, freq={freq_x:.3f}, phase={phase_x:.3f}, offset={offset_x:.3f}")
-        print(f"  Y: amp={amp_y:.3f}, freq={freq_y:.3f}, phase={phase_y:.3f}, offset={offset_y:.3f}")
-        print(f"  Z: amp={amp_z:.3f}, freq={freq_z:.3f}, phase={phase_z:.3f}, offset={offset_z:.3f}\n")
-
+    # Build reference trajectory from settings.yaml (no magic numbers)
+    _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "settings.yaml")
+    with open(_config_path, encoding="utf-8") as _f:
+        _raw_settings = yaml.load(_f, Loader=SafeLoader)
+    tset = load_trajectory_settings(_raw_settings)
+    validate_trajectory_settings(tset)
+    if REF_MODE == 0:
+        _traj_obj = make_hold_trajectory(np.zeros(3), SIM_TIME, tset)
+        print("\nReference mode 0: holding zero position.\n")
+    elif REF_MODE == 1:
+        _traj_obj = make_sinusoidal_trajectory(tset, SIM_TIME, seed, time_step=TIME_STEP)
+        print(f"\nSinusoidal trajectory: peak={_traj_obj.config.executed_peak_velocity_ms:.3f} m/s  "
+              f"factor={_traj_obj.config.global_speed_factor:.3f}\n")
     elif REF_MODE == 2:
-        trajectory, ptp_points = generate_random_ptp_sequence(
-            joint_limits=[
-                (-1.25, 1.25),
-                (-1.25, 1.25),
-                (-1.0, 1.0)
-            ],
-            sim_time=SIM_TIME,
-            step_duration=2.0
-        )
-
-        print("Generated PTP points:")
-        for p in ptp_points:
-            print(p)
+        _traj_obj = make_ptp_trajectory(tset, SIM_TIME, seed, time_step=TIME_STEP)
+        print(f"\nPTP trajectory: peak={_traj_obj.config.executed_peak_velocity_ms:.3f} m/s  "
+              f"factor={_traj_obj.config.global_speed_factor:.3f}\n")
+    else:
+        raise ValueError(f"Invalid ref_mode: {REF_MODE}")
 
     # -----------------------------
     # Sensor noise parameters
@@ -582,22 +503,10 @@ def main():
             damping_vector * dq_link
         )
 
-        # Compute reference trajectories with random parameters
-        if REF_MODE == 1:
-            tau = 1.0
-            ramp = 1 - np.exp(-time / tau)
-            ref_x = ramp * (amp_x * np.sin(freq_x * time + phase_x)) + offset_x
-            ref_y = ramp * (amp_y * np.cos(freq_y * time + phase_y)) + offset_y
-            ref_z = ramp * (amp_z * np.sin(freq_z * time + phase_z)) + offset_z
-            vel_x = ramp * (amp_x * freq_x * np.cos(freq_x * time + phase_x))
-            vel_y = ramp * (-amp_y * freq_y * np.sin(freq_y * time + phase_y))
-            vel_z = ramp * (amp_z * freq_z * np.cos(freq_z * time + phase_z))
-        elif REF_MODE == 2:
-            q_ref, dq_ref = trajectory(time)
-            ref_x, ref_y, ref_z = q_ref
-            vel_x, vel_y, vel_z = dq_ref
-        else:
-            raise ValueError(f"Invalid ref_mode: {REF_MODE}")
+        # Compute reference trajectory
+        _q_ref, _dq_ref = _traj_obj(time)
+        ref_x, ref_y, ref_z = _q_ref
+        vel_x, vel_y, vel_z = _dq_ref
 
         action = ArticulationAction(
             joint_positions=np.array([ref_x, 0.0, ref_y, 0.0, ref_z, 0.0]),

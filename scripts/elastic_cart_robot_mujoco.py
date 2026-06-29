@@ -32,6 +32,17 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+import yaml
+from elastic_sim.trajectory import (
+    load_trajectory_settings,
+    validate_trajectory_settings,
+    make_sinusoidal_trajectory,
+    make_ptp_trajectory,
+    make_hold_trajectory,
+)
+
 from sim_common import (  # noqa: E402
     CSV_COLUMNS,
     CUT_OFF_TIME,
@@ -53,8 +64,6 @@ from sim_common import (  # noqa: E402
     MASS_LINK_Z_MOTOR,
     MOTOR_DAMPING,
     MOTOR_FORCE_LIMIT,
-    MOTOR_JOINT_LIMIT_XY,
-    MOTOR_JOINT_LIMIT_Z,
     MOTOR_STIFFNESS,
     PAYLOAD,
     PAYLOAD_BOX_SIZE,
@@ -66,8 +75,7 @@ from sim_common import (  # noqa: E402
     TORQUE_NOISE_REL,
     debug_dynamics,
     debug_kinematics,
-    generate_random_ptp_sequence,
-    generate_random_trajectory_params,
+    load_settings,
     make_csv_filename,
     set_random_seed,
 )
@@ -222,34 +230,23 @@ def main():
     stiffness_vector = np.array([DRIVE_X_STIFFNESS, DRIVE_Y_STIFFNESS, DRIVE_Z_STIFFNESS])
     damping_vector   = np.array([DRIVE_X_DAMPING,   DRIVE_Y_DAMPING,   DRIVE_Z_DAMPING])
 
-    reference_limits = {
-        "x": (-MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_XY),
-        "y": (-MOTOR_JOINT_LIMIT_XY, MOTOR_JOINT_LIMIT_XY),
-        "z": (-MOTOR_JOINT_LIMIT_Z,  MOTOR_JOINT_LIMIT_Z),
-    }
-
     # ------------------------------------------------------------------
-    # Build reference trajectory
+    # Build reference trajectory from settings.yaml (no magic numbers)
     # ------------------------------------------------------------------
+    _raw_settings = load_settings()
+    tset = load_trajectory_settings(_raw_settings)
+    validate_trajectory_settings(tset)
     if REF_MODE == 0:
+        _traj_obj = make_hold_trajectory(np.zeros(3), SIM_TIME, tset)
         print("\nReference mode 0: holding zero position.\n")
     elif REF_MODE == 1:
-        amp_x, freq_x, phase_x, offset_x = generate_random_trajectory_params(*reference_limits["x"], seed)
-        amp_y, freq_y, phase_y, offset_y = generate_random_trajectory_params(*reference_limits["y"], seed)
-        amp_z, freq_z, phase_z, offset_z = generate_random_trajectory_params(*reference_limits["z"], seed)
-        print("\nGenerated random trajectories:")
-        print(f"  X: amp={amp_x:.3f}, freq={freq_x:.3f}, phase={phase_x:.3f}, offset={offset_x:.3f}")
-        print(f"  Y: amp={amp_y:.3f}, freq={freq_y:.3f}, phase={phase_y:.3f}, offset={offset_y:.3f}")
-        print(f"  Z: amp={amp_z:.3f}, freq={freq_z:.3f}, phase={phase_z:.3f}, offset={offset_z:.3f}\n")
+        _traj_obj = make_sinusoidal_trajectory(tset, SIM_TIME, seed, time_step=TIME_STEP)
+        print(f"\nSinusoidal trajectory: peak={_traj_obj.config.executed_peak_velocity_ms:.3f} m/s  "
+              f"factor={_traj_obj.config.global_speed_factor:.3f}\n")
     elif REF_MODE == 2:
-        trajectory, ptp_points = generate_random_ptp_sequence(
-            joint_limits=[reference_limits["x"], reference_limits["y"], reference_limits["z"]],
-            sim_time=SIM_TIME,
-            step_duration=2.0,
-        )
-        print("Generated PTP points:")
-        for p in ptp_points:
-            print(p)
+        _traj_obj = make_ptp_trajectory(tset, SIM_TIME, seed, time_step=TIME_STEP)
+        print(f"\nPTP trajectory: peak={_traj_obj.config.executed_peak_velocity_ms:.3f} m/s  "
+              f"factor={_traj_obj.config.global_speed_factor:.3f}\n")
     else:
         raise ValueError(f"Invalid ref_mode: {REF_MODE}")
 
@@ -297,21 +294,9 @@ def main():
             dq_link  = np.array([dq_meas[dof_index_map[a]["elastic"]] for a in ("x", "y", "z")])
 
             # ── Reference trajectory ────────────────────────────────
-            if REF_MODE == 0:
-                ref_x = ref_y = ref_z = 0.0
-                vel_x = vel_y = vel_z = 0.0
-            elif REF_MODE == 1:
-                ramp  = 1.0 - np.exp(-t / 1.0)
-                ref_x = ramp * (amp_x * np.sin(freq_x * t + phase_x)) + offset_x
-                ref_y = ramp * (amp_y * np.cos(freq_y * t + phase_y)) + offset_y
-                ref_z = ramp * (amp_z * np.sin(freq_z * t + phase_z)) + offset_z
-                vel_x = ramp * (amp_x * freq_x *  np.cos(freq_x * t + phase_x))
-                vel_y = ramp * (-amp_y * freq_y * np.sin(freq_y * t + phase_y))
-                vel_z = ramp * (amp_z * freq_z *  np.cos(freq_z * t + phase_z))
-            else:
-                q_ref, dq_ref = trajectory(t)
-                ref_x, ref_y, ref_z = q_ref
-                vel_x, vel_y, vel_z = dq_ref
+            _q_ref, _dq_ref = _traj_obj(t)
+            ref_x, ref_y, ref_z = _q_ref
+            vel_x, vel_y, vel_z = _dq_ref
 
             # ── Apply PD + velocity feedforward control ─────────────
             # ctrl = pos_ref + (kd/kp) * vel_ref

@@ -711,7 +711,7 @@ def run_rollout(
     joint_targets = np.zeros(model.joint_dof_count, dtype=np.float32)
     joint_target_vel = np.zeros(model.joint_dof_count, dtype=np.float32)
 
-    sim_time = trajectory.config.sim_time
+    sim_time = trajectory.config.effective_sim_time
     num_steps = int(np.ceil(sim_time / time_step))
 
     # Pre-extract DOF indices

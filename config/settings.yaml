@@ -18,7 +18,50 @@ simulation:
   cut_off_time: 2.0 # seconds to skip at start of comparisons
 
 # -----------------------------------------------------------------------
-# Data collection settings (used by scripts/collect_dataset.py)
+# Everything that shapes a trajectory lives here. No trajectory-shaping
+# literal may exist in .py files (O1 / INV-2).
+# -----------------------------------------------------------------------
+trajectory:
+  # Position limits per prismatic axis (meters). Used for both amplitude
+  # clamping (sin) and waypoint sampling (ptp). Single source of truth.
+  joint_limits:
+    x: [-1.8, 1.8]
+    y: [-1.8, 1.8]
+    z: [-1.0, 1.0]
+
+  # --- Velocity / speed governance ------------------------------------
+  # Desired Cartesian peak speed cap (m/s). The auto override guarantees the
+  # executed peak velocity never exceeds this.
+  peak_cartesian_velocity_ms: 0.5
+
+  # Optional per-axis velocity caps (m/s). null = no per-axis cap;
+  # only the Cartesian peak applies.
+  axis_velocity_limits_ms:
+    x: null
+    y: null
+    z: null
+
+  # Startup ramp time constant (s): ramp = 1 - exp(-t / ramp_tau).
+  ramp_tau: 1.0
+
+  # --- Sinusoidal mode shape parameters --------------------------------
+  sinusoidal:
+    amplitude_fraction: 0.4    # max amp = (hi-lo) * amplitude_fraction
+    amplitude_min_m: 0.2       # min amp (m); must be < max amp
+    freq_min: 0.5              # rad/s
+    freq_max: 3.0              # rad/s
+
+  # --- PTP mode shape parameters ---------------------------------------
+  ptp:
+    step_duration: 2.0         # s per segment (nominal, before speed scaling)
+    min_distance: 0.2          # m, minimum spacing between consecutive waypoints
+
+  # --- Execution / sampling density ------------------------------------
+  # Points per PTP segment when building the ROS FollowJointTrajectory goal.
+  ros_points_per_segment: 20
+
+# -----------------------------------------------------------------------
+# Data collection. speed_override is the USER cap; default 100 = deactivated.
 # -----------------------------------------------------------------------
 collection:
   num_trajectories: 10      # 0 = run until Ctrl-C
