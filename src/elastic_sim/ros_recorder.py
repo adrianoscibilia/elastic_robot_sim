@@ -117,8 +117,12 @@ if _HAS_ROS:
             self._joint_velocities: dict[str, list[tuple[float, float]]] = {
                 j: [] for j in JOINT_NAMES
             }
+            self._joint_efforts: dict[str, list[tuple[float, float]]] = {
+                j: [] for j in JOINT_NAMES
+            }
             self._ft_data: list[tuple[float, float, float, float]] = []
             self._t0: float = 0.0
+            self._warned_missing_effort: bool = False
 
         def _js_callback(self, msg: JointState) -> None:
             t = self.get_clock().now().nanoseconds * 1e-9
@@ -130,6 +134,16 @@ if _HAS_ROS:
                         self._joint_positions[jname].append((t, msg.position[i]))
                         vel = msg.velocity[i] if i < len(msg.velocity) else 0.0
                         self._joint_velocities[jname].append((t, vel))
+                        if i < len(msg.effort):
+                            self._joint_efforts[jname].append((t, msg.effort[i]))
+                        elif not self._warned_missing_effort:
+                            self.get_logger().warn(
+                                "/joint_states has no effort field for "
+                                f"'{jname}' — commanded torque will be recorded as 0. "
+                                "Check that the hardware's JointStateBroadcaster "
+                                "exposes an effort state interface."
+                            )
+                            self._warned_missing_effort = True
 
         def _ft_callback(self, msg: WrenchStamped) -> None:
             t = self.get_clock().now().nanoseconds * 1e-9
@@ -372,7 +386,19 @@ if _HAS_ROS:
                     ])
                 else:
                     tau_link = np.zeros((len(grid), 3))
-                tau_motor = tau_link.copy()
+                # tau_motor is the commanded joint effort read from /joint_states
+                # (msg.effort), NOT the F/T sensor. Do not conflate the two.
+                tau_motor = np.column_stack([
+                    _interp(self._joint_efforts[j], t0) for j in JOINT_NAMES
+                ])
+
+            if not np.any(tau_motor):
+                self.get_logger().warn(
+                    "Recorded tau_motor (joint effort) is all zero. The "
+                    "hardware's JointStateBroadcaster likely does not expose an "
+                    "effort state interface for these joints — check "
+                    "ros2_control controller config."
+                )
 
             # Reference positions: evaluate the nominal trajectory at the equivalent
             # nominal time (t_real * factor), matching what the controller was sent.
