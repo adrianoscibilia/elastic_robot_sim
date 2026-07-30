@@ -152,7 +152,6 @@ class TrajectoryConfig:
             step_duration=float(d.get("step_duration", 2.0)),
             params=d.get("params", {}),
             speed_override=float(d.get("speed_override", 100.0)),
-            speed_override=float(d.get("speed_override", 100.0)),
             vel_limit_ms=float(d["vel_limit_ms"]) if d.get("vel_limit_ms") is not None else None,
             ramp_tau=float(d.get("ramp_tau", 1.0)),
             nominal_sim_time=nominal_sim_time,

@@ -226,6 +226,45 @@ All values are normalised to `[-1, 1]` before being passed to the optimizer.
 
 The fidelity metric is a weighted normalised RMSE over position, velocity, and torque signals (configurable in `config/calibration.yaml`).
 
+### Asset-driven serial-arm simulation and calibration
+
+The Cartesian platform remains supported, but new robots are now defined by
+asset files rather than hard-coded joint names.  Put a robot description and
+its provenance under `assets/robots/<robot>/`, then create an `asset.yaml`
+with its URDF and ordered active joints.  `elastic_sim.assets` discovers the
+URDF's non-mimic one-DoF joints, and `elastic_sim.generic_newton_runner`
+rebuilds every selected joint as a motor joint followed by a negligible-mass,
+passive elastic transmission joint.
+
+The asset layer is intentionally reusable: robot-specific files name assets,
+joint order, units and parameter priors; trajectory generation, torque replay,
+comparison, optimization and storage do not embed robot names.  See
+[`assets/README.md`](assets/README.md) for provenance and the downloaded
+benchmark material.
+
+For a serial arm, Pinocchio is the primary non-ROS trajectory dependency: it
+loads the URDF and its joint limits, validates the selected one-DoF chain, and
+creates seeded, limit-safe minimum-jerk joint-space trajectories.  Install the
+Pinocchio Python bindings in the simulator environment, then run:
+
+```bash
+python scripts/generate_serial_trajectory.py \
+  --urdf assets/robots/baxter/description/baxter_description/urdf/baxter.urdf \
+  --joints left_s0,left_s1,left_e0,left_e1,left_w0,left_w1,left_w2 \
+  --output data/trajectories/baxter_left.json --seed 42
+```
+
+MoveIt is the complementary ROS 2 path for collision-aware planning and real
+robot execution; it should consume these asset definitions rather than become
+the simulator's required runtime dependency.
+
+`scripts/run_dataset_calibration.py` calibrates a generic Newton asset by
+replaying recorded joint torques.  It consumes canonical CSV/Parquet data and
+an asset/config-only YAML such as
+`config/dataset_calibration.example.yaml`.  Its metric distinguishes observed
+output/link state, optional observed motor state, joint torque input, and an
+optional end-effector F/T channel—none is silently substituted for another.
+
 ---
 
 ## Configuration

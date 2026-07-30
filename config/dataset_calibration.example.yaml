@@ -1,0 +1,23 @@
+# Generic sim-vs-dataset calibration.  Asset-specific values belong in this
+# file; the optimizer, metrics, ingestion and runner protocol remain shared.
+asset: assets/robots/baxter/asset.yaml
+dataset: data/processed/baxter_direct_dynamics.parquet
+joint_names: [left_s0, left_s1, left_e0, left_e1, left_w0, left_w1, left_w2]
+runner_factory: elastic_sim.generic_newton_runner:make_torque_replay_runner
+train_fraction: 0.8
+metric_weights:
+  position: 1.0
+  velocity: 0.3
+  # Use only when the source provides a separate motor encoder stream (KUKA raw data).
+  motor_position: 0.0
+  motor_velocity: 0.0
+optimizer:
+  name: cma
+  sigma0: 0.3
+  max_evals: 300
+# Direct stiffness/damping units for revolute transmissions.  The parameters
+# are intentionally per-joint and not tied to the Cartesian x/y/z convention.
+parameters:
+  - {name: left_s0.stiffness, lower: 10.0, upper: 100000.0, log_scale: true}
+  - {name: left_s0.damping, lower: 0.01, upper: 1000.0, log_scale: true}
+  # Repeat stiffness/damping entries for every selected active joint.

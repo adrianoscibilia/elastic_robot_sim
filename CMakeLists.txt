@@ -26,5 +26,13 @@ install(PROGRAMS scripts/collect_dataset.py
   RENAME collect_dataset
   DESTINATION lib/${PROJECT_NAME}
 )
+install(PROGRAMS scripts/generate_serial_trajectory.py
+  RENAME generate_serial_trajectory
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(PROGRAMS scripts/run_dataset_calibration.py
+  RENAME run_dataset_calibration
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()

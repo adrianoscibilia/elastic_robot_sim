@@ -1,0 +1,10 @@
+# Robot-specific content belongs in this file, not in simulation code.
+# `active_joints` may be omitted to select every non-mimic 1-DoF URDF joint.
+asset:
+  name: ur10
+  urdf: ../../urdf/ur10.urdf
+  active_joints: []
+  base:
+    position: [0.0, 0.0, 0.0]
+    quaternion: [0.0, 0.0, 0.0, 1.0]
+  self_collisions: false

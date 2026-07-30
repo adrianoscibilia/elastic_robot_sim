@@ -1,0 +1,8 @@
+# Large downloaded benchmark data; retain manifests, provenance and checksums.
+datasets/**/raw/
+datasets/**/*.rar
+datasets/**/*.mat
+datasets/**/*.csv
+
+# Temporary clone used only to obtain the archived, tracked Baxter description.
+robots/baxter/source/

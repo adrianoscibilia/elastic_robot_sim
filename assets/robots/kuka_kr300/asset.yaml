@@ -1,0 +1,10 @@
+schema_version: 1
+name: kuka_kr300_r2500_ultra_se
+manufacturer: KUKA
+model_status: blocked_missing_authoritative_description
+degrees_of_freedom: 6
+dataset_axis_order: [a1, a2, a3, a4, a5, a6]
+required_description_format: URDF
+required_validation: >-
+  Verify kinematic chain, mechanical zero, axis sign, units, limits and link
+  inertias against the actual KR300 R2500 ultra SE before use in calibration.
