@@ -626,7 +626,7 @@ def _build_platform_from_urdf():
         articulation_joint_indices.append(joint_idx)
 
     _add_payload_at_ee(target_builder, body_label_to_index, articulation_joint_indices)
-    target_builder.add_articulation(articulation_joint_indices, label="platform_complete")
+    target_builder.add_articulation(articulation_joint_indices, label="fmrr_tecnobody")
     ground_cfg = target_builder.ShapeConfig(is_visible=SHOW_GROUND)
     ground_height = -0.5 * float(urdf_properties.get("col_height", 0.0))
     target_builder.add_ground_plane(height=ground_height, cfg=ground_cfg, label="ground")

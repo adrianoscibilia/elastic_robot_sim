@@ -29,6 +29,7 @@ from elastic_sim.generic_calibration import (
     compare_torque_replay,
     load_torque_replay_rollouts,
 )
+from elastic_sim.asset_dataset import load_asset_rollouts
 
 
 def _load_factory(path: str):
@@ -79,7 +80,14 @@ def main() -> None:
         value = Path(str(cfg[key])).expanduser()
         cfg[key] = str(value if value.is_absolute() else (config_path.parent / value).resolve())
     joint_names = tuple(cfg["joint_names"]) if cfg.get("joint_names") else None
-    all_rollouts = load_torque_replay_rollouts(cfg["dataset"], joint_names=joint_names)
+    dataset_format = cfg.get("dataset_format")
+    if dataset_format:
+        all_rollouts = load_asset_rollouts(
+            cfg["dataset"], joint_names=joint_names, dataset_format=str(dataset_format),
+            sample_time_s=cfg.get("sample_time_s"),
+        )
+    else:
+        all_rollouts = load_torque_replay_rollouts(cfg["dataset"], joint_names=joint_names)
     fraction = float(cfg.get("train_fraction", 0.8))
     if not 0.0 < fraction <= 1.0:
         raise ValueError("train_fraction must be in (0, 1]")

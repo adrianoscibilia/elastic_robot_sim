@@ -9,6 +9,8 @@ joint order without embedding robot names in their implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
+import re
 from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
@@ -52,6 +54,7 @@ class AssetSpec:
     active_joints: tuple[str, ...] = ()
     base_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     base_quaternion: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
     self_collisions: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -77,6 +80,36 @@ class AssetSpec:
     def joint_names(self) -> tuple[str, ...]:
         return tuple(joint.name for joint in self.resolve_active_joints())
 
+    def validate_resources(self) -> tuple[Path, ...]:
+        """Validate every mesh referenced by this portable robot description.
+
+        ``package://`` references use the optional ``package_roots`` mapping in
+        the asset YAML.  Relative paths are deliberately resolved from the
+        URDF itself, not the process working directory, so asset folders remain
+        relocatable across developer machines and CI.
+        """
+        package_roots = self.metadata.get("package_roots", {})
+        if package_roots is None:
+            package_roots = {}
+        if not isinstance(package_roots, dict) or not all(
+            isinstance(name, str) and isinstance(path, str)
+            for name, path in package_roots.items()
+        ):
+            raise ValueError(f"Asset {self.name!r} package_roots must map package names to paths")
+        resolved: list[Path] = []
+        root = ET.parse(self.urdf_path).getroot()
+        for mesh in root.findall(".//mesh"):
+            filename = mesh.get("filename")
+            if not filename:
+                raise ValueError(f"Asset {self.name!r} contains a mesh with no filename")
+            path = _resolve_mesh_path(self.urdf_path, filename, package_roots)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Asset {self.name!r} references a missing mesh: {filename} -> {path}"
+                )
+            resolved.append(path)
+        return tuple(resolved)
+
 
 def discover_urdf_joints(urdf_path: str | Path) -> tuple[UrdfJoint, ...]:
     """Parse the joint declarations of a URDF without requiring a simulator.
@@ -90,6 +123,14 @@ def discover_urdf_joints(urdf_path: str | Path) -> tuple[UrdfJoint, ...]:
     root = ET.parse(path).getroot()
     if root.tag != "robot":
         raise ValueError(f"Expected a <robot> root in {path}, got <{root.tag}>")
+
+    properties: dict[str, float] = {}
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "property":
+            continue
+        name, value = element.get("name"), element.get("value")
+        if name and value:
+            properties[name] = _xacro_float(value, properties)
 
     joints: list[UrdfJoint] = []
     for element in root.findall("joint"):
@@ -120,10 +161,10 @@ def discover_urdf_joints(urdf_path: str | Path) -> tuple[UrdfJoint, ...]:
                 parent=parent_link,
                 child=child_link,
                 axis=axis_values,  # type: ignore[arg-type]
-                lower=_optional_float(limit, "lower"),
-                upper=_optional_float(limit, "upper"),
-                effort=_optional_float(limit, "effort"),
-                velocity=_optional_float(limit, "velocity"),
+                lower=_optional_float(limit, "lower", properties),
+                upper=_optional_float(limit, "upper", properties),
+                effort=_optional_float(limit, "effort", properties),
+                velocity=_optional_float(limit, "velocity", properties),
                 mimic=None if mimic is None else mimic.get("joint"),
             )
         )
@@ -161,13 +202,15 @@ def load_asset_spec(path: str | Path) -> AssetSpec:
         raise ValueError(f"base must be a mapping: {source}")
     position = _float_tuple(base.get("position", (0.0, 0.0, 0.0)), 3, "base.position", source)
     quaternion = _float_tuple(base.get("quaternion", (0.0, 0.0, 0.0, 1.0)), 4, "base.quaternion", source)
-    known = {"name", "urdf", "active_joints", "base", "self_collisions"}
+    gravity = _float_tuple(data.get("gravity", (0.0, 0.0, -9.81)), 3, "gravity", source)
+    known = {"name", "urdf", "active_joints", "base", "gravity", "self_collisions"}
     return AssetSpec(
         name=name,
         urdf_path=urdf_path,
         active_joints=tuple(active),
         base_position=position,  # type: ignore[arg-type]
         base_quaternion=quaternion,  # type: ignore[arg-type]
+        gravity=gravity,  # type: ignore[arg-type]
         self_collisions=bool(data.get("self_collisions", False)),
         metadata={key: value for key, value in data.items() if key not in known},
     )
@@ -182,14 +225,14 @@ class AssetRegistry:
     @classmethod
     def for_repository(cls, repository_root: str | Path | None = None) -> "AssetRegistry":
         root = Path(repository_root or Path(__file__).resolve().parents[2]).resolve()
-        return cls((root / "config" / "assets",))
+        return cls((root / "assets" / "robots",))
 
     def available(self) -> dict[str, Path]:
         found: dict[str, Path] = {}
         for directory in self.spec_directories:
             if not directory.is_dir():
                 continue
-            for path in sorted((*directory.glob("*.yaml"), *directory.glob("*.yml"))):
+            for path in sorted((*directory.rglob("*.yaml"), *directory.rglob("*.yml"))):
                 spec = load_asset_spec(path)
                 if spec.name in found:
                     raise ValueError(f"Duplicate asset name {spec.name!r}: {found[spec.name]} and {path}")
@@ -205,10 +248,10 @@ class AssetRegistry:
             raise KeyError(f"Unknown asset {name!r}; available: {choices}") from exc
 
 
-def _optional_float(element: ET.Element | None, attr: str) -> float | None:
+def _optional_float(element: ET.Element | None, attr: str, properties: dict[str, float] | None = None) -> float | None:
     if element is None or element.get(attr) is None:
         return None
-    return float(element.get(attr))  # type: ignore[arg-type]
+    return _xacro_float(element.get(attr), properties or {})  # type: ignore[arg-type]
 
 
 def _required_string(data: dict[str, Any], key: str, source: Path) -> str:
@@ -225,3 +268,36 @@ def _float_tuple(value: Any, length: int, label: str, source: Path) -> tuple[flo
         return tuple(float(item) for item in value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must contain numeric values: {source}") from exc
+
+
+def _resolve_mesh_path(urdf_path: Path, filename: str, package_roots: dict[str, str]) -> Path:
+    """Resolve a portable URDF mesh reference without a ROS installation."""
+    if filename.startswith("package://"):
+        package_and_path = filename[len("package://"):]
+        package, separator, relative = package_and_path.partition("/")
+        if not separator or package not in package_roots:
+            choices = ", ".join(sorted(package_roots)) or "<none>"
+            raise ValueError(
+                f"Cannot resolve mesh URI {filename!r}; available package_roots: {choices}"
+            )
+        return (urdf_path.parent / package_roots[package] / relative).resolve()
+    path = Path(filename)
+    if path.is_absolute():
+        return path
+    return (urdf_path.parent / path).resolve()
+
+
+def _xacro_float(value: str, properties: dict[str, float]) -> float:
+    """Evaluate the numeric subset used by the legacy platform xacro."""
+    expression = value.strip()
+    if expression.startswith("${") and expression.endswith("}"):
+        expression = expression[2:-1]
+    expression = re.sub(r"\$\{([^}]+)\}", r"\1", expression)
+    try:
+        return float(expression)
+    except ValueError:
+        scope = {"__builtins__": {}, "pi": math.pi, **properties}
+        try:
+            return float(eval(expression, scope, {}))  # noqa: S307 - restricted numeric scope
+        except Exception as exc:
+            raise ValueError(f"Invalid numeric URDF/xacro expression {value!r}") from exc

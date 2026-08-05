@@ -2,7 +2,7 @@
 # `active_joints` may be omitted to select every non-mimic 1-DoF URDF joint.
 asset:
   name: ur10
-  urdf: ../../urdf/ur10.urdf
+  urdf: ../../assets/robots/ur10/description/ur10.urdf
   active_joints: []
   base:
     position: [0.0, 0.0, 0.0]

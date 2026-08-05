@@ -71,3 +71,11 @@ deg/s².  It is an inverse-dynamics dataset, not a torque-replay source.
 There is no `KukaDirectDynamics.mat` file in this official benchmark.  That
 name and the assumed `(T,35)` schema in the external notebook are incompatible
 with this verified 6-DoF resource.
+
+## Local canonical export
+
+`canonical/recording_2021_12_15_20H_29M.csv` is generated locally from the
+first raw recording.  It preserves the output/link state as `q*`/`dq*`, motor
+encoders as `q_motor*`/`dq_motor*`, and applied motor torques as `tau*`, with
+angles and rates converted to SI radians.  The complete raw MAT collection
+remains the source of truth and is loadable directly by the calibration CLI.

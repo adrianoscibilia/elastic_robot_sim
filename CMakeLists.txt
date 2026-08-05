@@ -14,6 +14,10 @@ ament_python_install_package(elastic_sim
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
+install(DIRECTORY assets/robots/
+  DESTINATION share/${PROJECT_NAME}/assets/robots
+  PATTERN "source" EXCLUDE
+)
 
 # Install ROS 2 executables without the .py suffix (ros2 run matches by exact name):
 #   ros2 run elastic_robot_sim record_real_rollout  — single trajectory
@@ -32,6 +36,9 @@ install(PROGRAMS scripts/generate_serial_trajectory.py
 )
 install(PROGRAMS scripts/run_dataset_calibration.py
   RENAME run_dataset_calibration
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(PROGRAMS scripts/run_asset_simulation.py scripts/run_asset_dataset_generation.py scripts/prepare_asset_dataset.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

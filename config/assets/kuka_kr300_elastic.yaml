@@ -1,0 +1,15 @@
+# Initial numerical parameters for the KUKA structural approximation.  These
+# are not identified physical parameters until calibrated to its dataset.
+asset: kuka_kr300_r2500_ultra_se
+simulation:
+  gravity: [0.0, 0.0, -9.81]
+elastic:
+  defaults:
+    stiffness: 1500.0
+    damping: 40.0
+    motor_stiffness: 3000.0
+    motor_damping: 100.0
+    # The structural approximation needs a larger numerical rotor inertia in
+    # Newton to keep its gravity-loaded revolute chain well conditioned.
+    intermediate_mass: 1.0
+    intermediate_size: 0.50

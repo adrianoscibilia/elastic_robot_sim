@@ -72,3 +72,17 @@ def test_registry_and_transmission_validation_are_generic(tmp_path: Path):
 def test_transmission_parameters_reject_non_physical_values():
     with pytest.raises(ValueError, match="stiffness"):
         ElasticTransmissionParams(-1.0, 0.0)
+
+
+def test_repository_assets_are_discoverable_and_resource_complete():
+    registry = AssetRegistry.for_repository(_REPO)
+    expected = {
+        "fmrr_tecnobody", "ur10", "baxter_left", "baxter_right", "kuka_kr300_r2500_ultra_se",
+    }
+    assert expected.issubset(registry.available())
+    for name in expected:
+        asset = registry.load(name)
+        assert asset.joint_names
+        assert asset.gravity == (0.0, 0.0, -9.81)
+        assert asset.self_collisions
+        assert all(path.is_file() for path in asset.validate_resources())

@@ -26,7 +26,9 @@ from yaml import SafeLoader
 # Paths
 # ---------------------------------------------------------------------------
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-URDF_MODEL_PATH = os.path.join(_SCRIPTS_DIR, "..", "urdf", "platform_complete.urdf")
+URDF_MODEL_PATH = os.path.join(
+    _SCRIPTS_DIR, "..", "assets", "robots", "fmrr_tecnobody", "description", "fmrr_tecnobody.urdf"
+)
 DATA_DIR = os.path.join(_SCRIPTS_DIR, "..", "data")
 
 # ---------------------------------------------------------------------------

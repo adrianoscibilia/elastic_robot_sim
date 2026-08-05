@@ -1,0 +1,15 @@
+schema_version: 1
+name: ur10
+manufacturer: Universal Robots
+urdf: description/ur10.urdf
+active_joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+base:
+  position: [0.0, 0.0, 0.0]
+  quaternion: [0.0, 0.0, 0.0, 1.0]
+gravity: [0.0, 0.0, -9.81]
+self_collisions: true
+dataset:
+  state_units: rad
+  torque_units: Nm
+  source: synthetic_or_ros_recording
+licence: BSD-3-Clause

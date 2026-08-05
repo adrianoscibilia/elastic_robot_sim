@@ -3,11 +3,15 @@ name: baxter_left
 manufacturer: Rethink Robotics
 description_root: description/baxter_description
 urdf: description/baxter_description/urdf/baxter.urdf
+package_roots:
+  baxter_description: ..
 licence: BSD-3-Clause
 active_joints: [left_s0, left_s1, left_e0, left_e1, left_w0, left_w1, left_w2]
 base:
   position: [0.0, 0.0, 0.0]
   quaternion: [0.0, 0.0, 0.0, 1.0]
+gravity: [0.0, 0.0, -9.81]
+self_collisions: true
 dataset_joint_order: [s0, s1, e0, e1, w0, w1, w2]
 chains:
   left:

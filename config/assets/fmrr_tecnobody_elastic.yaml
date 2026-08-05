@@ -1,0 +1,14 @@
+# FMRR Tecnobody settings matching the legacy Cartesian transmission model.
+asset: fmrr_tecnobody
+simulation:
+  gravity: [0.0, 0.0, -9.81]
+elastic:
+  defaults:
+    motor_stiffness: 30000.0
+    motor_damping: 500.0
+    intermediate_mass: 0.10
+    intermediate_size: 0.20
+  joints:
+    joint_x: {stiffness: 5977.08, damping: 82.99677800011276}
+    joint_y: {stiffness: 7162.08, damping: 154.4168698763189}
+    joint_z: {stiffness: 3861.11, damping: 149.1307936007852}

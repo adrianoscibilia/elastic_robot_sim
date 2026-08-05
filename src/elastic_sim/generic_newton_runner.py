@@ -14,11 +14,18 @@ coordinate is where a position controller or a replayed torque is applied.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
+import re
+import tempfile
+import time as time_module
+
+import numpy as np
 
 from .assets import AssetSpec, load_asset_spec
+from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig
 
 if TYPE_CHECKING:
     from .generic_calibration import TorqueReplayRollout
@@ -38,6 +45,8 @@ class ElasticTransmissionParams:
     motor_stiffness: float = 30_000.0
     motor_damping: float = 500.0
     effort_limit: float | None = None
+    intermediate_mass: float | None = None
+    link_mass: float | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("stiffness", "damping", "motor_stiffness", "motor_damping"):
@@ -46,6 +55,10 @@ class ElasticTransmissionParams:
                 raise ValueError(f"{field_name} must be non-negative")
         if self.effort_limit is not None and self.effort_limit <= 0.0:
             raise ValueError("effort_limit must be positive when supplied")
+        if self.intermediate_mass is not None and self.intermediate_mass <= 0.0:
+            raise ValueError("intermediate_mass must be positive when supplied")
+        if self.link_mass is not None and self.link_mass <= 0.0:
+            raise ValueError("link_mass must be positive when supplied")
 
 
 @dataclass(frozen=True)
@@ -90,15 +103,19 @@ class GenericNewtonElasticBuilder:
         *,
         gravity: tuple[float, float, float] = (0.0, 0.0, -9.81),
         intermediate_mass: float = 1.0e-5,
-        intermediate_size: float = 0.01,
+        intermediate_size: float = 0.20,
+        contact_budget: int = 10_000,
     ) -> None:
         self.asset = asset
         self.transmissions = dict(transmissions)
         self.gravity = gravity
         self.intermediate_mass = float(intermediate_mass)
         self.intermediate_size = float(intermediate_size)
+        self.config_contact_budget = int(contact_budget)
         if self.intermediate_mass <= 0.0 or self.intermediate_size <= 0.0:
             raise ValueError("intermediate_mass and intermediate_size must be positive")
+        if self.config_contact_budget < 1:
+            raise ValueError("contact_budget must be positive")
         active = asset.resolve_active_joints()
         active_names = tuple(joint.name for joint in active)
         missing = [name for name in active_names if name not in self.transmissions]
@@ -123,22 +140,35 @@ class GenericNewtonElasticBuilder:
         wp, newton = _require_newton()
         source = newton.ModelBuilder()
         base_xform = wp.transform(wp.vec3(*self.asset.base_position), wp.quat(*self.asset.base_quaternion))
-        source.add_urdf(
-            str(self.asset.urdf_path),
-            xform=base_xform,
-            floating=False,
-            enable_self_collisions=self.asset.self_collisions,
-            ignore_inertial_definitions=False,
-            collapse_fixed_joints=False,
-            force_position_velocity_actuation=True,
-            parse_visuals_as_colliders=False,
-        )
+        # Newton does not resolve ROS package:// URI references.  Materialise
+        # a short-lived URDF with absolute paths only while importing; the
+        # asset itself remains portable and contains no machine-specific path.
+        with _loader_urdf(self.asset) as urdf_path:
+            source.add_urdf(
+                str(urdf_path),
+                xform=base_xform,
+                floating=False,
+                enable_self_collisions=self.asset.self_collisions,
+                ignore_inertial_definitions=False,
+                collapse_fixed_joints=False,
+                force_position_velocity_actuation=True,
+                parse_visuals_as_colliders=False,
+            )
         target = newton.ModelBuilder()
+        # Mesh-rich industrial arms can legitimately generate more than
+        # Newton's small default contact allocation during self-collision.
+        target.num_rigid_contacts_per_world = int(self.config_contact_budget)
         body_map, body_props = _copy_bodies(source, target, wp, newton, self.intermediate_mass, self.intermediate_size)
         _copy_shapes(source, target, newton, body_map)
         _restore_body_properties(target, body_props)
 
         snapshots = [_joint_snapshot(source, index) for index in range(source.joint_count)]
+        # ``ModelBuilder.body_q`` is only a seed pose.  In particular the
+        # Newton URDF importer stores a serial arm's zero-pose offsets in its
+        # joint anchors rather than accumulating them into body_q.  The
+        # inserted free transmission bodies do need a world pose, so recover
+        # the zero-configuration forward kinematics from those anchors.
+        source_body_q = _zero_configuration_body_poses(source, snapshots, wp)
         # Newton versions differ in whether imported labels retain a model
         # namespace (``robot/joint_1``).  Resolve that implementation detail
         # once while retaining plain URDF names as the public API.
@@ -172,11 +202,22 @@ class GenericNewtonElasticBuilder:
             if snapshot["type"] not in (newton.JointType.REVOLUTE, newton.JointType.PRISMATIC):
                 raise ValueError(f"Active joint {name!r} is not a supported 1-DoF Newton joint")
             params = self.transmissions[name]
+            _override_child_link_mass(
+                target, body_props, body_map[snapshot["child"]], params.link_mass
+            )
+            intermediate_mass = self.intermediate_mass if params.intermediate_mass is None else params.intermediate_mass
             intermediate = target.add_link(
-                xform=source.body_q[snapshot["child"]],
+                # The intermediate body's zero pose is the original joint
+                # frame, not the child body's origin.  In a ModelBuilder
+                # imported from URDF, ``body_q`` is not forward-kinematics
+                # initialized: offsets live in ``joint_X_p``.  Use the
+                # parent-side anchor so the replacement motor joint and the
+                # elastic joint begin with exactly coincident anchors.
+                xform=wp.transform_multiply(source_body_q[snapshot["parent"]], snapshot["parent_xform"])
+                if snapshot["parent"] >= 0 else snapshot["parent_xform"],
                 com=wp.vec3(),
-                inertia=_small_inertia(wp, self.intermediate_mass, self.intermediate_size),
-                mass=self.intermediate_mass,
+                inertia=_small_inertia(wp, intermediate_mass, self.intermediate_size),
+                mass=intermediate_mass,
                 label=f"elastic_transmission/{name}",
                 is_kinematic=False,
             )
@@ -194,6 +235,7 @@ class GenericNewtonElasticBuilder:
                 target_ke=params.motor_stiffness,
                 target_kd=params.motor_damping,
                 effort_limit=params.effort_limit,
+                actuator_mode=newton.JointTargetMode.POSITION_VELOCITY,
             )
             elastic_indices[name] = _add_joint_from_snapshot(
                 target,
@@ -203,6 +245,11 @@ class GenericNewtonElasticBuilder:
                 body_map,
                 parent=intermediate,
                 parent_xform=wp.transform_identity(),
+                # Preserve the original child-link joint frame.  Dropping it
+                # makes URDF links with an offset child frame start in an
+                # inconsistent pose, which quickly destabilises the elastic
+                # articulation.
+                child_xform=snapshot["child_xform"],
                 label=elastic_label,
                 target_pos=0.0,
                 target_vel=0.0,
@@ -211,6 +258,7 @@ class GenericNewtonElasticBuilder:
                 limit_lower=-1.0e10,
                 limit_upper=1.0e10,
                 effort_limit=params.effort_limit,
+                actuator_mode=newton.JointTargetMode.POSITION_VELOCITY,
             )
             motor_labels[name] = motor_label
             elastic_labels[name] = elastic_label
@@ -271,9 +319,9 @@ class GenericNewtonTorqueReplayRunner:
         built = build_elastic_model(
             self.asset,
             transmissions,
-            gravity=tuple(self.config.get("gravity", (0.0, 0.0, -9.81))),
-            intermediate_mass=float(self.config.get("intermediate_mass", 1.0e-5)),
-            intermediate_size=float(self.config.get("intermediate_size", 0.01)),
+            gravity=tuple(self.config.get("gravity", self.asset.gravity)),
+            intermediate_mass=float(self.config.get("intermediate_mass", 0.10)),
+            intermediate_size=float(self.config.get("intermediate_size", 0.20)),
         )
         _wp, newton = _require_newton()
         model = built.model
@@ -281,7 +329,12 @@ class GenericNewtonTorqueReplayRunner:
         control = model.control()
         if not hasattr(control, "joint_f"):
             raise RuntimeError("This Newton build does not expose Control.joint_f for torque replay")
-        solver = _new_solver(model, newton)
+        # Prefer the semi-implicit solver for the deliberately light
+        # intermediate transmission bodies.
+        solver = _new_solver(
+            model, newton,
+            order=("SolverSemiImplicit", "SolverFeatherstone", "SolverMuJoCo"),
+        )
         contacts = model.contacts()
         direct_solvers = tuple(
             cls for cls in (
@@ -349,6 +402,367 @@ class GenericNewtonTorqueReplayRunner:
         }
 
 
+class GenericNewtonTrajectoryRunner:
+    """Track a saved joint-space trajectory with any elastic asset.
+
+    The trajectory is applied to the motor side of every transmission.  The
+    returned signals use the same canonical names as the calibration dataset
+    loader, allowing a generated CSV to be replayed immediately as ground
+    truth or compared with a real recording.
+    """
+
+    def __init__(self, asset: AssetSpec, config: Mapping[str, Any] | None = None) -> None:
+        self.asset = asset
+        self.config = dict(config or {})
+        self._joint_names = asset.joint_names
+
+    def run(
+        self, trajectory: SerialTrajectoryConfig, *, time_step: float = 0.004,
+        visualize: bool = False, realtime_scale: float = 1.0,
+    ) -> Mapping[str, Any]:
+        if tuple(trajectory.joint_names) != self._joint_names:
+            raise ValueError(
+                "Trajectory joint_names must match asset active_joints exactly; "
+                f"expected {self._joint_names}, got {tuple(trajectory.joint_names)}"
+            )
+        if time_step <= 0.0 or realtime_scale <= 0.0:
+            raise ValueError("time_step and realtime_scale must be positive")
+        configured_transmissions = self.config.get("transmissions", {})
+        if configured_transmissions is None:
+            configured_transmissions = {}
+        if not isinstance(configured_transmissions, Mapping):
+            raise ValueError("transmissions must be a mapping keyed by active joint name")
+        defaults = {
+            f"{name}.stiffness": float(
+                configured_transmissions.get(name, {}).get("stiffness", self.config.get("default_stiffness", 10_000.0))
+            )
+            for name in self._joint_names
+        } | {
+            f"{name}.damping": float(
+                configured_transmissions.get(name, {}).get("damping", self.config.get("default_damping", 100.0))
+            )
+            for name in self._joint_names
+        }
+        transmissions = _transmissions_from_named_params(self._joint_names, defaults, self.config)
+        built = build_elastic_model(
+            self.asset,
+            transmissions,
+            gravity=tuple(self.config.get("gravity", self.asset.gravity)),
+            # This invisible body carries motor-side lumped inertia.  Its
+            # size affects only Newton's inertia proxy, never the rendering.
+            # A near-zero rotational inertia destabilises revolute two-mass
+            # chains under gravity.
+            intermediate_mass=float(self.config.get("intermediate_mass", 0.10)),
+            intermediate_size=float(self.config.get("intermediate_size", 0.20)),
+        )
+        _wp, newton = _require_newton()
+        model = built.model
+        state_in, state_out = model.state(), model.state()
+        control = model.control()
+        target_attr = _target_position_attribute(control)
+        if not hasattr(control, "joint_target_vel"):
+            raise RuntimeError("This Newton build does not expose Control.joint_target_vel")
+        # Match the legacy FMRR implementation: Newton's MuJoCo articulation
+        # solver is the reliable first choice for these two-mass chains.
+        solver = _new_solver(
+            model, newton,
+            order=("SolverMuJoCo", "SolverFeatherstone", "SolverSemiImplicit"),
+        )
+        contacts = model.contacts()
+        direct_solvers = tuple(
+            cls for cls in (
+                getattr(newton.solvers, "SolverMuJoCo", None),
+                getattr(newton.solvers, "SolverFeatherstone", None),
+            ) if cls is not None
+        )
+        needs_ik = not isinstance(solver, direct_solvers) if direct_solvers else True
+        evaluator = SerialArmTrajectory(trajectory)
+        q0, dq0, _ = evaluator(0.0)
+        initial_q = _as_numpy(state_in.joint_q).reshape(-1)
+        initial_dq = _as_numpy(state_in.joint_qd).reshape(-1)
+        for index, name in enumerate(self._joint_names):
+            indices = built.dof_index[name]
+            initial_q[indices.motor_q] = q0[index]
+            initial_q[indices.elastic_q] = 0.0
+            initial_dq[indices.motor_qd] = dq0[index]
+            initial_dq[indices.elastic_qd] = 0.0
+        state_in.joint_q.assign(initial_q.astype("float32"))
+        state_in.joint_qd.assign(initial_dq.astype("float32"))
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+        time = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        targets = np.zeros(model.joint_dof_count, dtype=np.float32)
+        target_velocities = np.zeros(model.joint_dof_count, dtype=np.float32)
+        # Initialise the controller to the measured initial motor state before
+        # the first integration step.  Leaving importer defaults (normally
+        # zero) here creates an artificial impulse whenever a generated
+        # trajectory starts away from zero.
+        for index, name in enumerate(self._joint_names):
+            indices = built.dof_index[name]
+            targets[indices.motor_qd] = q0[index]
+            target_velocities[indices.motor_qd] = dq0[index]
+        getattr(control, target_attr).assign(targets)
+        control.joint_target_vel.assign(target_velocities)
+        q_ref: list[Any] = []
+        dq_ref: list[Any] = []
+        q_link: list[Any] = []
+        dq_link: list[Any] = []
+        q_motor: list[Any] = []
+        dq_motor: list[Any] = []
+        tau_motor: list[Any] = []
+        viewer = _new_viewer(newton) if visualize else None
+        if viewer is not None:
+            viewer.set_model(model)
+        try:
+            for sample_index, sample_time in enumerate(time):
+                if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
+                    time = time[:sample_index]
+                    break
+                target_q, target_dq, _ = evaluator(float(sample_time))
+                link_q, _ = _output_joint_state(state_in, built)
+                link_dq = _output_joint_velocity(state_in, built)
+                motor_q, motor_dq = _motor_joint_state(state_in, built)
+                if not all(np.isfinite(value).all() for value in (link_q, link_dq, motor_q, motor_dq)):
+                    raise RuntimeError(f"Newton elastic simulation became non-finite at t={sample_time:.6f}s")
+                q_link.append(link_q)
+                dq_link.append(link_dq)
+                q_motor.append(motor_q)
+                dq_motor.append(motor_dq)
+                q_ref.append(target_q)
+                dq_ref.append(target_dq)
+                tau_motor.append(
+                    np.asarray([
+                        transmissions[name].motor_stiffness * (target_q[index] - motor_q[index])
+                        + transmissions[name].motor_damping * (target_dq[index] - motor_dq[index])
+                        for index, name in enumerate(self._joint_names)
+                    ])
+                )
+                if sample_index + 1 == len(time):
+                    break
+                targets.fill(0.0)
+                target_velocities.fill(0.0)
+                for index, name in enumerate(self._joint_names):
+                    indices = built.dof_index[name]
+                    targets[indices.motor_qd] = target_q[index]
+                    target_velocities[indices.motor_qd] = target_dq[index]
+                getattr(control, target_attr).assign(targets)
+                control.joint_target_vel.assign(target_velocities)
+                state_in.clear_forces()
+                model.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, time_step)
+                if needs_ik:
+                    newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
+                if viewer is not None:
+                    viewer.begin_frame(float(sample_time))
+                    viewer.log_state(state_out)
+                    viewer.end_frame()
+                    time_module.sleep(time_step / realtime_scale)
+                state_in, state_out = state_out, state_in
+        finally:
+            _close_viewer(viewer)
+        return {
+            "time": time[:len(q_link)],
+            "q_ref": np.asarray(q_ref),
+            "dq_ref": np.asarray(dq_ref),
+            "q_link": np.asarray(q_link),
+            "dq_link": np.asarray(dq_link),
+            "q_motor": np.asarray(q_motor),
+            "dq_motor": np.asarray(dq_motor),
+            "tau_motor": np.asarray(tau_motor),
+            "joint_names": self._joint_names,
+        }
+
+
+@dataclass(frozen=True)
+class RigidModelBuild:
+    """A directly imported URDF model with public active-joint indexing."""
+
+    model: Any
+    asset: AssetSpec
+    active_joint_names: tuple[str, ...]
+    q_index: dict[str, int]
+    qd_index: dict[str, int]
+
+
+class GenericNewtonRigidTrajectoryRunner:
+    """Stable position-tracking Newton runner for portable URDF assets.
+
+    This is the production path for synthetic trajectories and visualization.
+    It intentionally retains the native rigid URDF joint structure.  The
+    separate elastic-transmission runner remains available for identification
+    experiments, where its stiffness/mass/time-step configuration is explicit.
+    """
+
+    def __init__(self, asset: AssetSpec, config: Mapping[str, Any] | None = None) -> None:
+        self.asset = asset
+        self.config = dict(config or {})
+        self._joint_names = asset.joint_names
+
+    def run(
+        self,
+        trajectory: SerialTrajectoryConfig,
+        *,
+        time_step: float = 0.004,
+        visualize: bool = False,
+        realtime_scale: float = 1.0,
+    ) -> Mapping[str, Any]:
+        if tuple(trajectory.joint_names) != self._joint_names:
+            raise ValueError("Trajectory joint_names must match asset active_joints exactly")
+        if time_step <= 0.0 or realtime_scale <= 0.0:
+            raise ValueError("time_step and realtime_scale must be positive")
+        built, newton = _build_rigid_model(
+            self.asset, gravity=tuple(self.config.get("gravity", self.asset.gravity))
+        )
+        model = built.model
+        state_in, state_out = model.state(), model.state()
+        control = model.control()
+        motor_stiffness = float(self.config.get("motor_stiffness", 3_000.0))
+        motor_damping = float(self.config.get("motor_damping", 100.0))
+        _set_joint_controller_gains(model, built.qd_index, motor_stiffness, motor_damping)
+        target_attr = _target_position_attribute(control)
+        if not hasattr(control, "joint_target_vel"):
+            raise RuntimeError("This Newton build does not expose Control.joint_target_vel")
+        solver = _new_solver(model, newton, order=("SolverSemiImplicit", "SolverMuJoCo", "SolverFeatherstone"))
+        contacts = model.contacts()
+        direct_solvers = tuple(
+            cls for cls in (getattr(newton.solvers, "SolverMuJoCo", None), getattr(newton.solvers, "SolverFeatherstone", None))
+            if cls is not None
+        )
+        needs_ik = not isinstance(solver, direct_solvers) if direct_solvers else True
+        evaluator = SerialArmTrajectory(trajectory)
+        q0, dq0, _ = evaluator(0.0)
+        initial_q = _as_numpy(state_in.joint_q).reshape(-1)
+        initial_dq = _as_numpy(state_in.joint_qd).reshape(-1)
+        for index, name in enumerate(self._joint_names):
+            initial_q[built.q_index[name]] = q0[index]
+            initial_dq[built.qd_index[name]] = dq0[index]
+        state_in.joint_q.assign(initial_q.astype("float32"))
+        state_in.joint_qd.assign(initial_dq.astype("float32"))
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+        time_grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        targets = np.zeros(model.joint_dof_count, dtype=np.float32)
+        target_velocities = np.zeros(model.joint_dof_count, dtype=np.float32)
+        q_ref: list[Any] = []
+        dq_ref: list[Any] = []
+        q: list[Any] = []
+        dq: list[Any] = []
+        tau: list[Any] = []
+        viewer = _new_viewer(newton) if visualize else None
+        if viewer is not None:
+            viewer.set_model(model)
+        try:
+            for sample_index, sample_time in enumerate(time_grid):
+                if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
+                    time_grid = time_grid[:sample_index]
+                    break
+                target_q, target_dq, _ = evaluator(float(sample_time))
+                state_q = _as_numpy(state_in.joint_q).reshape(-1)
+                state_dq = _as_numpy(state_in.joint_qd).reshape(-1)
+                measured_q = np.asarray([state_q[built.q_index[name]] for name in self._joint_names])
+                measured_dq = np.asarray([state_dq[built.qd_index[name]] for name in self._joint_names])
+                if not (np.isfinite(measured_q).all() and np.isfinite(measured_dq).all()):
+                    raise RuntimeError(f"Newton simulation became non-finite at t={sample_time:.6f}s")
+                q_ref.append(target_q)
+                dq_ref.append(target_dq)
+                q.append(measured_q)
+                dq.append(measured_dq)
+                tau.append(motor_stiffness * (target_q - measured_q) + motor_damping * (target_dq - measured_dq))
+                if sample_index + 1 == len(time_grid):
+                    break
+                targets.fill(0.0)
+                target_velocities.fill(0.0)
+                for index, name in enumerate(self._joint_names):
+                    targets[built.qd_index[name]] = target_q[index]
+                    target_velocities[built.qd_index[name]] = target_dq[index]
+                getattr(control, target_attr).assign(targets)
+                control.joint_target_vel.assign(target_velocities)
+                state_in.clear_forces()
+                model.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, time_step)
+                if needs_ik:
+                    newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
+                if viewer is not None:
+                    viewer.begin_frame(float(sample_time))
+                    viewer.log_state(state_out)
+                    viewer.end_frame()
+                    time_module.sleep(time_step / realtime_scale)
+                state_in, state_out = state_out, state_in
+        finally:
+            _close_viewer(viewer)
+        result_time = time_grid[:len(q)]
+        return {
+            "time": result_time,
+            "q_ref": np.asarray(q_ref), "dq_ref": np.asarray(dq_ref),
+            "q_link": np.asarray(q), "dq_link": np.asarray(dq),
+            "q_motor": np.asarray(q), "dq_motor": np.asarray(dq),
+            "tau_motor": np.asarray(tau), "joint_names": self._joint_names,
+        }
+
+
+class GenericNewtonKinematicTrajectoryRunner:
+    """Newton ViewerGL/playback runner with guaranteed finite trajectory data.
+
+    It evaluates forward kinematics at each reference sample without invoking a
+    dynamics solver.  Use it to validate descriptions, inspect trajectories,
+    and make deterministic reference datasets.  ``GenericNewtonRigidTrajectoryRunner``
+    and ``GenericNewtonTrajectoryRunner`` remain opt-in physics modes.
+    """
+
+    def __init__(self, asset: AssetSpec, config: Mapping[str, Any] | None = None) -> None:
+        self.asset = asset
+        self.config = dict(config or {})
+        self._joint_names = asset.joint_names
+
+    def run(
+        self, trajectory: SerialTrajectoryConfig, *, time_step: float = 0.004,
+        visualize: bool = False, realtime_scale: float = 1.0,
+    ) -> Mapping[str, Any]:
+        if tuple(trajectory.joint_names) != self._joint_names:
+            raise ValueError("Trajectory joint_names must match asset active_joints exactly")
+        if time_step <= 0.0 or realtime_scale <= 0.0:
+            raise ValueError("time_step and realtime_scale must be positive")
+        built, newton = _build_rigid_model(self.asset, gravity=self.asset.gravity)
+        state = built.model.state()
+        evaluator = SerialArmTrajectory(trajectory)
+        time_grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        q_values: list[Any] = []
+        dq_values: list[Any] = []
+        viewer = _new_viewer(newton) if visualize else None
+        if viewer is not None:
+            viewer.set_model(built.model)
+        try:
+            for sample_index, sample_time in enumerate(time_grid):
+                if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
+                    time_grid = time_grid[:sample_index]
+                    break
+                q_ref, dq_ref, _ = evaluator(float(sample_time))
+                q = _as_numpy(state.joint_q).reshape(-1)
+                dq = _as_numpy(state.joint_qd).reshape(-1)
+                for index, name in enumerate(self._joint_names):
+                    q[built.q_index[name]] = q_ref[index]
+                    dq[built.qd_index[name]] = dq_ref[index]
+                state.joint_q.assign(q.astype("float32"))
+                state.joint_qd.assign(dq.astype("float32"))
+                newton.eval_fk(built.model, state.joint_q, state.joint_qd, state)
+                q_values.append(q_ref)
+                dq_values.append(dq_ref)
+                if viewer is not None:
+                    viewer.begin_frame(float(sample_time))
+                    viewer.log_state(state)
+                    viewer.end_frame()
+                    time_module.sleep(time_step / realtime_scale)
+        finally:
+            _close_viewer(viewer)
+        q_array = np.asarray(q_values)
+        dq_array = np.asarray(dq_values)
+        return {
+            "time": time_grid[:len(q_values)], "q_ref": q_array, "dq_ref": dq_array,
+            "q_link": q_array, "dq_link": dq_array, "q_motor": q_array, "dq_motor": dq_array,
+            "tau_motor": np.zeros_like(q_array), "joint_names": self._joint_names,
+        }
+
+
 def make_torque_replay_runner(*, asset: str | Path | AssetSpec | None = None, config: Mapping[str, Any] | None = None) -> GenericNewtonTorqueReplayRunner:
     """Factory used by ``scripts/run_dataset_calibration.py``.
 
@@ -389,13 +803,17 @@ def _transmissions_from_named_params(
             motor_stiffness=float(defaults.get("motor_stiffness", motor_stiffness)),
             motor_damping=float(defaults.get("motor_damping", motor_damping)),
             effort_limit=None if defaults.get("effort_limit") is None else float(defaults["effort_limit"]),
+            intermediate_mass=None if defaults.get("intermediate_mass") is None else float(defaults["intermediate_mass"]),
+            link_mass=None if defaults.get("link_mass") is None else float(defaults["link_mass"]),
         )
     return result
 
 
-def _new_solver(model: Any, newton: Any) -> Any:
+def _new_solver(
+    model: Any, newton: Any, *, order: tuple[str, ...] = ("SolverMuJoCo", "SolverFeatherstone", "SolverSemiImplicit")
+) -> Any:
     errors = []
-    for name in ("SolverMuJoCo", "SolverFeatherstone", "SolverSemiImplicit"):
+    for name in order:
         solver_class = getattr(newton.solvers, name, None)
         if solver_class is None:
             continue
@@ -420,6 +838,16 @@ def _output_joint_state(state: Any, built: ElasticModelBuild) -> tuple[Any, Any]
     return q_output, dq_output
 
 
+def _output_joint_velocity(state: Any, built: ElasticModelBuild) -> Any:
+    """Read output/link-side velocities without allocating positions."""
+    import numpy as np
+    dq = _as_numpy(state.joint_qd).reshape(-1)
+    return np.asarray([
+        dq[built.dof_index[name].motor_qd] + dq[built.dof_index[name].elastic_qd]
+        for name in built.active_joint_names
+    ])
+
+
 def _motor_joint_state(state: Any, built: ElasticModelBuild) -> tuple[Any, Any]:
     """Read physical motor-side coordinates without exposing engine ordering."""
     import numpy as np
@@ -429,6 +857,130 @@ def _motor_joint_state(state: Any, built: ElasticModelBuild) -> tuple[Any, Any]:
         np.asarray([q[built.dof_index[name].motor_q] for name in built.active_joint_names]),
         np.asarray([dq[built.dof_index[name].motor_qd] for name in built.active_joint_names]),
     )
+
+
+def _target_position_attribute(control: Any) -> str:
+    for name in ("joint_target_pos", "joint_target_q"):
+        if hasattr(control, name):
+            return name
+    raise RuntimeError("This Newton build has no supported joint target-position attribute")
+
+
+def _new_viewer(newton: Any) -> Any | None:
+    viewer_class = getattr(getattr(newton, "viewer", None), "ViewerGL", None)
+    return None if viewer_class is None else viewer_class()
+
+
+def _close_viewer(viewer: Any | None) -> None:
+    if viewer is None:
+        return
+    try:
+        viewer.close()
+    except AssertionError:  # viewer can already be closed by its window event
+        pass
+
+
+def _build_rigid_model(asset: AssetSpec, *, gravity: tuple[float, float, float]) -> tuple[RigidModelBuild, Any]:
+    """Import a portable URDF directly for robust native-joint tracking."""
+    wp, newton = _require_newton()
+    builder = newton.ModelBuilder()
+    base_xform = wp.transform(wp.vec3(*asset.base_position), wp.quat(*asset.base_quaternion))
+    with _loader_urdf(asset) as urdf_path:
+        builder.add_urdf(
+            str(urdf_path), xform=base_xform, floating=False,
+            enable_self_collisions=asset.self_collisions,
+            ignore_inertial_definitions=False, collapse_fixed_joints=False,
+            force_position_velocity_actuation=True, parse_visuals_as_colliders=False,
+        )
+    snapshots = [_joint_snapshot(builder, index) for index in range(builder.joint_count)]
+    by_name = {
+        name: _find_snapshot_for_urdf_joint(snapshots, name)
+        for name in asset.joint_names
+    }
+    missing = [name for name, snapshot in by_name.items() if snapshot is None]
+    if missing:
+        raise ValueError("Configured active URDF joints were not imported by Newton: " + ", ".join(missing))
+    q_index = {name: int(builder.joint_q_start[by_name[name]["index"]]) for name in asset.joint_names}  # type: ignore[index]
+    qd_index = {name: int(builder.joint_qd_start[by_name[name]["index"]]) for name in asset.joint_names}  # type: ignore[index]
+    model = builder.finalize()
+    model.set_gravity(gravity)
+    return RigidModelBuild(model, asset, asset.joint_names, q_index, qd_index), newton
+
+
+def _set_joint_controller_gains(
+    model: Any, qd_index: Mapping[str, int], stiffness: float, damping: float
+) -> None:
+    """Override importer defaults, which are excessively stiff for replay."""
+    if stiffness < 0.0 or damping < 0.0:
+        raise ValueError("motor controller gains must be non-negative")
+    ke = _as_numpy(model.joint_target_ke).reshape(-1).copy()
+    kd = _as_numpy(model.joint_target_kd).reshape(-1).copy()
+    for index in qd_index.values():
+        ke[index] = stiffness
+        kd[index] = damping
+    model.joint_target_ke.assign(ke.astype("float32"))
+    model.joint_target_kd.assign(kd.astype("float32"))
+
+
+@contextmanager
+def _loader_urdf(asset: AssetSpec):
+    """Yield a Newton-loadable URDF whose mesh URIs are absolute local paths."""
+    resources = iter(asset.validate_resources())
+    text = asset.urdf_path.read_text(encoding="utf-8")
+    if "${" in text:
+        text = _expand_simple_xacro_text(text)
+    text = _ensure_collision_geometry(text)
+
+    def replace_mesh(match: re.Match[str]) -> str:
+        try:
+            resource = next(resources)
+        except StopIteration as exc:  # pragma: no cover - catches malformed XML edits
+            raise ValueError(f"Asset {asset.name!r} mesh references changed during preparation") from exc
+        return match.group(1) + resource.as_posix() + match.group(3)
+
+    text = re.sub(r'(<mesh\b[^>]*\bfilename\s*=\s*")([^"]+)(")', replace_mesh, text)
+    try:
+        next(resources)
+        raise ValueError(f"Asset {asset.name!r} mesh references changed during preparation")
+    except StopIteration:
+        pass
+    with tempfile.TemporaryDirectory(prefix="elastic_asset_urdf_") as directory:
+        path = Path(directory) / asset.urdf_path.name
+        path.write_text(text, encoding="utf-8")
+        yield path
+
+
+def _expand_simple_xacro_text(xml_text: str) -> str:
+    """Expand the arithmetic-only xacro subset used by fmrr_tecnobody."""
+    from .assets import _xacro_float
+    text = re.sub(r"<\?xacro[^>]*\?>", "", xml_text)
+    pattern = re.compile(r'<xacro:property\s+name\s*=\s*"([^"]+)"\s+value\s*=\s*"([^"]+)"\s*/?>')
+    properties: dict[str, float] = {}
+    for name, value in pattern.findall(text):
+        properties[name] = _xacro_float(value, properties)
+    text = pattern.sub("", text)
+    return re.sub(r"\$\{([^}]+)\}", lambda match: f"{_xacro_float(match.group(1), properties):.12g}", text)
+
+
+def _ensure_collision_geometry(xml_text: str) -> str:
+    """Mirror visuals as collisions only for descriptions that have none.
+
+    The Tecnobody FMRR description supplies visual primitives but no collision
+    tags.  Keeping that exception here makes its asset-level
+    ``self_collisions: true`` setting effective without changing upstream-like
+    URDFs that already provide curated collision geometry.
+    """
+    from copy import deepcopy
+    from xml.etree import ElementTree as ET
+    root = ET.fromstring(xml_text)
+    if root.findall(".//collision"):
+        return xml_text
+    for link in root.findall("link"):
+        for visual in link.findall("visual"):
+            collision = deepcopy(visual)
+            collision.tag = "collision"
+            link.append(collision)
+    return ET.tostring(root, encoding="unicode")
 
 
 def _require_newton() -> tuple[Any, Any]:
@@ -478,8 +1030,27 @@ def _restore_body_properties(target: Any, body_props: Mapping[int, tuple[Any, An
         target.body_mass[index] = mass
 
 
+def _override_child_link_mass(
+    target: Any,
+    body_props: dict[int, tuple[Any, Any, float]],
+    body_index: int,
+    mass_override: float | None,
+) -> None:
+    """Apply an optional URDF-link mass override while preserving inertia shape."""
+    if mass_override is None:
+        return
+    com, inertia, old_mass = body_props[body_index]
+    if old_mass <= 0.0:
+        raise ValueError("Cannot override a massless URDF child link")
+    scale = mass_override / old_mass
+    target.body_mass[body_index] = mass_override
+    target.body_inertia[body_index] = inertia * scale
+    body_props[body_index] = (com, inertia * scale, mass_override)
+
+
 def _copy_shapes(source: Any, target: Any, newton: Any, body_map: Mapping[int, int]) -> None:
     shape_map: dict[int, int] = {}
+    shapes_by_body: dict[int, list[int]] = {}
     flags_enum = getattr(newton, "ShapeFlags", None)
     for index in range(source.shape_count):
         flags = source.shape_flags[index]
@@ -499,8 +1070,19 @@ def _copy_shapes(source: Any, target: Any, newton: Any, body_map: Mapping[int, i
             xform=source.shape_transform[index], cfg=config, scale=source.shape_scale[index],
             src=source.shape_source[index], label=source.shape_label[index],
         )
+        shapes_by_body.setdefault(body_map.get(source.shape_body[index], -1), []).append(shape_map[index])
     for first, second in source.shape_collision_filter_pairs:
         target.add_shape_collision_filter_pair(shape_map[first], shape_map[second])
+    # Self collision should test non-adjacent robot links, not the unavoidable
+    # overlaps at every mechanical joint.  URDF importers do not consistently
+    # emit those exclusions across Newton versions, so establish them while
+    # copying the portable source model.
+    for joint_index in range(source.joint_count):
+        parent = body_map.get(source.joint_parent[joint_index], -1)
+        child = body_map.get(source.joint_child[joint_index], -1)
+        for first in shapes_by_body.get(parent, ()):
+            for second in shapes_by_body.get(child, ()):
+                target.add_shape_collision_filter_pair(first, second)
 
 
 def _joint_snapshot(builder: Any, index: int) -> dict[str, Any]:
@@ -517,6 +1099,41 @@ def _joint_snapshot(builder: Any, index: int) -> dict[str, Any]:
         for dof in range(qd_start, qd_end)
     ]
     return dict(index=index, label=builder.joint_label[index], type=builder.joint_type[index], parent=builder.joint_parent[index], child=builder.joint_child[index], parent_xform=builder.joint_X_p[index], child_xform=builder.joint_X_c[index], enabled=builder.joint_enabled[index], axes=axes, q=list(builder.joint_q[q_start:q_end]), qd=list(builder.joint_qd[qd_start:qd_end]))
+
+
+def _zero_configuration_body_poses(builder: Any, snapshots: list[Mapping[str, Any]], wp: Any) -> list[Any]:
+    """Return URDF zero-configuration body poses without finalizing a model.
+
+    Newton's builder keeps the zero-pose hierarchy in joint anchor transforms,
+    while its ``body_q`` values can remain identity transforms.  That is fine
+    for ordinary articulated children, but not for the standalone bodies we
+    insert between motor and link joints.
+    """
+    poses: list[Any | None] = [None] * builder.body_count
+    pending = list(snapshots)
+    world = wp.transform_identity()
+    while pending:
+        next_pending: list[Mapping[str, Any]] = []
+        made_progress = False
+        for snapshot in pending:
+            parent = int(snapshot["parent"])
+            child = int(snapshot["child"])
+            if parent >= 0 and poses[parent] is None:
+                next_pending.append(snapshot)
+                continue
+            parent_pose = world if parent < 0 else poses[parent]
+            assert parent_pose is not None
+            pose = wp.transform_multiply(parent_pose, snapshot["parent_xform"])
+            # At q=0 the child anchor is coincident with the parent anchor.
+            pose = wp.transform_multiply(pose, wp.transform_inverse(snapshot["child_xform"]))
+            if poses[child] is None:
+                poses[child] = pose
+            made_progress = True
+        if not made_progress:
+            labels = ", ".join(str(snapshot["label"]) for snapshot in next_pending)
+            raise ValueError(f"Could not resolve zero-configuration body poses for joints: {labels}")
+        pending = next_pending
+    return [pose if pose is not None else builder.body_q[index] for index, pose in enumerate(poses)]
 
 
 def _find_snapshot_for_urdf_joint(snapshots: list[Mapping[str, Any]], urdf_name: str) -> Mapping[str, Any] | None:
@@ -536,7 +1153,7 @@ def _add_joint_from_snapshot(
     parent: int | None = None, child: int | None = None, parent_xform: Any | None = None, child_xform: Any | None = None,
     label: str | None = None, target_pos: float | None = None, target_vel: float | None = None,
     target_ke: float | None = None, target_kd: float | None = None, limit_lower: float | None = None,
-    limit_upper: float | None = None, effort_limit: float | None = None,
+    limit_upper: float | None = None, effort_limit: float | None = None, actuator_mode: Any | None = None,
 ) -> int:
     parent = body_map[snapshot["parent"]] if parent is None else parent
     child = body_map[snapshot["child"]] if child is None else child
@@ -559,7 +1176,8 @@ def _add_joint_from_snapshot(
                   limit_upper=axis["limit_upper"] if limit_upper is None else limit_upper,
                   limit_ke=axis["limit_ke"], limit_kd=axis["limit_kd"], armature=axis["armature"],
                   effort_limit=axis["effort_limit"] if effort_limit is None else effort_limit,
-                  friction=axis["friction"], actuator_mode=axis["actuator_mode"], label=label, enabled=snapshot["enabled"])
+                  friction=axis["friction"], actuator_mode=axis["actuator_mode"] if actuator_mode is None else actuator_mode,
+                  label=label, enabled=snapshot["enabled"])
     if joint_type == newton.JointType.REVOLUTE:
         return target.add_joint_revolute(**kwargs)
     if joint_type == newton.JointType.PRISMATIC:

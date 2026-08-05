@@ -1,0 +1,13 @@
+# Initial numerical parameters for the Baxter left arm.  Tune against its
+# dataset; link_mass entries may be supplied per joint when required.
+asset: baxter_left
+simulation:
+  gravity: [0.0, 0.0, -9.81]
+elastic:
+  defaults:
+    stiffness: 1500.0
+    damping: 40.0
+    motor_stiffness: 3000.0
+    motor_damping: 100.0
+    intermediate_mass: 0.10
+    intermediate_size: 0.20

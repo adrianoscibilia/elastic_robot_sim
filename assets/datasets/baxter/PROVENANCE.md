@@ -41,3 +41,10 @@ within each individual file.
 
 The recorded right-arm files use the same column layout. Dataset file names
 follow `{arm}_{trajectory}_p{phi}_t{theta}.csv`.
+
+## Local canonical export
+
+`canonical/baxter_left_circle_p-15_t105.csv` is generated locally from the
+raw sample with `sample_time_s=0.002`.  It uses the calibration-ready columns
+`time`, `q0..q6`, `dq0..dq6`, and `tau0..tau6`; the raw source remains the
+provenance-preserving ground truth.

@@ -1,0 +1,29 @@
+[project]
+name = "elastic-robot-sim"
+version = "0.1.0"
+description = "Portable Newton and MuJoCo simulation for elastic robot assets"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "newton==1.1.0",
+    "warp-lang==1.13.0",
+    "newton-actuators==0.1.0",
+    "mujoco==3.6.0",
+    "mujoco-warp==3.6.0",
+    "numpy>=2.0",
+    "scipy>=1.11",
+    "PyYAML>=6.0",
+    "pandas>=2.0",
+    "matplotlib>=3.9",
+    "trimesh>=4.0",
+    "pycollada>=0.9",
+    "pyglet>=2.1",
+    "imgui-bundle>=1.92",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = false

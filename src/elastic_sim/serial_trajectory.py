@@ -17,6 +17,8 @@ from typing import Iterable
 
 import numpy as np
 
+from .assets import discover_urdf_joints
+
 
 @dataclass(frozen=True)
 class SerialTrajectoryConfig:
@@ -104,34 +106,26 @@ class SerialArmTrajectory:
         }
 
 
-def _pinocchio_joint_limits(urdf_path: str | Path, requested_names: Iterable[str] | None = None) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
-    """Return names and limits for configured one-DoF URDF joints.
+def _urdf_joint_limits(urdf_path: str | Path, requested_names: Iterable[str] | None = None) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
+    """Return portable URDF joint limits without requiring Pinocchio.
 
-    Pinocchio is optional at import time but required for generation from an
-    asset.  Continuous joints with non-finite limits receive [-pi, pi].
+    Pinocchio remains useful for collision-aware planning, but a seeded
+    joint-space excitation only needs the one-DoF limits that are already in
+    the asset URDF.  Continuous/unbounded joints receive ``[-pi, pi]``.
     """
-    try:
-        import pinocchio as pin
-    except ImportError as exc:  # pragma: no cover - depends on local robotics environment
-        raise RuntimeError(
-            "Pinocchio is required for serial-arm trajectory generation. "
-            "Install its Python bindings in the simulator environment."
-        ) from exc
-
-    model = pin.buildModelFromUrdf(str(urdf_path))
-    requested = set(requested_names) if requested_names else None
+    requested_order = tuple(requested_names) if requested_names else None
+    requested = set(requested_order) if requested_order else None
     names: list[str] = []
     lower: list[float] = []
     upper: list[float] = []
-    for joint_id in range(1, model.njoints):  # joint 0 is universe
-        joint = model.joints[joint_id]
-        if joint.nq != 1 or joint.nv != 1:
+    for joint in discover_urdf_joints(urdf_path):
+        if not joint.is_one_dof or joint.mimic is not None:
             continue
-        name = model.names[joint_id]
+        name = joint.name
         if requested is not None and name not in requested:
             continue
-        idx = model.idx_qs[joint_id]
-        lo, hi = float(model.lowerPositionLimit[idx]), float(model.upperPositionLimit[idx])
+        lo = float("nan") if joint.lower is None else joint.lower
+        hi = float("nan") if joint.upper is None else joint.upper
         if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
             lo, hi = -np.pi, np.pi
         names.append(name)
@@ -142,6 +136,12 @@ def _pinocchio_joint_limits(urdf_path: str | Path, requested_names: Iterable[str
         raise ValueError(f"requested joints are not one-DoF URDF joints: {missing}")
     if not names:
         raise ValueError("the asset has no selectable one-DoF joints")
+    if requested_order is not None:
+        positions = {name: index for index, name in enumerate(names)}
+        order = [positions[name] for name in requested_order]
+        names = [names[index] for index in order]
+        lower = [lower[index] for index in order]
+        upper = [upper[index] for index in order]
     return tuple(names), np.asarray(lower), np.asarray(upper)
 
 
@@ -166,7 +166,7 @@ def generate_serial_arm_trajectory(
         raise ValueError("num_waypoints must be at least two")
     if not 0.0 <= limit_margin < 0.5:
         raise ValueError("limit_margin must be in [0, 0.5)")
-    names, lower, upper = _pinocchio_joint_limits(urdf_path, joint_names)
+    names, lower, upper = _urdf_joint_limits(urdf_path, joint_names)
     n = len(names)
     vmax = np.broadcast_to(np.asarray(max_velocity, dtype=float), (n,))
     amax = np.broadcast_to(np.asarray(max_acceleration, dtype=float), (n,))

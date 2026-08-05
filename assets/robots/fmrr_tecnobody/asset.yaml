@@ -1,0 +1,14 @@
+schema_version: 1
+name: fmrr_tecnobody
+manufacturer: Tecnobody
+urdf: description/fmrr_tecnobody.urdf
+active_joints: [joint_x, joint_y, joint_z]
+base:
+  position: [0.0, 0.0, 0.0]
+  quaternion: [0.0, 0.0, 0.0, 1.0]
+gravity: [0.0, 0.0, -9.81]
+self_collisions: true
+dataset:
+  state_units: m
+  torque_units: N
+  source: synthetic_or_ros_recording

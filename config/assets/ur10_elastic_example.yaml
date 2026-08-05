@@ -1,0 +1,18 @@
+# UR10 explicit-transmission configuration.  All names are URDF joint names.
+# Omit link_mass to retain the URDF inertial mass for that original child link.
+asset: ur10
+simulation:
+  gravity: [0.0, 0.0, -9.81]
+elastic:
+  defaults:
+    stiffness: 1500.0          # Nm/rad
+    damping: 40.0              # Nms/rad
+    motor_stiffness: 3000.0    # position-controller gain at the motor joint
+    motor_damping: 100.0
+    intermediate_mass: 0.10    # kg, fictional rotor-side transmission link
+    intermediate_size: 0.20    # m, Newton-only inertia proxy; never visualized
+  joints:
+    wrist_3_joint:
+      stiffness: 800.0
+      damping: 20.0
+      # link_mass: 0.20        # uncomment to override the URDF child-link mass

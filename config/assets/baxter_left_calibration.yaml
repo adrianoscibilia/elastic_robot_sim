@@ -2,7 +2,11 @@
 # ordered joint mapping, data path and physical priors.  The runner, metric
 # and optimizer are shared with every asset.
 asset: ../../assets/robots/baxter/asset.yaml
-dataset: ../../data/processed/baxter_left.parquet
+dataset: ../../assets/datasets/baxter/raw/left_circle_p-15_t105.csv
+dataset_format: baxter_csv
+# The public Baxter CSV has no timestamps.  The producer must confirm this
+# sampling interval for a different acquisition before calibration.
+sample_time_s: 0.002
 joint_names: [left_s0, left_s1, left_e0, left_e1, left_w0, left_w1, left_w2]
 runner_factory: elastic_sim.generic_newton_runner:make_torque_replay_runner
 train_fraction: 0.8

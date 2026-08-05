@@ -242,26 +242,70 @@ comparison, optimization and storage do not embed robot names.  See
 [`assets/README.md`](assets/README.md) for provenance and the downloaded
 benchmark material.
 
-For a serial arm, Pinocchio is the primary non-ROS trajectory dependency: it
-loads the URDF and its joint limits, validates the selected one-DoF chain, and
-creates seeded, limit-safe minimum-jerk joint-space trajectories.  Install the
-Pinocchio Python bindings in the simulator environment, then run:
+Serial-arm trajectories are generated directly from portable URDF joint limits
+(Pinocchio and MoveIt remain optional for collision-aware planning).  Every
+asset can be validated, simulated, generated into a canonical CSV dataset,
+and calibrated through the same entry points:
 
 ```bash
-python scripts/generate_serial_trajectory.py \
-  --urdf assets/robots/baxter/description/baxter_description/urdf/baxter.urdf \
-  --joints left_s0,left_s1,left_e0,left_e1,left_w0,left_w1,left_w2 \
-  --output data/trajectories/baxter_left.json --seed 42
+# Validate bundled descriptions without a Newton installation
+python scripts/run_asset_simulation.py --asset ur10 --dry-run --seed 42
+python scripts/run_asset_simulation.py --asset baxter_left --dry-run --seed 42
+python scripts/run_asset_simulation.py --asset kuka_kr300_r2500_ultra_se --dry-run --seed 42
+
+# Create the repository-local, gitignored .venv from the pinned uv lockfile
+uv sync --all-groups
+# Equivalent PowerShell helper (also verifies the imports)
+powershell -ExecutionPolicy Bypass -File scripts/setup_sim_env.ps1
+
+# Run equivalent Newton or MuJoCo trajectories and build a synthetic dataset
+.\.venv\Scripts\python.exe scripts/run_asset_simulation.py --asset ur10 --backend newton --output data/ur10/trial.csv --seed 42
+.\.venv\Scripts\python.exe scripts/run_asset_simulation.py --asset ur10 --backend mujoco --visualize --seed 42
+.\.venv\Scripts\python.exe scripts/run_asset_dataset_generation.py --asset baxter_left --backend mujoco --output-dir data/baxter_synthetic --trials 20
+
+# Explicit motor -> invisible transmission link -> elastic joint model.
+.\.venv\Scripts\python.exe scripts/run_asset_simulation.py --asset ur10 --backend mujoco --dynamics elastic --visualize --settings config/assets/ur10_elastic_example.yaml
+
+# Calibrate against the local real-data sources
+python scripts/run_dataset_calibration.py --config config/assets/baxter_left_calibration.yaml
+python scripts/run_dataset_calibration.py --config config/assets/kuka_kr300_calibration.yaml
 ```
+
+`run_asset_simulation.py` defaults to deterministic Newton kinematic playback.
+Pass `--backend mujoco` for the equivalent MuJoCo runner; both expose
+`kinematic`, `rigid`, and `elastic` modes, the same result/CSV schema,
+`--visualize`, and optional output.  All assets declare standard gravity and
+self-collision.  MuJoCo uses native primitive geometry for FMRR/KUKA and
+converts the local UR10/Baxter DAE/STL meshes to temporary OBJ files at model
+load time, because the Windows importer cannot read that mesh mix directly.
+Primitive proxies are used only if a particular conversion fails.  Newton
+keeps the original asset meshes.  The kinematic mode is the reliable path for
+inspecting assets and finite reference data; the physics modes should be
+validated for a given robot/controller before treating them as calibration
+truth.
+
+Elastic runs use the same asset discovery path for every robot: each selected
+URDF joint is expanded into a controlled motor joint, an invisible fictional
+transmission body, and a passive elastic joint.  Each supplied YAML is bound
+to one `asset` name, so applying UR10 joint names to Baxter fails early.
+Settings under
+`elastic.defaults` apply to all active joints, while `elastic.joints.<name>`
+overrides stiffness, damping, motor gains, transmission-link mass, and
+optionally the original child-link mass.  See
+[`config/assets/ur10_elastic_example.yaml`](config/assets/ur10_elastic_example.yaml).
+The fictional body has no visual/collision geometry: `intermediate_size` is
+only Newton's numerical inertia proxy and must remain large enough for a
+well-conditioned gravity-loaded revolute transmission.
 
 MoveIt is the complementary ROS 2 path for collision-aware planning and real
 robot execution; it should consume these asset definitions rather than become
 the simulator's required runtime dependency.
 
 `scripts/run_dataset_calibration.py` calibrates a generic Newton asset by
-replaying recorded joint torques.  It consumes canonical CSV/Parquet data and
-an asset/config-only YAML such as
-`config/dataset_calibration.example.yaml`.  Its metric distinguishes observed
+replaying recorded joint torques.  It consumes canonical CSV/Parquet data plus
+the locally stored raw KUKA MAT and Baxter whitespace-CSV schemas.  Use
+`scripts/prepare_asset_dataset.py` to export a canonical CSV when desired.
+Its metric distinguishes observed
 output/link state, optional observed motor state, joint torque input, and an
 optional end-effector F/T channel—none is silently substituted for another.
 
@@ -345,6 +389,9 @@ elastic_robot_sim/
 │   ├── elastic_cart_robot_mujoco.py   # MuJoCo standalone simulation
 │   ├── elastic_cart_robot_isaacsim.py # Isaac Sim standalone simulation
 │   ├── run_dataset_generation.py  # Batch synthetic dataset generation (Newton)
+│   ├── run_asset_simulation.py    # Asset-generic Newton / MuJoCo simulation
+│   ├── run_asset_dataset_generation.py # Asset-generic synthetic dataset batch
+│   ├── prepare_asset_dataset.py   # KUKA/Baxter raw → canonical CSV
 │   ├── record_rollouts.py         # Record fixed-trajectory rollouts (sim backends)
 │   ├── collect_dataset.py         # ROS 2 node: batch real-robot dataset collection
 │   └── run_calibration.py         # Sim-to-real calibration optimizer
@@ -369,8 +416,9 @@ elastic_robot_sim/
 ├── data/                          # Generated CSV datasets
 ├── data/rollouts/                 # Structured rollout store (record_rollouts.py)
 ├── data/recordings/               # Flat timestamped recordings (collect_dataset)
-├── urdf/
-│   └── platform_complete.urdf     # Robot description
+├── assets/
+│   ├── robots/                    # Platform, UR10, Baxter and KUKA descriptions
+│   └── datasets/                  # Local KUKA MAT and Baxter CSV ground truth
 └── tests/
     └── test_vertical_deflection_payload_sweep.py
 ```
