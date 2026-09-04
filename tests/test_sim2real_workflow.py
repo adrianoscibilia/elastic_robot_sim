@@ -5,6 +5,7 @@ import pandas as pd
 
 from elastic_sim.experiment import (
     ExperimentStore,
+    artifact_root,
     config_digest,
     generate_materialized_trajectory,
     load_experiment_config,
@@ -63,13 +64,24 @@ def test_parameter_registry_supports_named_transmission_and_body_overrides():
 def test_store_discovery_requires_real_pair_and_hash(tmp_path):
     config = {"asset": "test", "trajectory": {"duration": 1.0}}
     trajectory = MaterializedTrajectory(np.array([0.0, 1.0]), np.zeros((2, 1)), np.zeros((2, 1)), ("joint_a",), np.zeros((2, 1)), {"config_hash": config_digest(config)})
-    store = ExperimentStore(tmp_path, "test", "20260101T000000Z")
+    root = tmp_path / "recorded"
+    store = ExperimentStore(root, "test", "20260101T000000Z")
     store.save_trajectory(trajectory)
     store.save_frame(pd.DataFrame({"trajectory_id": [0, 0], "t": [0.0, 1.0], "q__joint_a": [0.0, 0.0], "dq__joint_a": [0.0, 0.0]}), "real.parquet")
     store.save_manifest({"asset": "test", "config_hash": config_digest(config), "completion_status": "complete"})
-    records = discover_experiment_records(tmp_path, "test", config_digest(config))
+    records = discover_experiment_records(root, "test", config_digest(config))
     assert len(records) == 1
     assert len(records[0].trajectories) == 1
+
+
+def test_artifact_roots_are_kind_first_and_reject_mixed_paths(tmp_path):
+    config = {"paths": {"simulated_root": str(tmp_path / "simulated")}}
+    assert artifact_root(config, "simulated", ROOT).name == "simulated"
+    import pytest
+    with pytest.raises(ValueError, match="must end"):
+        artifact_root(config, "recorded", ROOT, tmp_path / "simulated")
+    with pytest.raises(ValueError, match="invalid run-id"):
+        ExperimentStore(tmp_path / "recorded", "robot", "../escape")
 
 
 def test_ros_topic_manifest_contains_required_and_extra_topics():

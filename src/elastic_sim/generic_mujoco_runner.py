@@ -70,7 +70,7 @@ class GenericMujocoTrajectoryRunner:
         model, uses_mesh_proxies = _build_model(self.asset, mujoco, time_step, body_overrides=self.config.get("body_overrides", {}))
         data = mujoco.MjData(model)
         active = _joint_addresses(model, mujoco, self._joint_names)
-        # A whole-body URDF (Baxter) includes joints outside the selected arm.
+        # A whole-body URDF may include joints outside the selected chain.
         # Hold them at their URDF zero pose during dynamic single-arm replay.
         all_names = tuple(
             joint.name for joint in discover_urdf_joints(self.asset.urdf_path)
@@ -560,5 +560,5 @@ def _require_mujoco() -> Any:
     try:
         import mujoco
     except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("MuJoCo asset simulation requires mujoco; run scripts/setup_sim_env.ps1") from exc
+        raise ImportError("MuJoCo asset simulation requires mujoco; run `uv sync`") from exc
     return mujoco

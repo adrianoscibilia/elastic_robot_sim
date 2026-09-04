@@ -8,7 +8,7 @@ The primary configuration files are `config/assets/*_sim2real.yaml`. They are or
 |---|---:|---|
 | `schema_version` | no | Configuration schema marker. |
 | `asset` | yes | Asset registry name or an asset YAML path. |
-| `output_root` | no | Experiment root; default is `data/experiments`. |
+| `paths` | no | Separate `simulated_root`, `recorded_root`, and `calibrations_root`; defaults are the matching directories under `data/`. |
 | `trajectory` | no | Generator, count, timing, seed, and workspace. |
 | `simulation` | no | Backends and simulator timestep. |
 | `model` | no | Backend/model defaults and overrides. |

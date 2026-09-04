@@ -1,0 +1,6 @@
+asset:
+  name: kuka_lbr_iiwa_14_r820
+  urdf: description/kuka_lbr_iiwa_14_r820.urdf
+  active_joints: [iiwa_A1, iiwa_A2, iiwa_A3, iiwa_A4, iiwa_A5, iiwa_A6, iiwa_A7]
+  gravity: [0.0, 0.0, -9.81]
+  self_collisions: true

@@ -32,6 +32,6 @@ def test_settings_reject_joint_not_selected_by_asset(tmp_path: Path):
 def test_settings_reject_another_assets_joint_configuration(tmp_path: Path):
     asset = AssetRegistry.for_repository(_REPO).load("ur10")
     path = tmp_path / "wrong-asset.yaml"
-    path.write_text("asset: baxter_left\nelastic: {}\n", encoding="utf-8")
+    path.write_text("asset: tiago_pro_dual\nelastic: {}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="not 'ur10'"):
         load_simulation_settings(path, asset)

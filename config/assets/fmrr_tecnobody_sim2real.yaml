@@ -1,6 +1,6 @@
 schema_version: 1
 asset: fmrr_tecnobody
-output_root: data/experiments
+paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
 
 trajectory:
   mode: ptp

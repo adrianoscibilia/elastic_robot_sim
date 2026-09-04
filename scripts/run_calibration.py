@@ -18,11 +18,12 @@ _SRC = _REPO / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from elastic_sim.experiment import config_digest, load_experiment_config, resolve_asset  # noqa: E402
+from elastic_sim.experiment import artifact_root, config_digest, load_experiment_config, resolve_asset, rollout_to_frame  # noqa: E402
 from elastic_sim.parameter_registry import ParameterRegistry  # noqa: E402
 from elastic_sim.sim2real import (  # noqa: E402
     ReferenceTrajectoryCalibrationProblem,
     discover_experiment_records,
+    run_simulation,
     split_records,
 )
 
@@ -32,7 +33,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--config", required=True, help="sim-to-real asset configuration")
     parser.add_argument("--methods", nargs="+", choices=("cma", "bo", "skrl", "all"), default=None)
     parser.add_argument("--backends", nargs="+", choices=("newton", "mujoco"), default=None)
-    parser.add_argument("--experiments-root", default=None)
+    parser.add_argument("--recorded-root", default=None, help="input root; final component must be recorded")
     parser.add_argument("--max-evals", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-root", default=None)
@@ -85,10 +86,7 @@ def main() -> int:
     methods = list(dict.fromkeys(methods))
     _dependency_check(methods)
     backends = tuple(args.backends or config.get("simulation", {}).get("backends", ("newton", "mujoco")))
-    root_value = args.experiments_root or config.get("output_root", "data/experiments")
-    root = Path(root_value).expanduser()
-    if not root.is_absolute():
-        root = (_REPO / root).resolve()
+    root = artifact_root(config, "recorded", _REPO, args.recorded_root)
     expected_hash = config_digest(config)
     records = discover_experiment_records(root, asset.name, expected_hash)
     if not records:
@@ -101,7 +99,7 @@ def main() -> int:
     max_evals = int(args.max_evals if args.max_evals is not None else cal.get("max_evals", 100))
     if max_evals < 1:
         raise ValueError("max-evals must be positive")
-    output_root = Path(args.output_root or (_REPO / "data" / "calibration")).expanduser().resolve()
+    output_root = artifact_root(config, "calibrations", _REPO, args.output_root)
     run_dir = output_root / asset.name / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir.mkdir(parents=True, exist_ok=True)
     report: dict = {
@@ -131,6 +129,15 @@ def main() -> int:
         backend_results["selected"] = winner
         backend_results["selected_parameters"] = backend_results[winner]["parameters"]
         _write_yaml(run_dir / f"calibrated_{backend}.yaml", asset.name, backend, backend_results[winner]["parameters"], registry, backend_results[winner]["validation_loss"])
+        validation_frames = []
+        for index, (trajectory, _) in enumerate(validation):
+            simulated = run_simulation(asset, config, trajectory, backend, backend_results[winner]["parameters"])
+            frame = rollout_to_frame(trajectory, simulated, source=f"calibrated_{backend}")
+            frame.insert(0, "trajectory_id", index)
+            validation_frames.append(frame)
+        __import__("pandas").concat(validation_frames, ignore_index=True).to_parquet(
+            run_dir / f"validation_{backend}.parquet", index=False
+        )
         report["results"][backend] = backend_results
     (run_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Calibration complete: {run_dir}")

@@ -1,0 +1,20 @@
+schema_version: 2
+asset: kuka_lbr_iiwa_14_r820
+paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
+trajectory:
+  mode: ptp
+  num_trajectories: 3
+  duration: 10.0
+  time_step: 0.01
+  seed: 20260904
+  max_velocity: 0.25
+  ptp: {waypoints: 5, limit_margin: 0.15}
+  workspace: {iiwa_A1: [-0.35, 0.35], iiwa_A2: [-0.35, 0.35], iiwa_A3: [-0.35, 0.35], iiwa_A4: [-0.35, 0.35], iiwa_A5: [-0.35, 0.35], iiwa_A6: [-0.35, 0.35], iiwa_A7: [-0.35, 0.35]}
+simulation: {backends: [newton, mujoco], time_step: 0.004}
+model: {mode: elastic, default_stiffness: 1500.0, default_damping: 40.0, motor_stiffness: 3000.0, motor_damping: 100.0, intermediate_mass: 0.05, intermediate_size: 0.08, transmissions: {}}
+calibration: {train_fraction: 0.67, methods: [cma, bo], max_evals: 100, loss_weights: {position: 1.0, velocity: 0.3, effort: 0.1, force: 0.1, torque: 0.1, motor_state: 0.0}, parameters: []}
+ros:
+  action_server: /lbr/joint_trajectory_controller/follow_joint_trajectory
+  topics: {joint_states: /lbr/joint_states, flange_wrench: /lbr/force_torque_broadcaster/wrench, controller_state: /lbr/joint_trajectory_controller/state}
+  motor_services: {enable: /lbr/controller_manager/start_motors, disable: /lbr/controller_manager/stop_motors}
+  extra_topics: []

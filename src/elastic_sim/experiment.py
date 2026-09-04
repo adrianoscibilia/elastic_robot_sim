@@ -208,9 +208,15 @@ class ExperimentStore:
     def __init__(self, root: str | Path, asset: str, run_id: str | None = None) -> None:
         now = datetime.now(timezone.utc)
         self.root = Path(root).expanduser().resolve()
+        if self.root.name not in {"simulated", "recorded", "calibrations"}:
+            raise ValueError("artifact root must end in simulated, recorded, or calibrations")
+        if not asset or Path(asset).name != asset or asset in {".", ".."}:
+            raise ValueError(f"invalid asset path component: {asset!r}")
         self.asset = asset
         self.date = now.strftime("%Y-%m-%d")
         self.run_id = run_id or now.strftime("%Y%m%dT%H%M%SZ")
+        if Path(self.run_id).name != self.run_id or self.run_id in {".", ".."}:
+            raise ValueError(f"invalid run-id path component: {self.run_id!r}")
         self.path = self.root / asset / self.date / self.run_id
         self.path.mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +235,19 @@ class ExperimentStore:
         path.write_text(yaml.safe_dump(dict(manifest), sort_keys=False), encoding="utf-8")
         return path
 
+
+def artifact_root(
+    config: Mapping[str, Any], kind: str, repository_root: str | Path, override: str | Path | None = None,
+) -> Path:
+    """Resolve and validate one of the three non-overlapping artifact roots."""
+    if kind not in {"simulated", "recorded", "calibrations"}:
+        raise ValueError(f"unsupported artifact kind {kind!r}")
+    configured = (config.get("paths", {}) or {}).get(f"{kind}_root", f"data/{kind}")
+    value = Path(override if override is not None else configured).expanduser()
+    root = value.resolve() if value.is_absolute() else (Path(repository_root).resolve() / value).resolve()
+    if root.name != kind:
+        raise ValueError(f"{kind} artifact root must end with '/{kind}', got {root}")
+    return root
 
 def config_digest(config: Mapping[str, Any]) -> str:
     clean = {key: value for key, value in config.items() if not str(key).startswith("_")}

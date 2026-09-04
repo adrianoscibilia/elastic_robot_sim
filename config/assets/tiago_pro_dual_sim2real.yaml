@@ -1,0 +1,41 @@
+schema_version: 2
+asset: tiago_pro_dual
+paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
+trajectory:
+  mode: ptp
+  num_trajectories: 3
+  duration: 12.0
+  time_step: 0.01
+  seed: 20260904
+  max_velocity: 0.25
+  ptp: {waypoints: 5, limit_margin: 0.15}
+  workspace:
+    arm_left_1_joint: [-0.35, 0.35]
+    arm_left_2_joint: [-0.35, 0.35]
+    arm_left_3_joint: [-0.35, 0.35]
+    arm_left_4_joint: [-0.35, 0.35]
+    arm_left_5_joint: [-0.35, 0.35]
+    arm_left_6_joint: [-0.35, 0.35]
+    arm_left_7_joint: [-0.35, 0.35]
+    arm_right_1_joint: [-0.35, 0.35]
+    arm_right_2_joint: [-0.35, 0.35]
+    arm_right_3_joint: [-0.35, 0.35]
+    arm_right_4_joint: [-0.35, 0.35]
+    arm_right_5_joint: [-0.35, 0.35]
+    arm_right_6_joint: [-0.35, 0.35]
+    arm_right_7_joint: [-0.35, 0.35]
+simulation: {backends: [newton, mujoco], time_step: 0.004}
+model: {mode: elastic, default_stiffness: 1500.0, default_damping: 40.0, motor_stiffness: 3000.0, motor_damping: 100.0, intermediate_mass: 0.05, intermediate_size: 0.08, transmissions: {}}
+calibration:
+  train_fraction: 0.67
+  methods: [cma, bo]
+  max_evals: 100
+  loss_weights: {position: 1.0, velocity: 0.3, effort: 0.1, force: 0.1, torque: 0.1, motor_state: 0.0}
+  parameters: []
+ros:
+  action_server: /dual_arm_controller/follow_joint_trajectory
+  topics: {joint_states: /joint_states, flange_wrench: /wrist_left_ft_sensor/wrench, controller_state: /dual_arm_controller/state}
+  motor_services: {enable: /controller_manager/start_motors, disable: /controller_manager/stop_motors}
+  extra_topics: [{name: /wrist_right_ft_sensor/wrench, type: geometry_msgs/msg/WrenchStamped}]
+  preflight_timeout: 5.0
+  action_timeout: 30.0

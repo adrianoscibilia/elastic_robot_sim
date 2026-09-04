@@ -7,7 +7,7 @@ This is the operational guide for a new experiment.
 From the repository root:
 
 ```bash
-uv sync --all-groups
+uv sync
 uv run python scripts/run_experiment.py \
   --config config/assets/fmrr_tecnobody_sim2real.yaml --dry-run
 ```
@@ -109,7 +109,7 @@ uv run python scripts/run_calibration.py \
   --methods cma --backends mujoco --max-evals 8
 ```
 
-The command discovers runs under the configured `output_root`, requires `completion_status: complete`, requires `real.parquet` and trajectory JSON files, and requires an exact configuration hash match. It then:
+The command discovers runs only under the configured `paths.recorded_root`, requires `completion_status: complete`, requires `real.parquet` and trajectory JSON files, and requires an exact configuration hash match. It then:
 
 - splits trajectories, never individual rows;
 - creates one backend-neutral calibration problem;

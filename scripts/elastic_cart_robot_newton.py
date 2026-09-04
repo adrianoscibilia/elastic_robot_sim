@@ -74,7 +74,7 @@ try:
     import newton
 except ImportError as exc:
     raise ImportError(
-        "This script requires Newton Physics. Install it with `pip install \"newton[examples]\"`."
+        "This script requires Newton Physics. Run `uv sync` from the repository root."
     ) from exc
 
 

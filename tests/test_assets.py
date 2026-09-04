@@ -77,7 +77,8 @@ def test_transmission_parameters_reject_non_physical_values():
 def test_repository_assets_are_discoverable_and_resource_complete():
     registry = AssetRegistry.for_repository(_REPO)
     expected = {
-        "fmrr_tecnobody", "ur10", "baxter_left", "baxter_right", "kuka_kr300_r2500_ultra_se",
+        "fmrr_tecnobody", "ur10", "tiago_pro_dual",
+        "kuka_lbr_iiwa_7_r800", "kuka_lbr_iiwa_14_r820",
     }
     assert expected.issubset(registry.available())
     for name in expected:

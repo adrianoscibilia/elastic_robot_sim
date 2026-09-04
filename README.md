@@ -2,7 +2,7 @@
 
 `elastic_robot_sim` is a sim-to-real system-identification framework for elastic robots. It generates joint-space excitation trajectories, saves the exact samples, runs those samples in Newton and MuJoCo, executes the same samples through a ROS 2 `joint_trajectory_controller`, records the robot signals and raw rosbag2 data, and calibrates simulator parameters against the real run.
 
-The primary workflow is asset-based. It does not require the KUKA or Baxter benchmark datasets and it does not replay a recorded torque as the simulator input. The reference trajectory is the input; joint effort and flange wrench are observations used by the loss when configured.
+The workflow is asset-based and uses only newly simulated trajectories or recordings collected from real robots. The reference trajectory is the input; joint effort and flange wrench are observations used by the loss when configured.
 
 ## Start here
 
@@ -11,10 +11,10 @@ The primary workflow is asset-based. It does not require the KUKA or Baxter benc
 From the repository root:
 
 ```bash
-uv sync --all-groups
+uv sync
 ```
 
-The `calibration` dependency group contains CMA-ES, Bayesian optimization, skrl, Gymnasium, and PyTorch. Use `uv sync --group calibration` if the development group is not needed.
+The default environment contains everything needed for Newton and MuJoCo simulation. Add `--group calibration` for optimizers or `--group dev` for pytest.
 
 The examples use POSIX shell continuation (`\`). In PowerShell, run the command on one line or replace each continuation character with a backtick (`` ` ``).
 
@@ -91,7 +91,7 @@ The command always generates a materialized trajectory from YAML first. Simulato
 run_calibration.py --config CONFIG
                        [--methods cma bo skrl all ...]
                        [--backends newton mujoco ...]
-                       [--experiments-root PATH]
+                       [--recorded-root PATH]
                        [--max-evals N]
                        [--seed SEED]
                        [--output-root PATH]
@@ -101,26 +101,23 @@ run_calibration.py --config CONFIG
 
 ## Output layout
 
-Experiment data is stored by asset, UTC date, and UTC run timestamp:
+Artifact kind is always the first directory and robot identity is always second:
 
 ```text
-data/experiments/
-└── <asset>/
-    └── YYYY-MM-DD/
-        └── <run_timestamp>/
-            ├── manifest.yaml
-            ├── trajectory.json                 # single-trajectory convenience copy
-            ├── trajectories/                   # present for multi-trajectory runs
-            │   ├── trajectory_000.json
-            │   └── trajectory_001.json
-            ├── sim_newton.parquet
-            ├── sim_mujoco.parquet
-            ├── real.parquet
-            ├── observations.parquet
-            └── raw/
-                ├── rosbag2/                    # rosbag2 output directory
-                ├── rosbag2.stdout.log
-                └── rosbag2.stderr.log
+data/
+├── simulated/<asset>/YYYY-MM-DD/<run_timestamp>/
+│   ├── manifest.yaml
+│   ├── trajectory.json
+│   ├── trajectories/
+│   ├── sim_newton.parquet
+│   └── sim_mujoco.parquet
+└── recorded/<asset>/YYYY-MM-DD/<run_timestamp>/
+    ├── manifest.yaml
+    ├── trajectory.json
+    ├── trajectories/
+    ├── real.parquet
+    ├── observations.parquet
+    └── raw/rosbag2/
 ```
 
 `real.parquet` is the calibration-ready normalized recording. `observations.parquet` currently preserves the same joined frame and is reserved for broader channels and future losses. Both include source/receipt timing, validity fields, joint-state channels, controller channels, wrench channels, planned reference samples, trajectory IDs, and action result metadata when the real path is used.
@@ -128,7 +125,7 @@ data/experiments/
 Calibration outputs are stored separately:
 
 ```text
-data/calibration/<asset>/<calibration_timestamp>/
+data/calibrations/<asset>/<calibration_timestamp>/
 ├── report.json
 ├── calibrated_newton.yaml
 ├── calibrated_mujoco.yaml
@@ -146,10 +143,11 @@ The manifest records the asset and configuration hashes, parameter values, traje
 |---|---|---|---|
 | `fmrr_tecnobody_sim2real.yaml` | FMRR Tecnobody | `joint_x`, `joint_y`, `joint_z` | Dedicated Cartesian elastic model and flange-force mapping |
 | `ur10_sim2real.yaml` | UR10 | URDF joint names | Generic serial elastic model |
-| `baxter_left_sim2real.yaml` | Baxter left arm | URDF joint names | Generic serial elastic model |
-| `kuka_kr300_sim2real.yaml` | KUKA KR300 approximation | URDF joint names | Generic serial elastic model |
+| `tiago_pro_dual_sim2real.yaml` | TIAGo Pro dual arm | Both seven-joint arms | Generic serial elastic model |
+| `kuka_lbr_iiwa_7_r800_sim2real.yaml` | KUKA LBR iiwa 7 R800 | Seven arm joints | Generic serial elastic model |
+| `kuka_lbr_iiwa_14_r820_sim2real.yaml` | KUKA LBR iiwa 14 R820 | Seven arm joints | Generic serial elastic model |
 
-Each sim2real YAML owns the asset, trajectory, simulation backends, model defaults, calibration registry, loss weights, ROS topics/services, sensor mapping, and output root. Copy one of these files when creating a new experiment; do not hardcode robot joint names in Python.
+Each sim2real YAML owns the asset, trajectory, simulation backends, model defaults, calibration registry, loss weights, ROS topics/services, sensor mapping, and three artifact roots. Copy one when creating an experiment; do not hardcode robot joint names in Python.
 
 ## How the workflow fits together
 
@@ -178,7 +176,10 @@ A sim2real file has these sections:
 
 ```yaml
 asset: ur10
-output_root: data/experiments
+paths:
+  simulated_root: data/simulated
+  recorded_root: data/recorded
+  calibrations_root: data/calibrations
 
 trajectory:
   mode: ptp                 # hold, sin/sinusoidal, or ptp

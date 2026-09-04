@@ -32,14 +32,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# xacro import — must be installed (``pip install xacro``)
+# xacro is an optional one-shot tool for compiling external descriptions.
 # ---------------------------------------------------------------------------
 try:
     import xacro
 except ImportError:
     sys.exit(
         "The 'xacro' Python package is required.\n"
-        "Install it with:  pip install xacro"
+        "Run this script with: uv run --with xacro python scripts/compile_urdf_from_description.py ..."
     )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

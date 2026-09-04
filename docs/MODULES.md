@@ -23,7 +23,6 @@ This page explains where to look when changing or debugging the repository.
 | `compare.py` | Legacy rollout fidelity metrics and per-axis comparisons. |
 | `calibration.py` | Legacy Cartesian `SimCalibrationProblem`; retained for compatibility, while the primary command uses `sim2real.py`. |
 | `generic_calibration.py` | Legacy torque-replay calibration adapter; not used by the primary sim2real command. |
-| `asset_dataset.py` | Legacy KUKA/Baxter dataset adapter; benchmark-data compatibility only, not a calibration input path. |
 | `elastic_settings.py` | Configuration helpers for explicit serial motor-to-link elastic transmissions. |
 | `ros_recorder.py` | Older ROS recorder retained for compatibility; new recording uses `ros_experiment.py`. |
 | `__init__.py` | Package marker and top-level package description. |
@@ -58,7 +57,6 @@ This page explains where to look when changing or debugging the repository.
 | `run_dataset_generation.py` | Older FMRR synthetic dataset sweep. It is not a sim2real input producer. |
 | `compile_urdf_from_description.py` | Convert a ROS/xacro robot description to a flat URDF with usable mesh paths. |
 | `view_urdf_mujoco.py` | Small MuJoCo URDF viewer utility. |
-| `setup_sim_env.ps1` | Windows helper for preparing/checking the uv environment. |
 | `sim_common.py` | Shared helpers for the older standalone Cartesian scripts and synthetic-data utilities. |
 
 ## Where to implement common changes

@@ -9,7 +9,7 @@ Generate and execute a UR10 excitation::
 
 Validate an asset and save its trajectory without requiring Newton::
 
-    python scripts/run_asset_simulation.py --asset kuka_kr300_r2500_ultra_se --dry-run
+    python scripts/run_asset_simulation.py --asset kuka_lbr_iiwa_14_r820 --dry-run
 """
 
 from __future__ import annotations
