@@ -86,6 +86,8 @@ def _build_mjcf_xml(params: RobotParams, time_step: float = 0.01) -> str:
     cy = params.drive_y.damping(EFFECTIVE_AXIS_MASS["y"])
     kz = params.drive_z.stiffness
     cz = params.drive_z.damping(EFFECTIVE_AXIS_MASS["z"])
+    motor_stiffness = float(params.motor_stiffness)
+    motor_damping = float(params.motor_damping)
 
     # Payload: always present; use a tiny stand-in mass when payload == 0
     payload_mass = max(float(params.payload), 1e-6)
@@ -169,16 +171,16 @@ def _build_mjcf_xml(params: RobotParams, time_step: float = 0.01) -> str:
   -->
   <actuator>
     <general name="act_x" joint="joint_x_motor"
-             gaintype="fixed"  gainprm="{MOTOR_STIFFNESS:.6g}"
-             biastype="affine" biasprm="0 -{MOTOR_STIFFNESS:.6g} -{MOTOR_DAMPING:.6g}"
+             gaintype="fixed"  gainprm="{motor_stiffness:.6g}"
+             biastype="affine" biasprm="0 -{motor_stiffness:.6g} -{motor_damping:.6g}"
              forcerange="-{_MOTOR_FORCE_LIMIT:.6g} {_MOTOR_FORCE_LIMIT:.6g}"/>
     <general name="act_y" joint="joint_y_motor"
-             gaintype="fixed"  gainprm="{MOTOR_STIFFNESS:.6g}"
-             biastype="affine" biasprm="0 -{MOTOR_STIFFNESS:.6g} -{MOTOR_DAMPING:.6g}"
+             gaintype="fixed"  gainprm="{motor_stiffness:.6g}"
+             biastype="affine" biasprm="0 -{motor_stiffness:.6g} -{motor_damping:.6g}"
              forcerange="-{_MOTOR_FORCE_LIMIT:.6g} {_MOTOR_FORCE_LIMIT:.6g}"/>
     <general name="act_z" joint="joint_z_motor"
-             gaintype="fixed"  gainprm="{MOTOR_STIFFNESS:.6g}"
-             biastype="affine" biasprm="0 -{MOTOR_STIFFNESS:.6g} -{MOTOR_DAMPING:.6g}"
+             gaintype="fixed"  gainprm="{motor_stiffness:.6g}"
+             biastype="affine" biasprm="0 -{motor_stiffness:.6g} -{motor_damping:.6g}"
              forcerange="-{_MOTOR_FORCE_LIMIT:.6g} {_MOTOR_FORCE_LIMIT:.6g}"/>
   </actuator>
 </mujoco>"""
@@ -321,9 +323,6 @@ def run_rollout(
     if seed is not None:
         np.random.seed(seed)
 
-    # Velocity-feedforward gain ratio: ctrl = pos_ref + (kd/kp)*vel_ref
-    vff = MOTOR_DAMPING / MOTOR_STIFFNESS
-
     # Reset to initial state
     mujoco.mj_resetData(model, data)
 
@@ -337,10 +336,20 @@ def run_rollout(
     ax = int(act_index_map["joint_x"])
     ay = int(act_index_map["joint_y"])
     az = int(act_index_map["joint_z"])
+    # Velocity-feedforward gain ratio: ctrl = pos_ref + (kd/kp)*vel_ref.
+    vff = np.asarray([
+        model.actuator_biasprm[ax, 2] / model.actuator_gainprm[ax, 0],
+        model.actuator_biasprm[ay, 2] / model.actuator_gainprm[ay, 0],
+        model.actuator_biasprm[az, 2] / model.actuator_gainprm[az, 0],
+    ], dtype=float)
 
     time_step = float(model.opt.timestep)
-    sim_time = trajectory.config.effective_sim_time
-    num_steps = int(np.ceil(sim_time / time_step))
+    if hasattr(trajectory, "time") and isinstance(getattr(trajectory, "time"), np.ndarray):
+        time_grid = np.asarray(trajectory.time, dtype=float)
+    else:
+        sim_time_value = getattr(trajectory, "duration", None)
+        sim_time = float(sim_time_value if sim_time_value is not None else trajectory.config.effective_sim_time)
+        time_grid = np.arange(0.0, sim_time + 0.5 * time_step, time_step)
 
     time_list: list = []
     ref_pos_list: list = []
@@ -352,8 +361,18 @@ def run_rollout(
     tau_motor_list: list = []
     tau_link_list: list = []
 
-    for _ in range(num_steps):
-        t = float(data.time)
+    # Keep the same zero-deflection initialization convention as the Newton
+    # path.  For saved trajectories this is the first exact sample.
+    if hasattr(trajectory, "__call__"):
+        q0, dq0, _ = trajectory(0.0)
+        data.qpos[mx], data.qpos[my], data.qpos[mz] = q0
+        data.qpos[ex], data.qpos[ey], data.qpos[ez] = q0
+        data.qvel[mx], data.qvel[my], data.qvel[mz] = dq0
+        data.qvel[ex], data.qvel[ey], data.qvel[ez] = dq0
+        mujoco.mj_forward(model, data)
+
+    for sample_index, sample_time in enumerate(time_grid):
+        t = float(sample_time)
         q = data.qpos.copy()
         dq = data.qvel.copy()
 
@@ -365,12 +384,13 @@ def run_rollout(
             q_meas = q
             dq_meas = dq
 
-        q_ref, dq_ref = trajectory(t)
+        sampled = trajectory(t)
+        q_ref, dq_ref = sampled[:2]
 
         # PD control with velocity feedforward
-        data.ctrl[ax] = float(q_ref[0]) + vff * float(dq_ref[0])
-        data.ctrl[ay] = float(q_ref[1]) + vff * float(dq_ref[1])
-        data.ctrl[az] = float(q_ref[2]) + vff * float(dq_ref[2])
+        data.ctrl[ax] = float(q_ref[0]) + vff[0] * float(dq_ref[0])
+        data.ctrl[ay] = float(q_ref[1]) + vff[1] * float(dq_ref[1])
+        data.ctrl[az] = float(q_ref[2]) + vff[2] * float(dq_ref[2])
 
         mujoco.mj_step(model, data)
 
@@ -409,6 +429,8 @@ def run_rollout(
             dq_link_list.append(np.array([dq_meas[ex], dq_meas[ey], dq_meas[ez]]))
             tau_motor_list.append(tau_motor)
             tau_link_list.append(tau_link)
+        if sample_index + 1 >= len(time_grid):
+            break
 
     return RolloutResult(
         time=np.array(time_list),

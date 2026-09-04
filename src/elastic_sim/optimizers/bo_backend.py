@@ -68,13 +68,17 @@ class BayesianOptimizer(Optimizer):
                 print(f"  BO eval {len(history):4d}: loss={loss:.6f}")
             return float(loss)
 
-        x0_list = [x0.tolist()] if x0 is not None else None
+        # scikit-optimize counts an explicit x0 in addition to
+        # n_initial_points.  For very short smoke-test budgets, omit x0 so
+        # the requested evaluation budget remains valid.
+        initial_points = min(self.n_initial_points, max_evals)
+        x0_list = [x0.tolist()] if x0 is not None and max_evals >= initial_points + 1 else None
 
         result = gp_minimize(
             _wrapped,
             norm_bounds,
             n_calls=max_evals,
-            n_initial_points=self.n_initial_points,
+            n_initial_points=initial_points,
             acq_func=self.acq_func,
             noise=self.noise,
             x0=x0_list,

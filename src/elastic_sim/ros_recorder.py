@@ -1,4 +1,4 @@
-"""ROS 2 recording node: shared between record_real_rollout and collect_dataset."""
+"""Legacy ROS recorder retained for compatibility; new runs use ros_experiment."""
 from __future__ import annotations
 
 import os

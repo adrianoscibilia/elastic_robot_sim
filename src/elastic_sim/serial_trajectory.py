@@ -18,6 +18,7 @@ from typing import Iterable
 import numpy as np
 
 from .assets import discover_urdf_joints
+from .materialized import MaterializedTrajectory
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,13 @@ class SerialArmTrajectory:
             "ddq": np.asarray([item[2] for item in samples]),
             "joint_names": np.asarray(self.config.joint_names),
         }
+
+
+def trajectory_evaluator(trajectory: SerialTrajectoryConfig | MaterializedTrajectory):
+    """Return a common ``(q, dq, ddq)`` evaluator for serial simulations."""
+    if isinstance(trajectory, MaterializedTrajectory):
+        return trajectory
+    return SerialArmTrajectory(trajectory)
 
 
 def _urdf_joint_limits(urdf_path: str | Path, requested_names: Iterable[str] | None = None) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:

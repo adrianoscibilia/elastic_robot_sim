@@ -13,6 +13,7 @@ dependencies = [
     "scipy>=1.11",
     "PyYAML>=6.0",
     "pandas>=2.0",
+    "pyarrow>=15.0",
     "matplotlib>=3.9",
     "trimesh>=4.0",
     "pycollada>=0.9",
@@ -23,6 +24,13 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+]
+calibration = [
+    "cma>=4.0",
+    "scikit-optimize>=0.10",
+    "skrl>=1.4",
+    "gymnasium>=0.29",
+    "torch>=2.2",
 ]
 
 [tool.uv]

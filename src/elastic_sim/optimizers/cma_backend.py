@@ -82,7 +82,20 @@ class CMAOptimizer(Optimizer):
             opts["popsize"] = self.popsize
 
         es = cma.CMAEvolutionStrategy(x0.tolist(), self.sigma0, opts)
-        es.optimize(_wrapped)
+        # ``EvolutionStrategy.optimize`` can overshoot a small budget by one
+        # complete population.  Ask/tell explicitly so every objective call
+        # is counted and the public max_evals contract is exact.
+        while len(history) < max_evals and not es.stop():
+            candidates = es.ask()
+            if len(history) + len(candidates) > max_evals:
+                candidates = candidates[: max_evals - len(history)]
+                # A partial population cannot be told back to CMA.  Evaluate
+                # it for a correct bounded history and finish this run.
+                for candidate in candidates:
+                    _wrapped(np.asarray(candidate))
+                break
+            values = [_wrapped(np.asarray(candidate)) for candidate in candidates]
+            es.tell(candidates, values)
 
-        best_x = np.asarray(es.result.xbest)
+        best_x = np.asarray(min(history, key=lambda item: item[1])[0]) if history else np.asarray(x0)
         return best_x, history

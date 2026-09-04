@@ -18,27 +18,25 @@ install(DIRECTORY assets/robots/
   DESTINATION share/${PROJECT_NAME}/assets/robots
   PATTERN "source" EXCLUDE
 )
+install(DIRECTORY docs/
+  DESTINATION share/${PROJECT_NAME}/docs
+)
+install(FILES README.md assets/README.md
+  DESTINATION share/${PROJECT_NAME}
+)
 
 # Install ROS 2 executables without the .py suffix (ros2 run matches by exact name):
-#   ros2 run elastic_robot_sim record_real_rollout  — single trajectory
-#   ros2 run elastic_robot_sim collect_dataset      — full dataset collection loop
-install(PROGRAMS real_robot/record_real_rollout.py
-  RENAME record_real_rollout
+#   ros2 run elastic_robot_sim run_experiment       — paired sim/real run
+#   ros2 run elastic_robot_sim run_calibration      — paired-artifact calibration
+install(PROGRAMS scripts/run_experiment.py
+  RENAME run_experiment
   DESTINATION lib/${PROJECT_NAME}
 )
-install(PROGRAMS scripts/collect_dataset.py
-  RENAME collect_dataset
+install(PROGRAMS scripts/run_calibration.py
+  RENAME run_calibration
   DESTINATION lib/${PROJECT_NAME}
 )
-install(PROGRAMS scripts/generate_serial_trajectory.py
-  RENAME generate_serial_trajectory
-  DESTINATION lib/${PROJECT_NAME}
-)
-install(PROGRAMS scripts/run_dataset_calibration.py
-  RENAME run_dataset_calibration
-  DESTINATION lib/${PROJECT_NAME}
-)
-install(PROGRAMS scripts/run_asset_simulation.py scripts/run_asset_dataset_generation.py scripts/prepare_asset_dataset.py
+install(PROGRAMS scripts/run_asset_simulation.py scripts/run_asset_dataset_generation.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

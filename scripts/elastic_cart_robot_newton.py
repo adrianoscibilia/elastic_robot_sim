@@ -91,7 +91,10 @@ parser.add_argument(
     action="store_true",
     help="Render the ground plane in the viewer instead of hiding it.",
 )
-args = parser.parse_args()
+# Importing this module is supported by the test and programmatic APIs.  Do
+# not consume the host process' argv during import (pytest, notebooks, and
+# calibration launchers all have their own command-line arguments).
+args = parser.parse_args([] if __name__ != "__main__" else None)
 
 SAVE_CSV = args.csv
 SHOW_PLOT = args.plot

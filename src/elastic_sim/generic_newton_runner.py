@@ -25,7 +25,8 @@ import time as time_module
 import numpy as np
 
 from .assets import AssetSpec, load_asset_spec
-from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig
+from .materialized import MaterializedTrajectory
+from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig, trajectory_evaluator
 
 if TYPE_CHECKING:
     from .generic_calibration import TorqueReplayRollout
@@ -47,6 +48,9 @@ class ElasticTransmissionParams:
     effort_limit: float | None = None
     intermediate_mass: float | None = None
     link_mass: float | None = None
+    intermediate_inertia_x: float | None = None
+    intermediate_inertia_y: float | None = None
+    intermediate_inertia_z: float | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("stiffness", "damping", "motor_stiffness", "motor_damping"):
@@ -59,6 +63,10 @@ class ElasticTransmissionParams:
             raise ValueError("intermediate_mass must be positive when supplied")
         if self.link_mass is not None and self.link_mass <= 0.0:
             raise ValueError("link_mass must be positive when supplied")
+        for field_name in ("intermediate_inertia_x", "intermediate_inertia_y", "intermediate_inertia_z"):
+            value = getattr(self, field_name)
+            if value is not None and value <= 0.0:
+                raise ValueError(f"{field_name} must be positive when supplied")
 
 
 @dataclass(frozen=True)
@@ -105,12 +113,14 @@ class GenericNewtonElasticBuilder:
         intermediate_mass: float = 1.0e-5,
         intermediate_size: float = 0.20,
         contact_budget: int = 10_000,
+        body_overrides: Mapping[str, Mapping[str, float]] | None = None,
     ) -> None:
         self.asset = asset
         self.transmissions = dict(transmissions)
         self.gravity = gravity
         self.intermediate_mass = float(intermediate_mass)
         self.intermediate_size = float(intermediate_size)
+        self.config_body_overrides = dict(body_overrides or {})
         self.config_contact_budget = int(contact_budget)
         if self.intermediate_mass <= 0.0 or self.intermediate_size <= 0.0:
             raise ValueError("intermediate_mass and intermediate_size must be positive")
@@ -158,7 +168,7 @@ class GenericNewtonElasticBuilder:
         # Mesh-rich industrial arms can legitimately generate more than
         # Newton's small default contact allocation during self-collision.
         target.num_rigid_contacts_per_world = int(self.config_contact_budget)
-        body_map, body_props = _copy_bodies(source, target, wp, newton, self.intermediate_mass, self.intermediate_size)
+        body_map, body_props = _copy_bodies(source, target, wp, newton, self.intermediate_mass, self.intermediate_size, self.config_body_overrides)
         _copy_shapes(source, target, newton, body_map)
         _restore_body_properties(target, body_props)
 
@@ -216,7 +226,9 @@ class GenericNewtonElasticBuilder:
                 xform=wp.transform_multiply(source_body_q[snapshot["parent"]], snapshot["parent_xform"])
                 if snapshot["parent"] >= 0 else snapshot["parent_xform"],
                 com=wp.vec3(),
-                inertia=_small_inertia(wp, intermediate_mass, self.intermediate_size),
+                inertia=_small_inertia(wp, intermediate_mass, self.intermediate_size, (
+                    params.intermediate_inertia_x, params.intermediate_inertia_y, params.intermediate_inertia_z
+                )),
                 mass=intermediate_mass,
                 label=f"elastic_transmission/{name}",
                 is_kinematic=False,
@@ -289,7 +301,7 @@ def build_elastic_model(
 
 
 class GenericNewtonTorqueReplayRunner:
-    """Open-loop motor-torque replay adapter for generic dataset calibration.
+    """Compatibility open-loop motor-torque replay adapter.
 
     It intentionally returns output-side joint motion as ``q_link``/``dq_link``
     even though the transmission is represented by two generalized
@@ -322,6 +334,7 @@ class GenericNewtonTorqueReplayRunner:
             gravity=tuple(self.config.get("gravity", self.asset.gravity)),
             intermediate_mass=float(self.config.get("intermediate_mass", 0.10)),
             intermediate_size=float(self.config.get("intermediate_size", 0.20)),
+            body_overrides=self.config.get("body_overrides", {}),
         )
         _wp, newton = _require_newton()
         model = built.model
@@ -417,7 +430,7 @@ class GenericNewtonTrajectoryRunner:
         self._joint_names = asset.joint_names
 
     def run(
-        self, trajectory: SerialTrajectoryConfig, *, time_step: float = 0.004,
+        self, trajectory: SerialTrajectoryConfig | MaterializedTrajectory, *, time_step: float = 0.004,
         visualize: bool = False, realtime_scale: float = 1.0,
     ) -> Mapping[str, Any]:
         if tuple(trajectory.joint_names) != self._joint_names:
@@ -454,6 +467,7 @@ class GenericNewtonTrajectoryRunner:
             # chains under gravity.
             intermediate_mass=float(self.config.get("intermediate_mass", 0.10)),
             intermediate_size=float(self.config.get("intermediate_size", 0.20)),
+            body_overrides=self.config.get("body_overrides", {}),
         )
         _wp, newton = _require_newton()
         model = built.model
@@ -476,7 +490,7 @@ class GenericNewtonTrajectoryRunner:
             ) if cls is not None
         )
         needs_ik = not isinstance(solver, direct_solvers) if direct_solvers else True
-        evaluator = SerialArmTrajectory(trajectory)
+        evaluator = trajectory_evaluator(trajectory)
         q0, dq0, _ = evaluator(0.0)
         initial_q = _as_numpy(state_in.joint_q).reshape(-1)
         initial_dq = _as_numpy(state_in.joint_qd).reshape(-1)
@@ -490,7 +504,7 @@ class GenericNewtonTrajectoryRunner:
         state_in.joint_qd.assign(initial_dq.astype("float32"))
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
-        time = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        time = trajectory.time.copy() if isinstance(trajectory, MaterializedTrajectory) else np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
         targets = np.zeros(model.joint_dof_count, dtype=np.float32)
         target_velocities = np.zeros(model.joint_dof_count, dtype=np.float32)
         # Initialise the controller to the measured initial motor state before
@@ -549,7 +563,8 @@ class GenericNewtonTrajectoryRunner:
                 control.joint_target_vel.assign(target_velocities)
                 state_in.clear_forces()
                 model.collide(state_in, contacts)
-                solver.step(state_in, state_out, control, contacts, time_step)
+                step_dt = float(time[sample_index + 1] - sample_time)
+                solver.step(state_in, state_out, control, contacts, step_dt)
                 if needs_ik:
                     newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
                 if viewer is not None:
@@ -600,7 +615,7 @@ class GenericNewtonRigidTrajectoryRunner:
 
     def run(
         self,
-        trajectory: SerialTrajectoryConfig,
+        trajectory: SerialTrajectoryConfig | MaterializedTrajectory,
         *,
         time_step: float = 0.004,
         visualize: bool = False,
@@ -629,7 +644,7 @@ class GenericNewtonRigidTrajectoryRunner:
             if cls is not None
         )
         needs_ik = not isinstance(solver, direct_solvers) if direct_solvers else True
-        evaluator = SerialArmTrajectory(trajectory)
+        evaluator = trajectory_evaluator(trajectory)
         q0, dq0, _ = evaluator(0.0)
         initial_q = _as_numpy(state_in.joint_q).reshape(-1)
         initial_dq = _as_numpy(state_in.joint_qd).reshape(-1)
@@ -640,7 +655,7 @@ class GenericNewtonRigidTrajectoryRunner:
         state_in.joint_qd.assign(initial_dq.astype("float32"))
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
-        time_grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        time_grid = trajectory.time.copy() if isinstance(trajectory, MaterializedTrajectory) else np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
         targets = np.zeros(model.joint_dof_count, dtype=np.float32)
         target_velocities = np.zeros(model.joint_dof_count, dtype=np.float32)
         q_ref: list[Any] = []
@@ -679,7 +694,8 @@ class GenericNewtonRigidTrajectoryRunner:
                 control.joint_target_vel.assign(target_velocities)
                 state_in.clear_forces()
                 model.collide(state_in, contacts)
-                solver.step(state_in, state_out, control, contacts, time_step)
+                step_dt = float(time_grid[sample_index + 1] - sample_time)
+                solver.step(state_in, state_out, control, contacts, step_dt)
                 if needs_ik:
                     newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
                 if viewer is not None:
@@ -715,7 +731,7 @@ class GenericNewtonKinematicTrajectoryRunner:
         self._joint_names = asset.joint_names
 
     def run(
-        self, trajectory: SerialTrajectoryConfig, *, time_step: float = 0.004,
+        self, trajectory: SerialTrajectoryConfig | MaterializedTrajectory, *, time_step: float = 0.004,
         visualize: bool = False, realtime_scale: float = 1.0,
     ) -> Mapping[str, Any]:
         if tuple(trajectory.joint_names) != self._joint_names:
@@ -724,8 +740,8 @@ class GenericNewtonKinematicTrajectoryRunner:
             raise ValueError("time_step and realtime_scale must be positive")
         built, newton = _build_rigid_model(self.asset, gravity=self.asset.gravity)
         state = built.model.state()
-        evaluator = SerialArmTrajectory(trajectory)
-        time_grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        evaluator = trajectory_evaluator(trajectory)
+        time_grid = trajectory.time.copy() if isinstance(trajectory, MaterializedTrajectory) else np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
         q_values: list[Any] = []
         dq_values: list[Any] = []
         viewer = _new_viewer(newton) if visualize else None
@@ -764,7 +780,7 @@ class GenericNewtonKinematicTrajectoryRunner:
 
 
 def make_torque_replay_runner(*, asset: str | Path | AssetSpec | None = None, config: Mapping[str, Any] | None = None) -> GenericNewtonTorqueReplayRunner:
-    """Factory used by ``scripts/run_dataset_calibration.py``.
+    """Compatibility factory for legacy torque-replay callers.
 
     ``asset`` may be a loaded :class:`AssetSpec` or a portable asset YAML.
     Per-joint defaults are configured under ``transmissions``; optimization
@@ -805,6 +821,9 @@ def _transmissions_from_named_params(
             effort_limit=None if defaults.get("effort_limit") is None else float(defaults["effort_limit"]),
             intermediate_mass=None if defaults.get("intermediate_mass") is None else float(defaults["intermediate_mass"]),
             link_mass=None if defaults.get("link_mass") is None else float(defaults["link_mass"]),
+            intermediate_inertia_x=None if defaults.get("intermediate_inertia_x") is None else float(defaults["intermediate_inertia_x"]),
+            intermediate_inertia_y=None if defaults.get("intermediate_inertia_y") is None else float(defaults["intermediate_inertia_y"]),
+            intermediate_inertia_z=None if defaults.get("intermediate_inertia_z") is None else float(defaults["intermediate_inertia_z"]),
         )
     return result
 
@@ -995,12 +1014,16 @@ def _require_newton() -> tuple[Any, Any]:
     return wp, newton
 
 
-def _small_inertia(wp: Any, mass: float, side: float) -> Any:
-    diagonal = mass * side * side / 6.0
-    return wp.mat33(diagonal, 0.0, 0.0, 0.0, diagonal, 0.0, 0.0, 0.0, diagonal)
+def _small_inertia(wp: Any, mass: float, side: float, principal: tuple[float | None, float | None, float | None] | None = None) -> Any:
+    if principal is None or any(value is None for value in principal):
+        diagonal = mass * side * side / 6.0
+        values = (diagonal, diagonal, diagonal)
+    else:
+        values = tuple(float(value) for value in principal)
+    return wp.mat33(values[0], 0.0, 0.0, 0.0, values[1], 0.0, 0.0, 0.0, values[2])
 
 
-def _copy_bodies(source: Any, target: Any, wp: Any, newton: Any, mass: float, side: float) -> tuple[dict[int, int], dict[int, tuple[Any, Any, float]]]:
+def _copy_bodies(source: Any, target: Any, wp: Any, newton: Any, mass: float, side: float, overrides: Mapping[str, Mapping[str, float]] | None = None) -> tuple[dict[int, int], dict[int, tuple[Any, Any, float]]]:
     body_map = {-1: -1}
     body_props: dict[int, tuple[Any, Any, float]] = {}
     flags = getattr(source, "body_flags", [0] * source.body_count)
@@ -1010,6 +1033,13 @@ def _copy_bodies(source: Any, target: Any, wp: Any, newton: Any, mass: float, si
         is_kinematic = bool(flags[index] & kinematic_flag)
         body_mass = source.body_mass[index]
         body_inertia = source.body_inertia[index]
+        override = _find_body_override(label, overrides or {})
+        if override:
+            if "mass" in override:
+                body_mass = float(override["mass"])
+            inertia_names = ("inertia_x", "inertia_y", "inertia_z")
+            if all(name in override for name in inertia_names):
+                body_inertia = _small_inertia(wp, body_mass, side, tuple(float(override[name]) for name in inertia_names))
         if not is_kinematic and body_mass <= 0.0:
             body_mass = mass
             body_inertia = _small_inertia(wp, mass, side)
@@ -1020,6 +1050,14 @@ def _copy_bodies(source: Any, target: Any, wp: Any, newton: Any, mass: float, si
         body_map[index] = target_index
         body_props[target_index] = (source.body_com[index], body_inertia, body_mass)
     return body_map, body_props
+
+
+def _find_body_override(label: Any, overrides: Mapping[str, Mapping[str, float]]) -> Mapping[str, float] | None:
+    text = str(label).replace("\\", "/")
+    for name, value in overrides.items():
+        if text == str(name).replace("\\", "/") or text.endswith("/" + str(name).replace("\\", "/")):
+            return value
+    return None
 
 
 def _restore_body_properties(target: Any, body_props: Mapping[int, tuple[Any, Any, float]]) -> None:

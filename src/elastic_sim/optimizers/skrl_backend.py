@@ -98,6 +98,10 @@ class SimCalibrationEnv:
         truncated = False
         return obs.astype(np.float32), float(reward), terminated, truncated, {"loss": loss}
 
+    def close(self):
+        """Gymnasium lifecycle hook used by skrl trainers."""
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Optimizer using skrl PPO or SAC
@@ -141,12 +145,14 @@ class SkrlOptimizer(Optimizer):
             import torch
             import skrl
             from skrl.envs.wrappers.torch import wrap_env
+            from skrl.agents.torch import ppo as _ppo_module
         except ImportError as exc:
             raise ImportError(
                 "skrl backend requires: pip install skrl gymnasium torch"
             ) from exc
 
         n = len(bounds)
+        skrl_v2 = hasattr(_ppo_module, "PPO_CFG")
         history: list[tuple[np.ndarray, float]] = []
 
         def _tracked(theta: np.ndarray) -> float:
@@ -169,7 +175,10 @@ class SkrlOptimizer(Optimizer):
 
         class Policy(GaussianMixin, Model):
             def __init__(self, obs_space, act_space, device, **kwargs):
-                Model.__init__(self, obs_space, act_space, device, **kwargs)
+                try:
+                    Model.__init__(self, observation_space=obs_space, action_space=act_space, device=device, **kwargs)
+                except TypeError:
+                    Model.__init__(self, obs_space, act_space, device, **kwargs)
                 GaussianMixin.__init__(self, clip_actions=True)
                 self.net = nn.Sequential(
                     nn.Linear(obs_dim, 64), nn.Tanh(),
@@ -179,12 +188,18 @@ class SkrlOptimizer(Optimizer):
                 self.log_std = nn.Parameter(torch.zeros(act_dim))
 
             def compute(self, inputs, role):
-                x = self.net(inputs["states"])
-                return x, self.log_std, {}
+                states = inputs.get("states")
+                if states is None:
+                    states = inputs.get("observations")
+                x = self.net(states)
+                return (x, {"log_std": self.log_std}) if skrl_v2 else (x, self.log_std, {})
 
         class Value(DeterministicMixin, Model):
             def __init__(self, obs_space, act_space, device, **kwargs):
-                Model.__init__(self, obs_space, act_space, device, **kwargs)
+                try:
+                    Model.__init__(self, observation_space=obs_space, action_space=act_space, device=device, **kwargs)
+                except TypeError:
+                    Model.__init__(self, obs_space, act_space, device, **kwargs)
                 DeterministicMixin.__init__(self)
                 self.net = nn.Sequential(
                     nn.Linear(obs_dim, 64), nn.Tanh(),
@@ -193,7 +208,10 @@ class SkrlOptimizer(Optimizer):
                 )
 
             def compute(self, inputs, role):
-                return self.net(inputs["states"]), {}
+                states = inputs.get("states")
+                if states is None:
+                    states = inputs.get("observations")
+                return self.net(states), {}
 
         models = {
             "policy": Policy(wrapped_env.observation_space, wrapped_env.action_space, self.device),
@@ -201,13 +219,21 @@ class SkrlOptimizer(Optimizer):
         }
 
         if self.algorithm == "ppo":
-            from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
-            cfg = PPO_DEFAULT_CONFIG.copy()
-            cfg["rollouts"] = 16
-            cfg["learning_epochs"] = 4
+            from skrl.agents.torch.ppo import PPO
+            from skrl.memories.torch import RandomMemory
+            try:
+                from skrl.agents.torch.ppo import PPO_DEFAULT_CONFIG
+                cfg = PPO_DEFAULT_CONFIG.copy()
+                cfg["rollouts"] = 16
+                cfg["learning_epochs"] = 4
+            except ImportError:
+                # skrl >= 2 exposes a typed PPO_CFG instead of the legacy
+                # dictionary constant.
+                from skrl.agents.torch.ppo import PPO_CFG
+                cfg = PPO_CFG(rollouts=16, learning_epochs=4)
             agent = PPO(
                 models=models,
-                memory=None,
+                memory=RandomMemory(memory_size=16, num_envs=1, device=self.device),
                 cfg=cfg,
                 observation_space=wrapped_env.observation_space,
                 action_space=wrapped_env.action_space,

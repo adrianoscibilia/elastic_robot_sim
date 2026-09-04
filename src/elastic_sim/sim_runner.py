@@ -249,12 +249,12 @@ def _add_joint_from_snapshot(
     raise ValueError(f"Unsupported joint type: {joint_type}")
 
 
-def _motor_joint_kwargs(joint_data: dict) -> dict:
+def _motor_joint_kwargs(joint_data: dict, *, stiffness: float = MOTOR_STIFFNESS, damping: float = MOTOR_DAMPING) -> dict:
     import newton
     ax = joint_data["axes"][0]
     return dict(
         target_pos=0.0, target_vel=0.0,
-        target_ke=MOTOR_STIFFNESS, target_kd=MOTOR_DAMPING,
+        target_ke=stiffness, target_kd=damping,
         limit_lower=ax["limit_lower"], limit_upper=ax["limit_upper"],
         actuator_mode=newton.JointTargetMode.POSITION_VELOCITY,
     )
@@ -491,14 +491,14 @@ def build_model(
     # ---- add elastic intermediate bodies ---------------------------------
     elastic_x_body = target_builder.add_link(
         xform=source_builder.body_q[jz_data["parent"]],
-        mass=1.0e-4, inertia=_make_inertia(1.0e-4, 0.02),
+        mass=params.intermediate_mass, inertia=_make_inertia(params.intermediate_mass, 0.02),
         label="elastic_x_link",
     )
     body_label_to_index["elastic_x_link"] = elastic_x_body
 
     elastic_z_body = target_builder.add_link(
         xform=source_builder.body_q[jz_data["child"]],
-        mass=1.0e-4, inertia=_make_inertia(1.0e-4, 0.02),
+        mass=params.intermediate_mass, inertia=_make_inertia(params.intermediate_mass, 0.02),
         label="elastic_z_link",
     )
     body_label_to_index["elastic_z_link"] = elastic_z_body
@@ -527,7 +527,7 @@ def build_model(
             joints_to_create.append((
                 "joint_x", _add_joint_from_snapshot,
                 {"joint_data": jx_data, "label": "joint_x",
-                 **_motor_joint_kwargs(jx_data)},
+                 **_motor_joint_kwargs(jx_data, stiffness=params.motor_stiffness, damping=params.motor_damping)},
             ))
             joints_to_create.append((
                 "elastic_joint_x", target_builder.add_joint_prismatic,
@@ -544,7 +544,7 @@ def build_model(
                 "joint_z", _add_joint_from_snapshot,
                 {"joint_data": jz_data, "label": "joint_z",
                  "parent": elastic_x_body, "child": elastic_z_body,
-                 **_motor_joint_kwargs(jz_data)},
+                 **_motor_joint_kwargs(jz_data, stiffness=params.motor_stiffness, damping=params.motor_damping)},
             ))
             continue
 
@@ -567,7 +567,7 @@ def build_model(
             joints_to_create.append((
                 "joint_y", _add_joint_from_snapshot,
                 {"joint_data": jy_data, "label": "joint_y",
-                 **_motor_joint_kwargs(jy_data)},
+                 **_motor_joint_kwargs(jy_data, stiffness=params.motor_stiffness, damping=params.motor_damping)},
             ))
             continue
 
@@ -711,8 +711,12 @@ def run_rollout(
     joint_targets = np.zeros(model.joint_dof_count, dtype=np.float32)
     joint_target_vel = np.zeros(model.joint_dof_count, dtype=np.float32)
 
-    sim_time = trajectory.config.effective_sim_time
-    num_steps = int(np.ceil(sim_time / time_step))
+    if hasattr(trajectory, "time") and isinstance(getattr(trajectory, "time"), np.ndarray):
+        time_grid = np.asarray(trajectory.time, dtype=float)
+    else:
+        sim_time_value = getattr(trajectory, "duration", None)
+        sim_time = float(sim_time_value if sim_time_value is not None else trajectory.config.effective_sim_time)
+        time_grid = np.arange(0.0, sim_time + 0.5 * time_step, time_step)
 
     # Pre-extract DOF indices
     mx = int(dof_index_map["joint_x"]["motor"])
@@ -721,6 +725,21 @@ def run_rollout(
     ex = int(dof_index_map["joint_x"]["elastic"])
     ey = int(dof_index_map["joint_y"]["elastic"])
     ez = int(dof_index_map["joint_z"]["elastic"])
+
+    # Materialized trajectories define the initial state as well as the
+    # command samples.  Initialize zero deflection so simulation and ROS start
+    # from the same reference pose instead of an implicit model zero pose.
+    if hasattr(trajectory, "__call__"):
+        q0, dq0, _ = trajectory(0.0)
+        initial_q = _get_numpy(state_in.joint_q).reshape(-1)
+        initial_dq = _get_numpy(state_in.joint_qd).reshape(-1)
+        initial_q[mx], initial_q[my], initial_q[mz] = q0
+        initial_q[ex], initial_q[ey], initial_q[ez] = q0
+        initial_dq[mx], initial_dq[my], initial_dq[mz] = dq0
+        initial_dq[ex], initial_dq[ey], initial_dq[ez] = dq0
+        state_in.joint_q.assign(initial_q.astype("float32"))
+        state_in.joint_qd.assign(initial_dq.astype("float32"))
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
     time_list: list = []
     ref_pos_list: list = []
@@ -733,7 +752,7 @@ def run_rollout(
     tau_link_list: list = []
 
     t = 0.0
-    for _ in range(num_steps):
+    for sample_index, sample_time in enumerate(time_grid):
         q_raw = _get_numpy(state_in.joint_q).reshape(-1)
         dq_raw = _get_numpy(state_in.joint_qd).reshape(-1)
 
@@ -745,7 +764,9 @@ def run_rollout(
             q_meas = q_raw
             dq_meas = dq_raw
 
-        q_ref, dq_ref = trajectory(t)
+        t = float(sample_time)
+        sampled = trajectory(t)
+        q_ref, dq_ref = sampled[:2]
 
         joint_targets[:] = 0.0
         joint_target_vel[:] = 0.0
@@ -758,9 +779,14 @@ def run_rollout(
         getattr(control, ctrl_attr).assign(joint_targets)
         control.joint_target_vel.assign(joint_target_vel)
 
+        dt = None if sample_index + 1 >= len(time_grid) else float(time_grid[sample_index + 1] - sample_time)
+        if dt is not None and dt <= 0.0:
+            raise ValueError("trajectory time must be strictly increasing")
+
         state_in.clear_forces()
         model.collide(state_in, contacts)
-        solver.step(state_in, state_out, control, contacts, time_step)
+        if dt is not None:
+            solver.step(state_in, state_out, control, contacts, dt)
         if needs_ik:
             newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
 
@@ -777,8 +803,6 @@ def run_rollout(
         else:
             tau_meas = tau_model
 
-        t += time_step
-
         if t >= cut_off_time:
             time_list.append(t)
             ref_pos_list.append(q_ref.copy())
@@ -790,6 +814,8 @@ def run_rollout(
             tau_motor_list.append(np.array([tau_meas[mx], tau_meas[my], tau_meas[mz]]))
             tau_link_list.append(np.array([tau_meas[ex], tau_meas[ey], tau_meas[ez]]))
 
+        if sample_index + 1 >= len(time_grid):
+            break
         state_in, state_out = state_out, state_in
 
     return RolloutResult(

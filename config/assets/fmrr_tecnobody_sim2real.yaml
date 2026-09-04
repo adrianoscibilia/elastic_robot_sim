@@ -1,0 +1,55 @@
+schema_version: 1
+asset: fmrr_tecnobody
+output_root: data/experiments
+
+trajectory:
+  mode: ptp
+  num_trajectories: 3
+  duration: 8.0
+  time_step: 0.01
+  seed: 20260903
+  ptp:
+    waypoints: 5
+    limit_margin: 0.12
+
+simulation:
+  backends: [newton, mujoco]
+  time_step: 0.01
+
+model:
+  base_params: ../../config/settings.yaml
+
+calibration:
+  train_fraction: 0.67
+  methods: [cma, bo, skrl]
+  max_evals: 100
+  loss_weights:
+    position: 1.0
+    velocity: 0.3
+    effort: 0.1
+    force: 0.1
+    torque: 0.1
+    motor_state: 0.0
+  parameters:
+    - {name: transmission.joint_x.stiffness, lower: 3000.0, upper: 9000.0, initial: 5977.08, scale: log}
+    - {name: transmission.joint_x.damping, lower: 10.0, upper: 300.0, initial: 82.996778, scale: log}
+    - {name: transmission.joint_y.stiffness, lower: 3000.0, upper: 9000.0, initial: 7162.08, scale: log}
+    - {name: transmission.joint_y.damping, lower: 10.0, upper: 400.0, initial: 154.41687, scale: log}
+    - {name: transmission.joint_z.stiffness, lower: 2500.0, upper: 7000.0, initial: 3861.11, scale: log}
+    - {name: transmission.joint_z.damping, lower: 10.0, upper: 400.0, initial: 149.13079, scale: log}
+
+ros:
+  action_server: /joint_trajectory_controller/follow_joint_trajectory
+  topics:
+    joint_states: /joint_states
+    flange_wrench: /ft_sensor_command_broadcaster/wrench
+    controller_state: /joint_trajectory_controller/state
+  sensor:
+    link_side_frame: flange
+    flange_to_link_side_axes: [0, 1, 2]
+  motor_services:
+    enable: /ethercat_checker/start_motors
+    disable: /ethercat_checker/stop_motors
+  extra_topics: []
+  preflight_timeout: 5.0
+  action_timeout: 30.0

@@ -65,6 +65,12 @@ class RobotParams:
     drive_y: AxisParams
     drive_z: AxisParams
     payload: float = 0.0
+    # These were constants in the original FMRR scripts.  Keeping defaults
+    # identical preserves old experiments while allowing the sim-to-real
+    # registry to tune controller-side dynamics explicitly.
+    motor_stiffness: float = MOTOR_STIFFNESS
+    motor_damping: float = MOTOR_DAMPING
+    intermediate_mass: float = 1.0e-4
 
     # ------------------------------------------------------------------
     # YAML I/O
@@ -92,6 +98,9 @@ class RobotParams:
                 damping_ratio=float(drives["drive_z"]["damping_ratio"]),
             ),
             payload=float(drives.get("payload", 0.0)),
+            motor_stiffness=float(drives.get("motor_stiffness", MOTOR_STIFFNESS)),
+            motor_damping=float(drives.get("motor_damping", MOTOR_DAMPING)),
+            intermediate_mass=float(drives.get("intermediate_mass", 1.0e-4)),
         )
 
     def to_yaml(self, path: str) -> None:
@@ -111,6 +120,9 @@ class RobotParams:
                     "damping_ratio": round(self.drive_z.damping_ratio, 6),
                 },
                 "payload": round(self.payload, 4),
+                "motor_stiffness": round(self.motor_stiffness, 4),
+                "motor_damping": round(self.motor_damping, 4),
+                "intermediate_mass": round(self.intermediate_mass, 8),
             }
         }
         with open(path, "w", encoding="utf-8") as f:

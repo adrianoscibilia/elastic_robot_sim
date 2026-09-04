@@ -26,7 +26,8 @@ import numpy as np
 
 from .assets import AssetSpec, discover_urdf_joints
 from .generic_newton_runner import _ensure_collision_geometry, _expand_simple_xacro_text
-from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig
+from .materialized import MaterializedTrajectory
+from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig, trajectory_evaluator
 
 
 class GenericMujocoTrajectoryRunner:
@@ -50,7 +51,7 @@ class GenericMujocoTrajectoryRunner:
 
     def run(
         self,
-        trajectory: SerialTrajectoryConfig,
+        trajectory: SerialTrajectoryConfig | MaterializedTrajectory,
         *,
         time_step: float = 0.004,
         visualize: bool = False,
@@ -66,7 +67,7 @@ class GenericMujocoTrajectoryRunner:
                 visualize=visualize, realtime_scale=realtime_scale,
             )
         mujoco = _require_mujoco()
-        model, uses_mesh_proxies = _build_model(self.asset, mujoco, time_step)
+        model, uses_mesh_proxies = _build_model(self.asset, mujoco, time_step, body_overrides=self.config.get("body_overrides", {}))
         data = mujoco.MjData(model)
         active = _joint_addresses(model, mujoco, self._joint_names)
         # A whole-body URDF (Baxter) includes joints outside the selected arm.
@@ -76,13 +77,13 @@ class GenericMujocoTrajectoryRunner:
             if joint.is_one_dof and joint.mimic is None
         )
         all_addresses = _joint_addresses(model, mujoco, all_names, required=False)
-        evaluator = SerialArmTrajectory(trajectory)
+        evaluator = trajectory_evaluator(trajectory)
         q0, dq0, _ = evaluator(0.0)
         for index, (qpos, dof) in enumerate(active):
             data.qpos[qpos] = q0[index]
             data.qvel[dof] = dq0[index]
         mujoco.mj_forward(model, data)
-        time_grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+        time_grid = trajectory.time.copy() if isinstance(trajectory, MaterializedTrajectory) else np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
         q_ref_values: list[Any] = []
         dq_ref_values: list[Any] = []
         q_values: list[Any] = []
@@ -165,7 +166,7 @@ class GenericMujocoElasticTrajectoryRunner(GenericMujocoTrajectoryRunner):
 def _run_explicit_elastic(
     asset: AssetSpec,
     config: Mapping[str, Any],
-    trajectory: SerialTrajectoryConfig,
+    trajectory: SerialTrajectoryConfig | MaterializedTrajectory,
     *, time_step: float, visualize: bool, realtime_scale: float,
 ) -> Mapping[str, Any]:
     """Run an actual motor joint + elastic joint chain in MuJoCo.
@@ -178,7 +179,8 @@ def _run_explicit_elastic(
     mujoco = _require_mujoco()
     parameters = _resolved_transmissions(asset, config)
     model, uses_mesh_proxies = _build_model(
-        asset, mujoco, time_step, elastic_transmissions=parameters
+        asset, mujoco, time_step, elastic_transmissions=parameters,
+        body_overrides=config.get("body_overrides", {}),
     )
     data = mujoco.MjData(model)
     addresses = _elastic_addresses(model, mujoco, asset.joint_names)
@@ -188,7 +190,7 @@ def _run_explicit_elastic(
         model.dof_damping[indices["elastic_dof"]] = parameters[name]["damping"]
     _apply_link_mass_overrides(model, mujoco, asset, parameters)
     mujoco.mj_setConst(model, data)
-    evaluator = SerialArmTrajectory(trajectory)
+    evaluator = trajectory_evaluator(trajectory)
     q0, dq0, _ = evaluator(0.0)
     for index, name in enumerate(asset.joint_names):
         indices = addresses[name]
@@ -197,7 +199,7 @@ def _run_explicit_elastic(
         data.qpos[indices["elastic_qpos"]] = 0.0
         data.qvel[indices["elastic_dof"]] = 0.0
     mujoco.mj_forward(model, data)
-    time_grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
+    time_grid = trajectory.time.copy() if isinstance(trajectory, MaterializedTrajectory) else np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
     q_ref_values: list[Any] = []
     dq_ref_values: list[Any] = []
     q_link_values: list[Any] = []
@@ -257,11 +259,13 @@ def _run_explicit_elastic(
 def _build_model(
     asset: AssetSpec, mujoco: Any, time_step: float,
     *, elastic_transmissions: Mapping[str, Mapping[str, float | None]] | None = None,
+    body_overrides: Mapping[str, Mapping[str, float]] | None = None,
 ) -> tuple[Any, bool]:
     with _materialized_mujoco_urdf(asset, elastic_transmissions) as (urdf_path, uses_mesh_proxies):
         model = mujoco.MjModel.from_xml_path(str(urdf_path))
     model.opt.timestep = time_step
     model.opt.gravity[:] = asset.gravity
+    _apply_body_overrides(model, mujoco, body_overrides or {})
     # The importer may assign no contact masks to visual-only geometries.  The
     # proxy collision geometries and native primitive collisions must all be
     # mutually eligible when an asset asks for self collision.
@@ -278,6 +282,33 @@ def _build_model(
                 model.geom_contype[geom_index] = 0
                 model.geom_conaffinity[geom_index] = 0
     return model, uses_mesh_proxies
+
+
+def _apply_body_overrides(model: Any, mujoco: Any, overrides: Mapping[str, Mapping[str, float]]) -> None:
+    """Apply configured mass/principal-inertia values after MJCF import."""
+    for name, values in overrides.items():
+        body_id = -1
+        for candidate in range(model.nbody):
+            label = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, candidate)
+            if label and (label == name or label.endswith("/" + str(name))):
+                body_id = candidate
+                break
+        if body_id < 0:
+            raise ValueError(f"MuJoCo body override names unknown body {name!r}")
+        if "mass" in values:
+            old_mass = float(model.body_mass[body_id])
+            new_mass = float(values["mass"])
+            if new_mass <= 0.0:
+                raise ValueError(f"body.{name}.mass must be positive")
+            if not all(field in values for field in ("inertia_x", "inertia_y", "inertia_z")) and old_mass > 0.0:
+                model.body_inertia[body_id] *= new_mass / old_mass
+            model.body_mass[body_id] = new_mass
+        for index, field in enumerate(("inertia_x", "inertia_y", "inertia_z")):
+            if field in values:
+                value = float(values[field])
+                if value <= 0.0:
+                    raise ValueError(f"body.{name}.{field} must be positive")
+                model.body_inertia[body_id, index] = value
 
 
 @contextmanager
@@ -346,9 +377,12 @@ def _insert_elastic_transmissions(
         inertial = ET.SubElement(link, "inertial")
         ET.SubElement(inertial, "mass", {"value": f"{parameters[original_name]['intermediate_mass']:.12g}"})
         inertia = max(float(parameters[original_name]["intermediate_mass"]) * 1.0e-4, 1.0e-8)
+        ixx = float(parameters[original_name].get("intermediate_inertia_x") or inertia)
+        iyy = float(parameters[original_name].get("intermediate_inertia_y") or inertia)
+        izz = float(parameters[original_name].get("intermediate_inertia_z") or inertia)
         ET.SubElement(inertial, "inertia", {
-            "ixx": f"{inertia:.12g}", "ixy": "0", "ixz": "0",
-            "iyy": f"{inertia:.12g}", "iyz": "0", "izz": f"{inertia:.12g}",
+            "ixx": f"{ixx:.12g}", "ixy": "0", "ixz": "0",
+            "iyy": f"{iyy:.12g}", "iyz": "0", "izz": f"{izz:.12g}",
         })
         elastic_joint = ET.Element("joint", {
             "name": f"elastic__{original_name}", "type": joint.get("type", "revolute"),
@@ -396,9 +430,15 @@ def _resolved_transmissions(asset: AssetSpec, config: Mapping[str, Any]) -> dict
             "motor_damping": float(values.get("motor_damping", config.get("motor_damping", 100.0))),
             "intermediate_mass": float(values.get("intermediate_mass", config.get("intermediate_mass", 0.10))),
             "link_mass": values.get("link_mass"),
+            "intermediate_inertia_x": values.get("intermediate_inertia_x"),
+            "intermediate_inertia_y": values.get("intermediate_inertia_y"),
+            "intermediate_inertia_z": values.get("intermediate_inertia_z"),
         }
         if result[name]["link_mass"] is not None:
             result[name]["link_mass"] = float(result[name]["link_mass"])
+        for field in ("intermediate_inertia_x", "intermediate_inertia_y", "intermediate_inertia_z"):
+            if result[name][field] is not None:
+                result[name][field] = float(result[name][field])
     return result
 
 

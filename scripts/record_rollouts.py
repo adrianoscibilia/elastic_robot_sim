@@ -16,10 +16,9 @@ python scripts/record_rollouts.py --backends mujoco --mode 2 --seed 99 --sim-tim
 python scripts/record_rollouts.py --backends newton mujoco \\
     --traj-config data/rollouts/traj_m2_s42/trajectory.json
 
-After recording, run the real robot to add real.parquet:
-    python real_robot/record_real_rollout.py \\
-        --traj-config data/rollouts/<traj_id>/trajectory.json \\
-        --output-dir  data/rollouts/<traj_id>/
+For a paired sim-to-real run, use scripts/run_experiment.py with an asset
+*_sim2real.yaml configuration; it materializes once and records the real robot
+with the same artifact.
 """
 
 from __future__ import annotations
@@ -194,12 +193,7 @@ def main() -> None:
         print(f"[{backend}] Saved {len(rollout.time)} steps → {out}")
 
     print(f"\nAll backends done.  Rollout directory: {os.path.join(store.base_dir, traj_id)}")
-    print(
-        "\nNext step — record the real robot:\n"
-        f"  python real_robot/record_real_rollout.py \\\n"
-        f"      --traj-config {traj_json} \\\n"
-        f"      --output-dir  {os.path.join(store.base_dir, traj_id)}\n"
-    )
+    print("\nFor paired real execution, use scripts/run_experiment.py with an asset *_sim2real.yaml configuration.")
 
 
 if __name__ == "__main__":
