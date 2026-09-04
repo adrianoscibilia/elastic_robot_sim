@@ -23,12 +23,14 @@ The primary configuration files are `config/assets/*_sim2real.yaml`. They are or
 
 ```yaml
 trajectory:
+  space: joint               # joint or cartesian
   mode: ptp                 # hold, sin, sinusoidal, or ptp
   num_trajectories: 3
   duration: 8.0
   time_step: 0.01
   seed: 20260903
   max_velocity: null        # optional global cap in asset units/s
+  max_acceleration: null    # optional global cap; timing is stretched
   workspace:                # optional; otherwise URDF limits are used
     joint_a: [-1.0, 1.0]
   ptp:
@@ -43,6 +45,32 @@ trajectory:
 ```
 
 `hold` uses the workspace midpoint. `sin` generates per-joint sinusoidal motion with seeded amplitude, frequency, and phase. `ptp` generates seeded minimum-jerk segments between random waypoints inside the configured limits. Workspace keys must exactly match the active joints. Invalid limits or a trajectory outside the safe workspace are rejected.
+
+Set `space: cartesian` for task-space motion. FMRR maps XYZ directly; serial arms use Pinocchio/Pink, and TIAGo can solve both arm tasks simultaneously:
+
+```yaml
+trajectory:
+  space: cartesian
+  mode: ptp
+  duration: 8.0
+  time_step: 0.02
+  max_velocity: 0.8
+  max_acceleration: 2.0
+  ptp: {waypoints: 4}
+  cartesian:
+    groups: [dual_arm]
+    position_tolerance: 0.001
+    orientation_tolerance: 0.01
+    collision_margin: 0.005
+    collision_avoidance: false # enable Pink's mesh-distance barrier; hard validation is always on
+    max_joint_increment: 0.35  # reject discontinuous successive IK solutions
+    max_iterations: 80
+    workspace:
+      left_arm: {x: [0.35, 0.55], y: [0.15, 0.35], z: [0.75, 1.05]}
+      right_arm: {x: [0.35, 0.55], y: [-0.35, -0.15], z: [0.75, 1.05]}
+```
+
+With no Cartesian workspace, generation uses a small box around the initial pose and holds its orientation. Explicit per-group `waypoints` accept XYZ values or mappings containing `position` and quaternion `orientation`. Every joint- or Cartesian-generated result is checked against limits and the asset's non-adjacent self-collision pairs before simulation or ROS execution.
 
 ## Simulation and model
 
@@ -142,6 +170,10 @@ The loss compares normalized RMSE values. Effort uses the real `tau_joint_state_
 
 ```yaml
 ros:
+  moveit:
+    namespace: ""
+    group: arm
+    timeout: 5.0
   action_server: /joint_trajectory_controller/follow_joint_trajectory
   topics:
     joint_states: /joint_states

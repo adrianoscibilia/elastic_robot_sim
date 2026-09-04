@@ -8,6 +8,14 @@ base:
   quaternion: [0.0, 0.0, 0.0, 1.0]
 gravity: [0.0, 0.0, -9.81]
 self_collisions: true
+kinematic_groups:
+  cartesian:
+    joints: [joint_x, joint_y, joint_z]
+    tip_link: ee_link
+    translation_only: true
+collision:
+  margin: 0.0
+  max_joint_step: 0.05
 dataset:
   state_units: m
   torque_units: N

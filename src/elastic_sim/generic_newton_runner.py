@@ -524,9 +524,11 @@ class GenericNewtonTrajectoryRunner:
         q_motor: list[Any] = []
         dq_motor: list[Any] = []
         tau_motor: list[Any] = []
-        viewer = _new_viewer(newton) if visualize else None
-        if viewer is not None:
-            viewer.set_model(model)
+        if visualize:
+            from .visualization import NewtonVisualizer
+            viewer = NewtonVisualizer(self.asset, trajectory).open(model)
+        else:
+            viewer = None
         try:
             for sample_index, sample_time in enumerate(time):
                 if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
@@ -568,9 +570,7 @@ class GenericNewtonTrajectoryRunner:
                 if needs_ik:
                     newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
                 if viewer is not None:
-                    viewer.begin_frame(float(sample_time))
-                    viewer.log_state(state_out)
-                    viewer.end_frame()
+                    viewer.render(float(sample_time), state_out, link_q)
                     time_module.sleep(time_step / realtime_scale)
                 state_in, state_out = state_out, state_in
         finally:
@@ -663,9 +663,11 @@ class GenericNewtonRigidTrajectoryRunner:
         q: list[Any] = []
         dq: list[Any] = []
         tau: list[Any] = []
-        viewer = _new_viewer(newton) if visualize else None
-        if viewer is not None:
-            viewer.set_model(model)
+        if visualize:
+            from .visualization import NewtonVisualizer
+            viewer = NewtonVisualizer(self.asset, trajectory).open(model)
+        else:
+            viewer = None
         try:
             for sample_index, sample_time in enumerate(time_grid):
                 if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
@@ -699,9 +701,7 @@ class GenericNewtonRigidTrajectoryRunner:
                 if needs_ik:
                     newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
                 if viewer is not None:
-                    viewer.begin_frame(float(sample_time))
-                    viewer.log_state(state_out)
-                    viewer.end_frame()
+                    viewer.render(float(sample_time), state_out, measured_q)
                     time_module.sleep(time_step / realtime_scale)
                 state_in, state_out = state_out, state_in
         finally:
@@ -744,9 +744,11 @@ class GenericNewtonKinematicTrajectoryRunner:
         time_grid = trajectory.time.copy() if isinstance(trajectory, MaterializedTrajectory) else np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
         q_values: list[Any] = []
         dq_values: list[Any] = []
-        viewer = _new_viewer(newton) if visualize else None
-        if viewer is not None:
-            viewer.set_model(built.model)
+        if visualize:
+            from .visualization import NewtonVisualizer
+            viewer = NewtonVisualizer(self.asset, trajectory).open(built.model)
+        else:
+            viewer = None
         try:
             for sample_index, sample_time in enumerate(time_grid):
                 if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
@@ -764,9 +766,7 @@ class GenericNewtonKinematicTrajectoryRunner:
                 q_values.append(q_ref)
                 dq_values.append(dq_ref)
                 if viewer is not None:
-                    viewer.begin_frame(float(sample_time))
-                    viewer.log_state(state)
-                    viewer.end_frame()
+                    viewer.render(float(sample_time), state, q_ref)
                     time_module.sleep(time_step / realtime_scale)
         finally:
             _close_viewer(viewer)

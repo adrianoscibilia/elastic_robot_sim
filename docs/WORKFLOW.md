@@ -46,7 +46,7 @@ uv run python scripts/run_experiment.py \
   --sim-only --backends newton mujoco
 ```
 
-Each backend is run independently for every saved trajectory. Outputs are validated for finite values and written as a combined `sim_<backend>.parquet` with a `trajectory_id` column.
+Each backend runs independently. Its native viewer opens by default with reference and traversed end-effector paths, the current target and end-effector frames, and red collision warnings. Results remain in memory unless `--save` is supplied; persisted outputs use a combined `sim_<backend>.parquet` with a `trajectory_id` column. Use `--headless --save` for batch jobs and `--plot` for joint/link/motor, wrench, Cartesian-error, and clearance figures. Closing a viewer early aborts that rollout.
 
 For asset inspection or a single standalone rollout:
 
@@ -69,6 +69,8 @@ source install/setup.bash
 ```
 
 Start the robot controller, joint-state publisher, flange sensor broadcaster, TF tree if used, and any motor lifecycle services. Confirm the configured topics before running the experiment. The runner checks topic names and message types and waits for valid samples before motion.
+
+For environment-aware validation, start the robot's MoveIt planning scene and pass `--moveit-validate`. The optional adapter checks every materialized state through `check_state_validity`; MoveIt remains external to `uv` and is never imported for portable simulation.
 
 ## 5. Execute and record
 

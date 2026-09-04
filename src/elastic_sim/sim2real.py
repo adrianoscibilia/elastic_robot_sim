@@ -77,6 +77,9 @@ def run_simulation(
     trajectory: MaterializedTrajectory,
     backend: str,
     params: Mapping[str, float] | None = None,
+    *,
+    visualize: bool = False,
+    realtime_scale: float = 1.0,
 ) -> Mapping[str, Any]:
     """Run one exact materialized trajectory on one configured backend."""
     params = dict(params or {})
@@ -89,12 +92,12 @@ def run_simulation(
             from .sim_runner import build_model, run_rollout
             model_params = _fmrr_params(config, params)
             model, dof_map, _ = build_model(model_params, urdf_path=str(asset.urdf_path))
-            return run_rollout(model, dof_map, trajectory, noise=False, time_step=time_step)
+            return run_rollout(model, dof_map, trajectory, noise=False, time_step=time_step, visualize=visualize, realtime_scale=realtime_scale)
         if backend == "mujoco":
             from .mujoco_runner import build_model, run_rollout
             model_params = _fmrr_params(config, params)
             model, data, dof_map, act_map = build_model(model_params, time_step=time_step)
-            return run_rollout(model, data, dof_map, act_map, trajectory, noise=False)
+            return run_rollout(model, data, dof_map, act_map, trajectory, noise=False, visualize=visualize, realtime_scale=realtime_scale)
         raise ValueError(f"unsupported backend {backend!r}")
 
     effective_config = apply_parameter_overrides(config, params)
@@ -115,7 +118,7 @@ def run_simulation(
     if runner_type is None:
         raise ValueError(f"unsupported model.mode {mode!r}")
     runner = runner_type(asset, mc) if backend == "newton" else runner_type(asset, mc, mode=mode)
-    return runner.run(trajectory, time_step=time_step, visualize=False)
+    return runner.run(trajectory, time_step=time_step, visualize=visualize, realtime_scale=realtime_scale)
 
 
 def _column_matrix(frame: pd.DataFrame, prefix: str, names: Sequence[str]) -> np.ndarray | None:

@@ -2,6 +2,7 @@ schema_version: 2
 asset: kuka_lbr_iiwa_14_r820
 paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
 trajectory:
+  space: joint
   mode: ptp
   num_trajectories: 3
   duration: 10.0
@@ -14,7 +15,8 @@ simulation: {backends: [newton, mujoco], time_step: 0.004}
 model: {mode: elastic, default_stiffness: 1500.0, default_damping: 40.0, motor_stiffness: 3000.0, motor_damping: 100.0, intermediate_mass: 0.05, intermediate_size: 0.08, transmissions: {}}
 calibration: {train_fraction: 0.67, methods: [cma, bo], max_evals: 100, loss_weights: {position: 1.0, velocity: 0.3, effort: 0.1, force: 0.1, torque: 0.1, motor_state: 0.0}, parameters: []}
 ros:
+  moveit: {namespace: "", group: arm, timeout: 5.0}
   action_server: /lbr/joint_trajectory_controller/follow_joint_trajectory
   topics: {joint_states: /lbr/joint_states, flange_wrench: /lbr/force_torque_broadcaster/wrench, controller_state: /lbr/joint_trajectory_controller/state}
-  motor_services: {enable: /lbr/controller_manager/start_motors, disable: /lbr/controller_manager/stop_motors}
+  motor_services: null
   extra_topics: []

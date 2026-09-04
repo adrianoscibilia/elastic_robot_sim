@@ -14,7 +14,7 @@ from elastic_sim.experiment import (
 )
 from elastic_sim.materialized import MaterializedTrajectory
 from elastic_sim.parameter_registry import ParameterRegistry, apply_parameter_overrides
-from elastic_sim.ros_experiment import ros_topics
+from elastic_sim.ros_experiment import _action_groups, ros_topics
 from elastic_sim.sim2real import discover_experiment_records
 
 
@@ -89,3 +89,18 @@ def test_ros_topic_manifest_contains_required_and_extra_topics():
     assert "/joint_states" in topics
     assert "/controller/follow_joint_trajectory/_action/feedback" in topics
     assert "/imu" in topics
+
+
+def test_multi_controller_actions_cover_all_joints_and_are_bagged():
+    config = {"ros": {"action_servers": [
+        {"name": "/left/follow_joint_trajectory", "joints": ["left_1", "left_2"]},
+        {"name": "/right/follow_joint_trajectory", "joints": ["right_1", "right_2"]},
+    ]}}
+    groups = _action_groups(config, ("left_1", "left_2", "right_1", "right_2"))
+    assert groups == [
+        ("/left/follow_joint_trajectory", (0, 1)),
+        ("/right/follow_joint_trajectory", (2, 3)),
+    ]
+    topics = ros_topics(config)
+    assert "/left/follow_joint_trajectory/_action/feedback" in topics
+    assert "/right/follow_joint_trajectory/_action/feedback" in topics

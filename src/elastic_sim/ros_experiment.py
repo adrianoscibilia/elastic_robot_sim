@@ -17,6 +17,28 @@ from .experiment import start_rosbag
 from .materialized import MaterializedTrajectory
 
 
+def _action_groups(config: Mapping[str, Any], joint_names: Sequence[str]) -> list[tuple[str, tuple[int, ...]]]:
+    ros = config.get("ros", {}) or {}
+    configured = ros.get("action_servers")
+    if configured is None:
+        return [(str(ros.get("action_server", "/joint_trajectory_controller/follow_joint_trajectory")), tuple(range(len(joint_names))))]
+    by_name = {name: index for index, name in enumerate(joint_names)}
+    groups: list[tuple[str, tuple[int, ...]]] = []
+    claimed: set[str] = set()
+    for item in configured:
+        name = str(item.get("name", ""))
+        names = tuple(str(value) for value in item.get("joints", ()))
+        if not name or not names or any(value not in by_name for value in names):
+            raise ValueError("each ros.action_servers entry requires a name and known joints")
+        if claimed.intersection(names):
+            raise ValueError("ros.action_servers joint groups must not overlap")
+        claimed.update(names)
+        groups.append((name, tuple(by_name[value] for value in names)))
+    if claimed != set(joint_names):
+        raise ValueError("ros.action_servers must cover every active joint exactly once")
+    return groups
+
+
 def _ros_imports():
     try:
         import rclpy
@@ -35,15 +57,16 @@ def _ros_imports():
 def ros_topics(config: Mapping[str, Any]) -> list[str]:
     ros = config.get("ros", {}) or {}
     topics = ros.get("topics", {}) or {}
-    action = str(ros.get("action_server", "/joint_trajectory_controller/follow_joint_trajectory")).rstrip("/")
     result = [
         str(topics.get("joint_states", "/joint_states")),
         str(topics.get("flange_wrench", "/ft_sensor_command_broadcaster/wrench")),
-        str(topics.get("controller_state", "/joint_trajectory_controller/state")),
-        f"{action}/_action/send_goal", f"{action}/_action/get_result",
-        f"{action}/_action/feedback", f"{action}/_action/cancel_goal",
-        f"{action}/_action/status",
     ]
+    controller_states = topics.get("controller_states", (topics.get("controller_state", "/joint_trajectory_controller/state"),))
+    result.extend(str(value) for value in controller_states)
+    action_names = [str(item["name"]) for item in ros.get("action_servers", ())] or [str(ros.get("action_server", "/joint_trajectory_controller/follow_joint_trajectory"))]
+    for action in action_names:
+        action = action.rstrip("/")
+        result.extend((f"{action}/_action/send_goal", f"{action}/_action/get_result", f"{action}/_action/feedback", f"{action}/_action/cancel_goal", f"{action}/_action/status"))
     for item in ros.get("extra_topics", ()) or ():
         if isinstance(item, Mapping) and item.get("name"):
             result.append(str(item["name"]))
@@ -59,7 +82,7 @@ def _topic_type(node: Any, name: str) -> str | None:
 
 
 def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict[str, Any]:
-    """Validate required topic types and active-joint observability before motion."""
+    """Validate topics, action availability, and joint observability before motors."""
     ros = _ros_imports()
     rclpy, JointState, JointTrajectoryControllerState, WrenchStamped = (
         ros["rclpy"], ros["JointState"], ros["JointTrajectoryControllerState"], ros["WrenchStamped"]
@@ -67,13 +90,20 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
     if not rclpy.ok():
         rclpy.init(args=None)
     node = rclpy.create_node("elastic_sim_ros_preflight")
-    topics = config.get("ros", {}).get("topics", {}) or {}
+    ros_config = config.get("ros", {}) or {}
+    topics = ros_config.get("topics", {}) or {}
+    actions = _action_groups(config, joint_names)
+    controller_states = topics.get("controller_states", (topics.get("controller_state", "/joint_trajectory_controller/state"),))
     required = {
         str(topics.get("joint_states", "/joint_states")): "sensor_msgs/msg/JointState",
         str(topics.get("flange_wrench", "/ft_sensor_command_broadcaster/wrench")): "geometry_msgs/msg/WrenchStamped",
-        str(topics.get("controller_state", "/joint_trajectory_controller/state")): "control_msgs/msg/JointTrajectoryControllerState",
     }
+    required.update({str(name): "control_msgs/msg/JointTrajectoryControllerState" for name in controller_states})
     try:
+        for action_name, _ in actions:
+            action_client = ros["ActionClient"](node, ros["FollowJointTrajectory"], action_name)
+            if not action_client.wait_for_server(timeout_sec=float(ros_config.get("preflight_timeout", 5.0))):
+                raise RuntimeError(f"ROS preflight failed; action server unavailable: {action_name}")
         deadline = time.monotonic() + float(config.get("ros", {}).get("preflight_timeout", 5.0))
         found: dict[str, str] = {}
         while time.monotonic() < deadline:
@@ -92,7 +122,8 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
         subscriptions = []
         subscriptions.append(node.create_subscription(JointState, next(name for name in required if required[name] == "sensor_msgs/msg/JointState"), lambda msg: samples.setdefault("joint_states", msg), 10))
         subscriptions.append(node.create_subscription(WrenchStamped, next(name for name in required if required[name] == "geometry_msgs/msg/WrenchStamped"), lambda msg: samples.setdefault("wrench", msg), 10))
-        subscriptions.append(node.create_subscription(JointTrajectoryControllerState, next(name for name in required if required[name] == "control_msgs/msg/JointTrajectoryControllerState"), lambda msg: samples.setdefault("controller", msg), 10))
+        for name in controller_states:
+            subscriptions.append(node.create_subscription(JointTrajectoryControllerState, str(name), lambda msg: samples.setdefault("controller", msg), 10))
         deadline = time.monotonic() + float(config.get("ros", {}).get("sample_timeout", 5.0))
         while time.monotonic() < deadline and len(samples) < 3:
             rclpy.spin_once(node, timeout_sec=0.1)
@@ -116,7 +147,7 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
         values = (wrench.wrench.force.x, wrench.wrench.force.y, wrench.wrench.force.z, wrench.wrench.torque.x, wrench.wrench.torque.y, wrench.wrench.torque.z)
         if not all(np.isfinite(value) for value in values):
             raise RuntimeError("flange wrench preflight received non-finite force/torque")
-        return {"topics": found, "joint_names": list(joint_names), "topic_types": required, "sample_validated": True}
+        return {"topics": found, "action_servers": [name for name, _ in actions], "joint_names": list(joint_names), "topic_types": required, "sample_validated": True}
     finally:
         node.destroy_node()
         if rclpy.ok():
@@ -147,7 +178,9 @@ class _Capture:
         topics = config.get("ros", {}).get("topics", {}) or {}
         node.create_subscription(ros["JointState"], str(topics.get("joint_states", "/joint_states")), self.on_joint, 50)
         node.create_subscription(ros["WrenchStamped"], str(topics.get("flange_wrench", "/ft_sensor_command_broadcaster/wrench")), self.on_wrench, 50)
-        node.create_subscription(ros["JointTrajectoryControllerState"], str(topics.get("controller_state", "/joint_trajectory_controller/state")), self.on_controller, 50)
+        controller_states = topics.get("controller_states", (topics.get("controller_state", "/joint_trajectory_controller/state"),))
+        for name in controller_states:
+            node.create_subscription(ros["JointTrajectoryControllerState"], str(name), self.on_controller, 50)
 
     @staticmethod
     def _stamp(msg: Any) -> int:
@@ -223,13 +256,14 @@ class _Capture:
 
     def on_controller(self, msg: Any) -> None:
         row = self._base(msg)
+        message_names = tuple(getattr(msg, "joint_names", ())) or self.joint_names
         for prefix, field in (("desired", "desired"), ("actual", "actual"), ("error", "error")):
             point = getattr(msg, field, None)
             if point is None:
                 continue
             for component in ("positions", "velocities", "accelerations", "efforts"):
                 values = getattr(point, component, ())
-                for index, name in enumerate(self.joint_names):
+                for index, name in enumerate(message_names):
                     if index < len(values) and np.isfinite(values[index]):
                         row[f"controller_{prefix}_{component}__{name}"] = float(values[index])
         row["valid_controller_state"] = True
@@ -258,43 +292,48 @@ class _Capture:
         return base.reset_index(drop=True)
 
 
-def _send_trajectory(node: Any, action_name: str, trajectory: MaterializedTrajectory, capture: _Capture, timeout: float) -> dict[str, Any]:
+def _send_trajectory(node: Any, config: Mapping[str, Any], trajectory: MaterializedTrajectory, capture: _Capture, timeout: float) -> dict[str, Any]:
+    """Dispatch all configured controller groups before waiting for completion."""
     ros = _ros_imports()
-    client = ros["ActionClient"](node, ros["FollowJointTrajectory"], action_name)
-    if not client.wait_for_server(timeout_sec=timeout):
-        raise RuntimeError(f"FollowJointTrajectory action server unavailable: {action_name}")
-    goal = ros["FollowJointTrajectory"].Goal()
-    goal.trajectory.joint_names = list(trajectory.joint_names)
-    for index, t in enumerate(trajectory.time):
-        point = ros["JointTrajectoryPoint"]() if "JointTrajectoryPoint" in ros else None
-        if point is None:
+    pending = []
+    for action_name, indices in _action_groups(config, trajectory.joint_names):
+        client = ros["ActionClient"](node, ros["FollowJointTrajectory"], action_name)
+        if not client.wait_for_server(timeout_sec=timeout):
+            raise RuntimeError(f"FollowJointTrajectory action server unavailable: {action_name}")
+        goal = ros["FollowJointTrajectory"].Goal()
+        goal.trajectory.joint_names = [trajectory.joint_names[index] for index in indices]
+        for row, t in enumerate(trajectory.time):
             from trajectory_msgs.msg import JointTrajectoryPoint
             point = JointTrajectoryPoint()
-        point.positions = trajectory.position[index].tolist()
-        point.velocities = trajectory.velocity[index].tolist()
-        if trajectory.acceleration is not None:
-            point.accelerations = trajectory.acceleration[index].tolist()
-        sec = int(t)
-        point.time_from_start.sec = sec
-        point.time_from_start.nanosec = int(round((float(t) - sec) * 1.0e9))
-        goal.trajectory.points.append(point)
-    send_future = client.send_goal_async(goal)
-    while not send_future.done():
+            point.positions = trajectory.position[row, list(indices)].tolist()
+            point.velocities = trajectory.velocity[row, list(indices)].tolist()
+            if trajectory.acceleration is not None:
+                point.accelerations = trajectory.acceleration[row, list(indices)].tolist()
+            sec = int(t)
+            point.time_from_start.sec = sec
+            point.time_from_start.nanosec = int(round((float(t) - sec) * 1.0e9))
+            goal.trajectory.points.append(point)
+        pending.append((action_name, client.send_goal_async(goal)))
+    while not all(future.done() for _, future in pending):
         ros["rclpy"].spin_once(node, timeout_sec=0.05)
         if capture.error is not None:
             raise RuntimeError(capture.error)
-    handle = send_future.result()
-    if handle is None or not handle.accepted:
-        raise RuntimeError("FollowJointTrajectory goal was rejected")
-    result_future = handle.get_result_async()
-    while not result_future.done():
+    handles = [(name, future.result()) for name, future in pending]
+    rejected = [name for name, handle in handles if handle is None or not handle.accepted]
+    if rejected:
+        raise RuntimeError(f"FollowJointTrajectory goal was rejected by {rejected}")
+    results = [(name, handle.get_result_async()) for name, handle in handles]
+    while not all(future.done() for _, future in results):
         ros["rclpy"].spin_once(node, timeout_sec=0.05)
         if capture.error is not None:
             raise RuntimeError(capture.error)
-    result = result_future.result().result
-    if int(result.error_code) != 0:
-        raise RuntimeError(f"FollowJointTrajectory failed with error_code={result.error_code}: {result.error_string}")
-    return {"accepted": True, "error_code": int(result.error_code), "error_string": str(result.error_string)}
+    reports = []
+    for name, future in results:
+        result = future.result().result
+        if int(result.error_code) != 0:
+            raise RuntimeError(f"FollowJointTrajectory failed on {name} with error_code={result.error_code}: {result.error_string}")
+        reports.append({"action_server": name, "accepted": True, "error_code": int(result.error_code), "error_string": str(result.error_string)})
+    return {"accepted": True, "error_code": 0, "error_string": "", "controllers": reports}
 
 
 def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[MaterializedTrajectory], output_dir: str | Path, *, no_motor_control: bool = False) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -309,7 +348,8 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
     node = rclpy.create_node("elastic_sim_experiment")
     capture = _Capture(node, config, trajectories[0].joint_names)
     topics = ros_topics(config)
-    lifecycle = config.get("ros", {}).get("motor_services", {}) or {}
+    lifecycle = config.get("ros", {}).get("motor_services")
+    manage_motors = bool(lifecycle) and not no_motor_control
     motor_enabled = False
     bag = None
     try:
@@ -317,8 +357,8 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
         time.sleep(float(config.get("ros", {}).get("bag_startup_delay", 0.5)))
         if bag.poll() is not None:
             raise RuntimeError("rosbag2 exited during startup; inspect raw/rosbag2.stderr.log")
-        if not no_motor_control:
-            client = node.create_client(ros["Trigger"], str(lifecycle.get("enable", "/ethercat_checker/start_motors")))
+        if manage_motors:
+            client = node.create_client(ros["Trigger"], str(lifecycle["enable"]))
             if not client.wait_for_service(timeout_sec=5.0):
                 raise RuntimeError("motor enable service unavailable")
             future = client.call_async(ros["Trigger"].Request())
@@ -328,10 +368,9 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
                 raise RuntimeError("motor enable service returned failure")
             motor_enabled = True
         results = []
-        action = str(config.get("ros", {}).get("action_server", "/joint_trajectory_controller/follow_joint_trajectory"))
         for index, trajectory in enumerate(trajectories):
             capture.trajectory_id = index
-            results.append(_send_trajectory(node, action, trajectory, capture, float(config.get("ros", {}).get("action_timeout", trajectory.duration + 10.0))))
+            results.append(_send_trajectory(node, config, trajectory, capture, float(config.get("ros", {}).get("action_timeout", trajectory.duration + 10.0))))
             # Drain callbacks after the action result so the final samples are retained.
             end = time.monotonic() + 0.25
             while time.monotonic() < end:
@@ -339,7 +378,7 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
             if capture.error is not None:
                 raise RuntimeError(capture.error)
         if motor_enabled:
-            client = node.create_client(ros["Trigger"], str(lifecycle.get("disable", "/ethercat_checker/stop_motors")))
+            client = node.create_client(ros["Trigger"], str(lifecycle["disable"]))
             if client.wait_for_service(timeout_sec=5.0):
                 future = client.call_async(ros["Trigger"].Request())
                 while not future.done():
@@ -365,7 +404,7 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
     finally:
         if motor_enabled:
             try:
-                client = node.create_client(ros["Trigger"], str(lifecycle.get("disable", "/ethercat_checker/stop_motors")))
+                client = node.create_client(ros["Trigger"], str(lifecycle["disable"]))
                 if client.wait_for_service(timeout_sec=1.0):
                     future = client.call_async(ros["Trigger"].Request())
                     while not future.done():

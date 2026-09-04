@@ -2,12 +2,20 @@ schema_version: 1
 asset: ur10
 paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
 trajectory:
+  space: joint
   mode: ptp
   num_trajectories: 3
   duration: 10.0
   time_step: 0.01
   seed: 20260903
   ptp: {waypoints: 5, limit_margin: 0.12}
+  workspace:
+    shoulder_pan_joint: [-0.35, 0.35]
+    shoulder_lift_joint: [-1.92, -1.22]
+    elbow_joint: [1.22, 1.92]
+    wrist_1_joint: [-1.92, -1.22]
+    wrist_2_joint: [-1.92, -1.22]
+    wrist_3_joint: [-0.35, 0.35]
 simulation: {backends: [newton, mujoco], time_step: 0.004}
 model:
   mode: elastic
@@ -25,6 +33,7 @@ calibration:
   loss_weights: {position: 1.0, velocity: 0.3, effort: 0.1, motor_state: 0.0}
   parameters: []
 ros:
+  moveit: {namespace: "", group: arm, timeout: 5.0}
   action_server: /joint_trajectory_controller/follow_joint_trajectory
   topics:
     joint_states: /joint_states

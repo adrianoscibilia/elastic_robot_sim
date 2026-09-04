@@ -18,3 +18,19 @@ asset:
     - arm_right_7_joint
   gravity: [0.0, 0.0, -9.81]
   self_collisions: true
+  default_configuration: [0.3, -0.6, 0.0, -1.2, 0.0, 1.0, 0.0, -0.3, -0.6, 0.0, -1.2, 0.0, 1.0, 0.0]
+  kinematic_groups:
+    left_arm:
+      joints: [arm_left_1_joint, arm_left_2_joint, arm_left_3_joint, arm_left_4_joint, arm_left_5_joint, arm_left_6_joint, arm_left_7_joint]
+      tip_link: arm_left_tool_link
+    right_arm:
+      joints: [arm_right_1_joint, arm_right_2_joint, arm_right_3_joint, arm_right_4_joint, arm_right_5_joint, arm_right_6_joint, arm_right_7_joint]
+      tip_link: arm_right_tool_link
+    dual_arm:
+      groups: [left_arm, right_arm]
+  collision:
+    margin: 0.005
+    max_joint_step: 0.05
+    allowed_pairs:
+      - [base_link, arm_left_2_link]
+      - [base_link, arm_right_2_link]

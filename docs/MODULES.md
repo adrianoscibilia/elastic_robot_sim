@@ -13,6 +13,10 @@ This page explains where to look when changing or debugging the repository.
 | `parameter_registry.py` | Named physical parameters, bounds, linear/log scaling, normalized optimizer coordinates, and model overrides. |
 | `assets.py` | Asset YAML loading, URDF joint discovery, active-joint validation, resource checking, and the repository asset registry. |
 | `serial_trajectory.py` | URDF-limit-based trajectory support for generic serial robots and compatibility trajectory generation. |
+| `kinematics.py` | Asset groups, Pinocchio/Pink Cartesian IK, FK enrichment, and Coal self-collision validation. |
+| `visualization.py` | Common Newton ViewerGL and MuJoCo passive-viewer lifecycle with path overlays. |
+| `plotting.py` | Backend-independent joint, Cartesian tracking, and clearance figures. |
+| `moveit_validation.py` | Optional live MoveIt planning-scene validation for real runs. |
 | `generic_newton_runner.py` | URDF-backed Newton serial model with kinematic, rigid, and elastic modes; supports transmission/body overrides. |
 | `generic_mujoco_runner.py` | URDF-backed MuJoCo serial model and rollout implementation. |
 | `sim_runner.py` | Dedicated FMRR Cartesian Newton model and rollout. |

@@ -19,6 +19,9 @@ dependencies = [
     "pycollada>=0.9",
     "pyglet>=2.1",
     "imgui-bundle>=1.92",
+    "pin==4.1.0",
+    "pin-pink==4.3.0",
+    "proxsuite==0.7.3",
 ]
 
 [dependency-groups]

@@ -14,7 +14,7 @@ From the repository root:
 uv sync
 ```
 
-The default environment contains everything needed for Newton and MuJoCo simulation. Add `--group calibration` for optimizers or `--group dev` for pytest.
+The default environment contains Newton, MuJoCo, Pinocchio, Pink, Coal, ProxSuite, both native viewers, and plotting. No Conda or ROS installation is needed for simulation. Add `--group calibration` for optimizers or `--group dev` for pytest.
 
 The examples use POSIX shell continuation (`\`). In PowerShell, run the command on one line or replace each continuation character with a backtick (`` ` ``).
 
@@ -36,6 +36,20 @@ uv run python scripts/run_experiment.py \
   --sim-only \
   --backends newton mujoco
 ```
+
+Simulation is visual and ephemeral by default. Add `--plot` for post-run diagnostics, `--save` for standard Parquet/manifest artifacts, or `--headless --save` for CI and batch generation.
+
+The same command supports every asset with both backends:
+
+```bash
+uv run python scripts/run_experiment.py --config config/assets/fmrr_tecnobody_sim2real.yaml --sim-only --backends newton mujoco
+uv run python scripts/run_experiment.py --config config/assets/ur10_sim2real.yaml --sim-only --backends newton mujoco
+uv run python scripts/run_experiment.py --config config/assets/tiago_pro_dual_sim2real.yaml --sim-only --backends newton mujoco
+uv run python scripts/run_experiment.py --config config/assets/kuka_lbr_iiwa_7_r800_sim2real.yaml --sim-only --backends newton mujoco
+uv run python scripts/run_experiment.py --config config/assets/kuka_lbr_iiwa_14_r820_sim2real.yaml --sim-only --backends newton mujoco
+```
+
+On macOS, MuJoCo interactive runs must use its `mjpython` launcher; `--headless` runs continue to use ordinary `uv run python`.
 
 ### Record a real experiment
 
@@ -76,12 +90,15 @@ run_experiment.py --config CONFIG
                       [--sim-only | --real-only]
                       [--dry-run]
                       [--backends newton mujoco ...]
+                      [--headless] [--plot] [--save]
+                      [--realtime-scale SCALE]
+                      [--moveit-validate]
                       [--no-motor-control]
                       [--seed SEED]
                       [--run-id RUN_ID]
 ```
 
-The default runs both configured simulators and the real-robot path. `--sim-only` skips ROS. `--real-only` skips simulation. `--dry-run` validates the asset and materializes metadata without creating a run or contacting ROS. `--run-id` is useful when a deterministic run directory name is required.
+The default runs both configured simulators and the real-robot path. `--sim-only` skips ROS and writes nothing unless `--save` is supplied. `--real-only` skips simulation; real and combined runs always persist. `--dry-run` validates without creating a run, opening a viewer, or contacting ROS.
 
 The command always generates a materialized trajectory from YAML first. Simulators and ROS consume those saved arrays; they do not independently regenerate a trajectory from the seed.
 
@@ -110,7 +127,8 @@ data/
 │   ├── trajectory.json
 │   ├── trajectories/
 │   ├── sim_newton.parquet
-│   └── sim_mujoco.parquet
+│   ├── sim_mujoco.parquet
+│   └── plots/                 # only with --plot --save
 └── recorded/<asset>/YYYY-MM-DD/<run_timestamp>/
     ├── manifest.yaml
     ├── trajectory.json

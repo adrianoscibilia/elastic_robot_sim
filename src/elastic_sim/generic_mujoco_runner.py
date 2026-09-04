@@ -91,7 +91,11 @@ class GenericMujocoTrajectoryRunner:
         q_motor_values: list[Any] = []
         dq_motor_values: list[Any] = []
         tau_values: list[Any] = []
-        viewer = _launch_viewer(mujoco, model, data) if visualize else None
+        if visualize:
+            from .visualization import MujocoVisualizer
+            viewer = MujocoVisualizer(self.asset, trajectory).open(model, data)
+        else:
+            viewer = None
         if uses_mesh_proxies:
             print("MuJoCo used primitive proxies only for mesh files that could not be converted to OBJ.")
         try:
@@ -134,7 +138,7 @@ class GenericMujocoTrajectoryRunner:
                         data.qfrc_applied[dof] += tau[index]
                     mujoco.mj_step(model, data)
                 if viewer is not None:
-                    viewer.sync()
+                    viewer.render(measured_q)
                     _sleep(time_step / realtime_scale)
         finally:
             if viewer is not None:
@@ -207,7 +211,11 @@ def _run_explicit_elastic(
     q_motor_values: list[Any] = []
     dq_motor_values: list[Any] = []
     tau_values: list[Any] = []
-    viewer = _launch_viewer(mujoco, model, data) if visualize else None
+    if visualize:
+        from .visualization import MujocoVisualizer
+        viewer = MujocoVisualizer(asset, trajectory).open(model, data)
+    else:
+        viewer = None
     if uses_mesh_proxies:
         print("MuJoCo used primitive proxies only for mesh files that could not be converted to OBJ.")
     try:
@@ -242,7 +250,7 @@ def _run_explicit_elastic(
                 data.qfrc_applied[addresses[name]["motor_dof"]] = tau[index]
             mujoco.mj_step(model, data)
             if viewer is not None:
-                viewer.sync()
+                viewer.render(link_q)
                 _sleep(time_step / realtime_scale)
     finally:
         if viewer is not None:

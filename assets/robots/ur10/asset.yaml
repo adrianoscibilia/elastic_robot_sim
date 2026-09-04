@@ -8,6 +8,13 @@ base:
   quaternion: [0.0, 0.0, 0.0, 1.0]
 gravity: [0.0, 0.0, -9.81]
 self_collisions: true
+kinematic_groups:
+  arm:
+    joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+    tip_link: tool0
+collision:
+  margin: 0.005
+  max_joint_step: 0.05
 dataset:
   state_units: rad
   torque_units: Nm

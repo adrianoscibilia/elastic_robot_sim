@@ -79,7 +79,7 @@ except ImportError as exc:
 
 
 parser = argparse.ArgumentParser(description="Elastic cart model simulation in Newton")
-parser.add_argument("--csv", action="store_true", help="Save simulation data to CSV")
+parser.add_argument("--csv", "--save", action="store_true", help="Save simulation data to CSV")
 parser.add_argument("--plot", action="store_true", help="Show debug plots")
 parser.add_argument(
     "--headless",

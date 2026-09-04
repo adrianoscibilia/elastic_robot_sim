@@ -4,3 +4,11 @@ asset:
   active_joints: [iiwa_A1, iiwa_A2, iiwa_A3, iiwa_A4, iiwa_A5, iiwa_A6, iiwa_A7]
   gravity: [0.0, 0.0, -9.81]
   self_collisions: true
+  default_configuration: [0.0, 0.3, 0.0, -1.2, 0.0, 0.8, 0.0]
+  kinematic_groups:
+    arm:
+      joints: [iiwa_A1, iiwa_A2, iiwa_A3, iiwa_A4, iiwa_A5, iiwa_A6, iiwa_A7]
+      tip_link: iiwa_link_ee
+  collision:
+    margin: 0.005
+    max_joint_step: 0.05

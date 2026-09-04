@@ -3,6 +3,7 @@ asset: fmrr_tecnobody
 paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
 
 trajectory:
+  space: joint  # set to cartesian to use XYZ workspace/waypoints
   mode: ptp
   num_trajectories: 3
   duration: 8.0
@@ -39,6 +40,7 @@ calibration:
     - {name: transmission.joint_z.damping, lower: 10.0, upper: 400.0, initial: 149.13079, scale: log}
 
 ros:
+  moveit: {namespace: "", group: cartesian, timeout: 5.0}
   action_server: /joint_trajectory_controller/follow_joint_trajectory
   topics:
     joint_states: /joint_states

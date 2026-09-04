@@ -313,6 +313,8 @@ def run_rollout(
     noise: bool = True,
     cut_off_time: float = 0.0,
     seed: int | None = None,
+    visualize: bool = False,
+    realtime_scale: float = 1.0,
 ) -> RolloutResult:
     """Run one MuJoCo simulation episode and return a RolloutResult.
 
@@ -361,6 +363,13 @@ def run_rollout(
     tau_motor_list: list = []
     tau_link_list: list = []
 
+    if visualize:
+        from .assets import AssetRegistry
+        from .visualization import MujocoVisualizer
+        viewer = MujocoVisualizer(AssetRegistry.for_repository().load("fmrr_tecnobody"), trajectory).open(model, data)
+    else:
+        viewer = None
+
     # Keep the same zero-deflection initialization convention as the Newton
     # path.  For saved trajectories this is the first exact sample.
     if hasattr(trajectory, "__call__"):
@@ -372,6 +381,9 @@ def run_rollout(
         mujoco.mj_forward(model, data)
 
     for sample_index, sample_time in enumerate(time_grid):
+        if viewer is not None and not viewer.is_running():
+            time_grid = time_grid[:sample_index]
+            break
         t = float(sample_time)
         q = data.qpos.copy()
         dq = data.qvel.copy()
@@ -429,8 +441,15 @@ def run_rollout(
             dq_link_list.append(np.array([dq_meas[ex], dq_meas[ey], dq_meas[ez]]))
             tau_motor_list.append(tau_motor)
             tau_link_list.append(tau_link)
+        if viewer is not None:
+            viewer.render(np.array([q_meas[ex], q_meas[ey], q_meas[ez]]))
+            import time as time_module
+            time_module.sleep(time_step / realtime_scale)
         if sample_index + 1 >= len(time_grid):
             break
+
+    if viewer is not None:
+        viewer.close()
 
     return RolloutResult(
         time=np.array(time_list),

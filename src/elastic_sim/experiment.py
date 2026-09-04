@@ -54,6 +54,13 @@ def _joint_limits(asset: AssetSpec, config: Mapping[str, Any]) -> dict[str, tupl
     for name, (lo, hi) in limits.items():
         if name not in asset.joint_names or not np.isfinite([lo, hi]).all() or lo >= hi:
             raise ValueError(f"invalid workspace for {name}: {(lo, hi)}")
+    physical = {joint.name: joint for joint in asset.resolve_active_joints()}
+    for name, (lo, hi) in limits.items():
+        joint = physical[name]
+        if joint.lower is not None and lo < joint.lower - 1.0e-12:
+            raise ValueError(f"workspace lower bound for {name} exceeds URDF limit {joint.lower}")
+        if joint.upper is not None and hi > joint.upper + 1.0e-12:
+            raise ValueError(f"workspace upper bound for {name} exceeds URDF limit {joint.upper}")
     return limits
 
 
@@ -63,13 +70,19 @@ def _time_grid(duration: float, time_step: float) -> np.ndarray:
     return np.arange(0.0, duration + 0.5 * time_step, time_step)
 
 
-def generate_materialized_trajectory(asset: AssetSpec, config: Mapping[str, Any], seed: int) -> MaterializedTrajectory:
-    """Generate a deterministic joint-space trajectory from YAML."""
+def generate_materialized_trajectory(
+    asset: AssetSpec, config: Mapping[str, Any], seed: int, *, _attempt: int = 0,
+    _requested_seed: int | None = None,
+) -> MaterializedTrajectory:
+    """Generate and collision-validate a deterministic joint or Cartesian trajectory."""
     tc = config.get("trajectory", {})
     names = tuple(asset.joint_names)
     limits = _joint_limits(asset, config)
     duration = float(tc.get("duration", config.get("simulation", {}).get("sim_time", 15.0)))
     dt = float(tc.get("time_step", config.get("simulation", {}).get("time_step", 0.01)))
+    space = str(tc.get("space", "joint")).lower()
+    if space not in {"joint", "cartesian"}:
+        raise ValueError("trajectory.space must be 'joint' or 'cartesian'")
     mode = tc.get("mode", tc.get("modes", "ptp"))
     if isinstance(mode, (list, tuple)):
         mode = mode[int(np.random.default_rng(seed).integers(0, len(mode)))]
@@ -84,7 +97,81 @@ def generate_materialized_trajectory(asset: AssetSpec, config: Mapping[str, Any]
     upper = np.asarray([limits[name][1] for name in names])
     centre = (lower + upper) / 2.0
     span = upper - lower
-    if mode == "hold":
+    cartesian_reference: dict[str, np.ndarray] = {}
+    ik_diagnostics: dict[str, Any] = {}
+    explicit_cartesian = False
+    if space == "cartesian":
+        from .kinematics import PortableKinematics, kinematic_groups
+        kin = PortableKinematics(asset)
+        cc = tc.get("cartesian", {}) or {}
+        requested_groups = cc.get("groups")
+        if requested_groups is not None and not isinstance(requested_groups, list):
+            raise ValueError("trajectory.cartesian.groups must be a list")
+        groups = kinematic_groups(asset, requested_groups)
+        initial_q = np.asarray(cc.get("initial_joint_positions", asset.metadata.get("default_configuration", centre)), dtype=float)
+        if initial_q.shape != centre.shape:
+            raise ValueError("trajectory.cartesian.initial_joint_positions has the wrong length")
+        initial_poses = kin.forward(initial_q, groups)
+        explicit = cc.get("waypoints")
+        explicit_cartesian = explicit is not None
+        waypoint_count = max(2, int((tc.get("ptp", {}) or {}).get("waypoints", 5)))
+        targets: dict[str, np.ndarray] = {}
+        for group in groups:
+            start = initial_poses[group.name]
+            if explicit is not None:
+                raw_points = explicit.get(group.name) if isinstance(explicit, Mapping) else None
+                if not isinstance(raw_points, list) or len(raw_points) < 1:
+                    raise ValueError(f"Cartesian waypoints require a non-empty {group.name!r} list")
+                points = np.asarray([_pose_value(item, start) for item in raw_points], dtype=float)
+                if not np.allclose(points[0], start, atol=1.0e-9):
+                    points = np.vstack((start, points))
+            elif mode == "hold":
+                points = np.vstack((start, start))
+            elif mode == "sin":
+                workspace = _cartesian_workspace(cc, group.name, start)
+                amplitude = np.minimum((workspace[:, 1] - workspace[:, 0]) * 0.25, 0.05)
+                frequency = rng.uniform(0.2, 0.6, 3)
+                pose_rows = np.repeat(start[None, :], n, axis=0)
+                pose_rows[:, :3] += amplitude[None, :] * np.sin(time[:, None] * frequency[None, :] + rng.uniform(-np.pi, np.pi, 3))
+                targets[group.name] = pose_rows
+                continue
+            elif mode == "ptp":
+                workspace = _cartesian_workspace(cc, group.name, start)
+                xyz = rng.uniform(workspace[:, 0], workspace[:, 1], size=(waypoint_count - 1, 3))
+                points = np.vstack((start, np.c_[xyz, np.repeat(start[None, 3:], waypoint_count - 1, axis=0)]))
+            else:
+                raise ValueError(f"unsupported Cartesian trajectory mode {mode!r}")
+            targets[group.name] = _interpolate_pose_waypoints(points, time)
+        collision_cfg = asset.metadata.get("collision", {}) or {}
+        try:
+            q, ik_diagnostics = kin.solve_pose_samples(
+                targets, initial_q=initial_q, dt=dt,
+                position_tolerance=float(cc.get("position_tolerance", 1.0e-3)),
+                orientation_tolerance=float(cc.get("orientation_tolerance", 1.0e-2)),
+                max_iterations=int(cc.get("max_iterations", 80)),
+                collision_margin=float(cc.get("collision_margin", collision_cfg.get("margin", 0.0))),
+                collision_avoidance=bool(cc.get("collision_avoidance", False)),
+            )
+        except (ValueError, RuntimeError) as exc:
+            retries = int(cc.get("max_retries", 4))
+            if mode in {"sin", "ptp"} and not explicit_cartesian and _attempt < retries:
+                return generate_materialized_trajectory(
+                    asset, config, seed + 1, _attempt=_attempt + 1,
+                    _requested_seed=seed if _requested_seed is None else _requested_seed,
+                )
+            raise ValueError(f"Cartesian trajectory generation failed after {_attempt + 1} attempt(s): {exc}") from exc
+        maximum_joint_increment = float(np.max(np.abs(np.diff(q, axis=0)))) if len(q) > 1 else 0.0
+        allowed_joint_increment = float(cc.get("max_joint_increment", 0.35))
+        if allowed_joint_increment <= 0.0:
+            raise ValueError("trajectory.cartesian.max_joint_increment must be positive")
+        if maximum_joint_increment > allowed_joint_increment:
+            raise ValueError(
+                "Cartesian IK produced a discontinuous joint path: "
+                f"increment={maximum_joint_increment:.6g}, limit={allowed_joint_increment:.6g}"
+            )
+        ik_diagnostics["maximum_joint_increment"] = maximum_joint_increment
+        cartesian_reference = targets
+    elif mode == "hold":
         q = np.repeat(centre[None, :], n, axis=0)
         dq = np.zeros_like(q)
         ddq = np.zeros_like(q)
@@ -125,24 +212,129 @@ def generate_materialized_trajectory(asset: AssetSpec, config: Mapping[str, Any]
             ddq[row] = dds * delta
     else:
         raise ValueError(f"unsupported trajectory mode {mode!r}")
-    cap = tc.get("max_velocity")
-    if cap is not None and float(np.max(np.abs(dq))) > float(cap):
-        factor = float(cap) / float(np.max(np.abs(dq)))
-        dq *= factor
-        ddq *= factor * factor
-        # Position samples remain unchanged; the exact saved samples are the source of truth.
+    _validate_joint_samples(asset, q)
+    time, dq, ddq, stretch = _time_parameterize(q, time, tc.get("max_velocity"), tc.get("max_acceleration"))
+    collision_cfg = asset.metadata.get("collision", {}) or {}
+    collision_diagnostics: dict[str, Any]
+    from .kinematics import PortableKinematics
+    kin = kin if space == "cartesian" else PortableKinematics(asset)
+    report = kin.validate_path(
+        q, margin=float((tc.get("cartesian", {}) or {}).get("collision_margin", collision_cfg.get("margin", 0.0))),
+        max_joint_step=float(collision_cfg.get("max_joint_step", 0.05)),
+    )
+    collision_diagnostics = {
+        "valid": report.valid, "minimum_distance": report.minimum_distance,
+        "closest_pair": report.closest_pair, "checked_configurations": report.checked_configurations,
+    }
+    if not report.valid:
+        retries = int((tc.get("cartesian", {}) or {}).get("max_retries", tc.get("max_retries", 4)))
+        if mode in {"sin", "ptp"} and not explicit_cartesian and _attempt < retries:
+            return generate_materialized_trajectory(
+                asset, config, seed + 1, _attempt=_attempt + 1,
+                _requested_seed=seed if _requested_seed is None else _requested_seed,
+            )
+        raise ValueError(
+            f"Generated trajectory violates self-collision margin: minimum={report.minimum_distance:.6g}, "
+            f"pair={report.closest_pair}"
+        )
     metadata = {
         "asset": asset.name,
         "seed": int(seed),
+        "requested_seed": int(seed if _requested_seed is None else _requested_seed),
+        "generation_attempt": _attempt + 1,
         "mode": mode,
+        "space": space,
         "workspace": {name: list(limits[name]) for name in names},
         "time_step": dt,
-        "duration": duration,
+        "duration": float(time[-1]),
         "generator_config": dict(tc),
         "requested_speed": None if tc.get("max_velocity") is None else float(tc["max_velocity"]),
         "effective_speed": float(np.max(np.abs(dq))) if len(dq) else 0.0,
+        "time_scale": stretch,
+        "kinematic_groups": [group.name for group in kin.groups],
+        "ik": ik_diagnostics,
+        "collision": collision_diagnostics,
     }
+    if cartesian_reference:
+        metadata["cartesian_reference"] = {name: values.tolist() for name, values in cartesian_reference.items()}
     return MaterializedTrajectory(time, q, dq, names, ddq, metadata)
+
+
+def _pose_value(value: Any, default: np.ndarray) -> np.ndarray:
+    if isinstance(value, Mapping):
+        position = value.get("position", default[:3])
+        orientation = value.get("orientation", default[3:])
+        pose = np.r_[np.asarray(position, dtype=float), np.asarray(orientation, dtype=float)]
+    else:
+        pose = np.asarray(value, dtype=float)
+    if pose.shape not in {(3,), (7,)}:
+        raise ValueError("Cartesian poses must contain XYZ or XYZ+quaternion")
+    if pose.shape == (3,):
+        pose = np.r_[pose, default[3:]]
+    norm = np.linalg.norm(pose[3:])
+    if not np.isfinite(pose).all() or norm < 1.0e-12:
+        raise ValueError("Cartesian pose must be finite with a non-zero quaternion")
+    pose[3:] /= norm
+    return pose
+
+
+def _cartesian_workspace(config: Mapping[str, Any], group: str, start: np.ndarray) -> np.ndarray:
+    raw = config.get("workspace", {}) or {}
+    value = raw.get(group, raw) if isinstance(raw, Mapping) else raw
+    if isinstance(value, Mapping) and "position" in value:
+        value = value["position"]
+    if isinstance(value, Mapping) and all(axis in value for axis in "xyz"):
+        bounds = np.asarray([value[axis] for axis in "xyz"], dtype=float)
+    elif value:
+        bounds = np.asarray(value, dtype=float)
+    else:
+        bounds = np.column_stack((start[:3] - 0.04, start[:3] + 0.04))
+    if bounds.shape != (3, 2) or not np.isfinite(bounds).all() or np.any(bounds[:, 0] >= bounds[:, 1]):
+        raise ValueError(f"Cartesian workspace for {group!r} must be x/y/z bounds")
+    return bounds
+
+
+def _interpolate_pose_waypoints(points: np.ndarray, time: np.ndarray) -> np.ndarray:
+    from scipy.spatial.transform import Rotation, Slerp
+    output = np.empty((len(time), 7), dtype=float)
+    duration = float(time[-1])
+    segment = duration / (len(points) - 1)
+    for row, sample_time in enumerate(time):
+        index = min(int(sample_time / segment), len(points) - 2)
+        u = np.clip((sample_time - index * segment) / segment, 0.0, 1.0)
+        smooth = 10 * u**3 - 15 * u**4 + 6 * u**5
+        output[row, :3] = points[index, :3] + smooth * (points[index + 1, :3] - points[index, :3])
+        rotations = Rotation.from_quat(points[index:index + 2, 3:])
+        output[row, 3:] = Slerp([0.0, 1.0], rotations)([smooth]).as_quat()[0]
+    return output
+
+
+def _time_parameterize(q: np.ndarray, time: np.ndarray, velocity_cap: Any, acceleration_cap: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    edge_order = 2 if len(time) >= 3 else 1
+    dq = np.gradient(q, time, axis=0, edge_order=edge_order)
+    ddq = np.gradient(dq, time, axis=0, edge_order=edge_order)
+    stretch = 1.0
+    if velocity_cap is not None:
+        cap = float(velocity_cap)
+        if cap <= 0.0:
+            raise ValueError("trajectory.max_velocity must be positive")
+        stretch = max(stretch, float(np.max(np.abs(dq))) / cap)
+    if acceleration_cap is not None:
+        cap = float(acceleration_cap)
+        if cap <= 0.0:
+            raise ValueError("trajectory.max_acceleration must be positive")
+        stretch = max(stretch, np.sqrt(float(np.max(np.abs(ddq))) / cap))
+    scaled_time = time * stretch
+    return scaled_time, dq / stretch, ddq / (stretch * stretch), stretch
+
+
+def _validate_joint_samples(asset: AssetSpec, q: np.ndarray) -> None:
+    values = np.asarray(q, dtype=float)
+    for index, joint in enumerate(asset.resolve_active_joints()):
+        if joint.lower is not None and float(np.min(values[:, index])) < joint.lower - 1.0e-8:
+            raise ValueError(f"trajectory violates lower limit of {joint.name}")
+        if joint.upper is not None and float(np.max(values[:, index])) > joint.upper + 1.0e-8:
+            raise ValueError(f"trajectory violates upper limit of {joint.name}")
 
 
 def rollout_to_frame(trajectory: MaterializedTrajectory, result: Any, *, source: str) -> pd.DataFrame:

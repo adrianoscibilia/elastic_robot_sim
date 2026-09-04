@@ -673,6 +673,8 @@ def run_rollout(
     cut_off_time: float = 0.0,
     time_step: float = 0.01,
     seed: int | None = None,
+    visualize: bool = False,
+    realtime_scale: float = 1.0,
 ) -> RolloutResult:
     """Run one simulation episode and return a RolloutResult.
 
@@ -751,8 +753,18 @@ def run_rollout(
     tau_motor_list: list = []
     tau_link_list: list = []
 
+    if visualize:
+        from .assets import AssetRegistry
+        from .visualization import NewtonVisualizer
+        viewer = NewtonVisualizer(AssetRegistry.for_repository().load("fmrr_tecnobody"), trajectory).open(model)
+    else:
+        viewer = None
+
     t = 0.0
     for sample_index, sample_time in enumerate(time_grid):
+        if viewer is not None and not viewer.is_running():
+            time_grid = time_grid[:sample_index]
+            break
         q_raw = _get_numpy(state_in.joint_q).reshape(-1)
         dq_raw = _get_numpy(state_in.joint_qd).reshape(-1)
 
@@ -816,8 +828,13 @@ def run_rollout(
 
         if sample_index + 1 >= len(time_grid):
             break
+        if viewer is not None:
+            viewer.render(t, state_out, np.array([q_meas[ex], q_meas[ey], q_meas[ez]]))
+            import time as time_module
+            time_module.sleep(float(dt) / realtime_scale)
         state_in, state_out = state_out, state_in
-
+    if viewer is not None:
+        viewer.close()
     return RolloutResult(
         time=np.array(time_list),
         ref_pos=np.array(ref_pos_list),

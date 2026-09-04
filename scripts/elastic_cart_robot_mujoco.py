@@ -85,7 +85,7 @@ from sim_common import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(description="Elastic cart model simulation in MuJoCo")
-parser.add_argument("--csv", action="store_true", help="Save simulation data to CSV")
+parser.add_argument("--csv", "--save", action="store_true", help="Save simulation data to CSV")
 parser.add_argument("--plot", action="store_true", help="Show debug plots")
 parser.add_argument(
     "--headless",
