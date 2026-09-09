@@ -3,15 +3,24 @@ asset: fmrr_tecnobody
 paths: {simulated_root: data/simulated, recorded_root: data/recorded, calibrations_root: data/calibrations}
 
 trajectory:
-  space: joint  # set to cartesian to use XYZ workspace/waypoints
+  space: cartesian
   mode: ptp
   num_trajectories: 3
   duration: 8.0
   time_step: 0.01
   seed: 20260903
+  max_velocity: 0.5       # m/s, conservative global Cartesian cap
+  max_acceleration: 0.5   # m/s^2, conservative global Cartesian cap
+  speed_scale: 1.0        # (0, 1], never permits a speed-up
   ptp:
     waypoints: 5
-    limit_margin: 0.12
+  cartesian:
+    groups: [cartesian]
+    workspace:
+      cartesian:
+        x: [-0.7, 0.7]
+        y: [-0.7, 0.8]
+        z: [-0.2, 0.25]
 
 simulation:
   backends: [newton, mujoco]
@@ -53,5 +62,9 @@ ros:
     enable: /ethercat_checker/start_motors
     disable: /ethercat_checker/stop_motors
   extra_topics: []
+  bag:
+    mode: all
   preflight_timeout: 5.0
+  sample_timeout: 5.0
+  bag_startup_delay: 0.5
   action_timeout: 30.0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +99,7 @@ def generate_materialized_trajectory(
     centre = (lower + upper) / 2.0
     span = upper - lower
     cartesian_reference: dict[str, np.ndarray] = {}
+    cartesian_workspaces: dict[str, np.ndarray] = {}
     ik_diagnostics: dict[str, Any] = {}
     explicit_cartesian = False
     if space == "cartesian":
@@ -118,6 +120,8 @@ def generate_materialized_trajectory(
         targets: dict[str, np.ndarray] = {}
         for group in groups:
             start = initial_poses[group.name]
+            workspace = _cartesian_workspace(cc, group.name, start)
+            cartesian_workspaces[group.name] = workspace
             if explicit is not None:
                 raw_points = explicit.get(group.name) if isinstance(explicit, Mapping) else None
                 if not isinstance(raw_points, list) or len(raw_points) < 1:
@@ -128,7 +132,6 @@ def generate_materialized_trajectory(
             elif mode == "hold":
                 points = np.vstack((start, start))
             elif mode == "sin":
-                workspace = _cartesian_workspace(cc, group.name, start)
                 amplitude = np.minimum((workspace[:, 1] - workspace[:, 0]) * 0.25, 0.05)
                 frequency = rng.uniform(0.2, 0.6, 3)
                 pose_rows = np.repeat(start[None, :], n, axis=0)
@@ -136,12 +139,12 @@ def generate_materialized_trajectory(
                 targets[group.name] = pose_rows
                 continue
             elif mode == "ptp":
-                workspace = _cartesian_workspace(cc, group.name, start)
                 xyz = rng.uniform(workspace[:, 0], workspace[:, 1], size=(waypoint_count - 1, 3))
                 points = np.vstack((start, np.c_[xyz, np.repeat(start[None, 3:], waypoint_count - 1, axis=0)]))
             else:
                 raise ValueError(f"unsupported Cartesian trajectory mode {mode!r}")
             targets[group.name] = _interpolate_pose_waypoints(points, time)
+        _validate_cartesian_targets(targets, cartesian_workspaces)
         collision_cfg = asset.metadata.get("collision", {}) or {}
         try:
             q, ik_diagnostics = kin.solve_pose_samples(
@@ -160,6 +163,11 @@ def generate_materialized_trajectory(
                     _requested_seed=seed if _requested_seed is None else _requested_seed,
                 )
             raise ValueError(f"Cartesian trajectory generation failed after {_attempt + 1} attempt(s): {exc}") from exc
+        actual_cartesian = {
+            group.name: np.asarray([kin.forward(row, groups)[group.name] for row in q])
+            for group in groups
+        }
+        _validate_cartesian_targets(actual_cartesian, cartesian_workspaces, tolerance=1.0e-6)
         maximum_joint_increment = float(np.max(np.abs(np.diff(q, axis=0)))) if len(q) > 1 else 0.0
         allowed_joint_increment = float(cc.get("max_joint_increment", 0.35))
         if allowed_joint_increment <= 0.0:
@@ -214,6 +222,20 @@ def generate_materialized_trajectory(
         raise ValueError(f"unsupported trajectory mode {mode!r}")
     _validate_joint_samples(asset, q)
     time, dq, ddq, stretch = _time_parameterize(q, time, tc.get("max_velocity"), tc.get("max_acceleration"))
+    speed_scale = float(tc.get("speed_scale", 1.0))
+    if not np.isfinite(speed_scale) or speed_scale <= 0.0 or speed_scale > 1.0:
+        raise ValueError("trajectory.speed_scale must be in (0, 1]")
+    if speed_scale < 1.0:
+        time = time / speed_scale
+        dq = dq * speed_scale
+        ddq = ddq * speed_scale * speed_scale
+        stretch = stretch / speed_scale
+    velocity_cap = tc.get("max_velocity")
+    acceleration_cap = tc.get("max_acceleration")
+    if velocity_cap is not None and np.max(np.abs(dq)) > float(velocity_cap) + 1.0e-8:
+        raise ValueError("trajectory exceeds max_velocity after speed scaling")
+    if acceleration_cap is not None and np.max(np.abs(ddq)) > float(acceleration_cap) + 1.0e-8:
+        raise ValueError("trajectory exceeds max_acceleration after speed scaling")
     collision_cfg = asset.metadata.get("collision", {}) or {}
     collision_diagnostics: dict[str, Any]
     from .kinematics import PortableKinematics
@@ -249,7 +271,12 @@ def generate_materialized_trajectory(
         "duration": float(time[-1]),
         "generator_config": dict(tc),
         "requested_speed": None if tc.get("max_velocity") is None else float(tc["max_velocity"]),
+        "requested_acceleration": None if tc.get("max_acceleration") is None else float(tc["max_acceleration"]),
         "effective_speed": float(np.max(np.abs(dq))) if len(dq) else 0.0,
+        "effective_acceleration": float(np.max(np.abs(ddq))) if len(ddq) else 0.0,
+        "speed_scale": speed_scale,
+        "effective_velocity_limit": None if velocity_cap is None else float(velocity_cap) * speed_scale,
+        "effective_acceleration_limit": None if acceleration_cap is None else float(acceleration_cap) * speed_scale * speed_scale,
         "time_scale": stretch,
         "kinematic_groups": [group.name for group in kin.groups],
         "ik": ik_diagnostics,
@@ -257,6 +284,7 @@ def generate_materialized_trajectory(
     }
     if cartesian_reference:
         metadata["cartesian_reference"] = {name: values.tolist() for name, values in cartesian_reference.items()}
+        metadata["cartesian_workspace"] = {name: values.tolist() for name, values in cartesian_workspaces.items()}
     return MaterializedTrajectory(time, q, dq, names, ddq, metadata)
 
 
@@ -292,6 +320,27 @@ def _cartesian_workspace(config: Mapping[str, Any], group: str, start: np.ndarra
     if bounds.shape != (3, 2) or not np.isfinite(bounds).all() or np.any(bounds[:, 0] >= bounds[:, 1]):
         raise ValueError(f"Cartesian workspace for {group!r} must be x/y/z bounds")
     return bounds
+
+
+def _validate_cartesian_targets(
+    targets: Mapping[str, np.ndarray],
+    workspaces: Mapping[str, np.ndarray],
+    *,
+    tolerance: float = 1.0e-9,
+) -> None:
+    """Reject every Cartesian sample outside its configured safety envelope."""
+    for group, values in targets.items():
+        bounds = np.asarray(workspaces[group], dtype=float)
+        positions = np.asarray(values, dtype=float)[:, :3]
+        if positions.ndim != 2 or positions.shape[1] != 3 or not np.isfinite(positions).all():
+            raise ValueError(f"Cartesian target samples for {group!r} must be finite XYZ values")
+        if np.any(positions < bounds[:, 0] - tolerance) or np.any(positions > bounds[:, 1] + tolerance):
+            minimum = positions.min(axis=0).tolist()
+            maximum = positions.max(axis=0).tolist()
+            raise ValueError(
+                f"Cartesian trajectory for {group!r} exceeds its safety workspace: "
+                f"min={minimum}, max={maximum}, bounds={bounds.tolist()}"
+            )
 
 
 def _interpolate_pose_waypoints(points: np.ndarray, time: np.ndarray) -> np.ndarray:
@@ -447,11 +496,22 @@ def config_digest(config: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def start_rosbag(output_dir: str | Path, topics: list[str]) -> subprocess.Popen:
+def rosbag_available() -> bool:
+    """Return whether the ROS 2 CLI needed to start rosbag2 is available."""
+    return shutil.which("ros2") is not None
+
+
+def start_rosbag(output_dir: str | Path, topics: list[str], *, record_all: bool = True) -> subprocess.Popen:
     """Start rosbag2 without shell expansion and without pipe backpressure."""
+    if not rosbag_available():
+        raise RuntimeError("ros2 CLI is unavailable; source the ROS 2 workspace before recording")
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
-    command = ["ros2", "bag", "record", "-o", str(target / "rosbag2"), *topics]
+    command = ["ros2", "bag", "record", "-o", str(target / "rosbag2")]
+    if record_all:
+        command.append("--all")
+    else:
+        command.extend(("--topics", *topics))
     stdout = (target / "rosbag2.stdout.log").open("w", encoding="utf-8")
     stderr = (target / "rosbag2.stderr.log").open("w", encoding="utf-8")
     return subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True)

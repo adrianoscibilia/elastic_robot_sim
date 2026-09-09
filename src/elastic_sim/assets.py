@@ -224,8 +224,27 @@ class AssetRegistry:
 
     @classmethod
     def for_repository(cls, repository_root: str | Path | None = None) -> "AssetRegistry":
-        root = Path(repository_root or Path(__file__).resolve().parents[2]).resolve()
-        return cls((root / "assets" / "robots",))
+        if repository_root is not None:
+            root = Path(repository_root).expanduser().resolve()
+            return cls((root / "assets" / "robots",))
+
+        # Source-tree execution keeps the historical lookup.  Installed ROS 2
+        # packages place the same registry below the ament share directory, so
+        # discover that location lazily and use it when the source tree is not
+        # present (for example from ``ros2 run``).
+        source_root = Path(__file__).resolve().parents[2]
+        source_assets = source_root / "assets" / "robots"
+        if source_assets.is_dir():
+            return cls((source_assets,))
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            share = Path(get_package_share_directory("elastic_robot_sim"))
+        except (ImportError, KeyError, LookupError):
+            share = None
+        if share is not None:
+            return cls((share / "assets" / "robots",))
+        return cls((source_assets,))
 
     def available(self) -> dict[str, Path]:
         found: dict[str, Path] = {}

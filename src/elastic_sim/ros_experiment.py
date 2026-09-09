@@ -6,6 +6,7 @@ run on machines without a ROS installation.
 
 from __future__ import annotations
 
+import signal
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -13,7 +14,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from .experiment import start_rosbag
+from .experiment import rosbag_available, start_rosbag
 from .materialized import MaterializedTrajectory
 
 
@@ -70,7 +71,26 @@ def ros_topics(config: Mapping[str, Any]) -> list[str]:
     for item in ros.get("extra_topics", ()) or ():
         if isinstance(item, Mapping) and item.get("name"):
             result.append(str(item["name"]))
+    sensor = ros.get("sensor", {}) or {}
+    if sensor.get("link_side_frame"):
+        result.extend(("/tf", "/tf_static"))
     return list(dict.fromkeys(result))
+
+
+def _extra_topic_specs(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    specs = []
+    for item in (config.get("ros", {}) or {}).get("extra_topics", ()) or ():
+        if not isinstance(item, Mapping) or not item.get("name"):
+            raise ValueError("each ros.extra_topics entry requires a name")
+        name = str(item["name"])
+        expected = item.get("type")
+        if expected is not None and not isinstance(expected, str):
+            raise ValueError(f"ros.extra_topics[{name!r}].type must be a string")
+        required = bool(item.get("required", False))
+        if required and not expected:
+            raise ValueError(f"required ros.extra_topics entry {name!r} needs a type")
+        specs.append({"name": name, "type": expected, "required": required})
+    return specs
 
 
 def _topic_type(node: Any, name: str) -> str | None:
@@ -81,12 +101,19 @@ def _topic_type(node: Any, name: str) -> str | None:
     return None
 
 
-def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict[str, Any]:
+def preflight_ros(
+    config: Mapping[str, Any],
+    joint_names: Sequence[str],
+    *,
+    check_motor_services: bool = True,
+) -> dict[str, Any]:
     """Validate topics, action availability, and joint observability before motors."""
     ros = _ros_imports()
     rclpy, JointState, JointTrajectoryControllerState, WrenchStamped = (
         ros["rclpy"], ros["JointState"], ros["JointTrajectoryControllerState"], ros["WrenchStamped"]
     )
+    if not rosbag_available():
+        raise RuntimeError("ROS preflight failed; ros2 CLI is unavailable for rosbag2 recording")
     if not rclpy.ok():
         rclpy.init(args=None)
     node = rclpy.create_node("elastic_sim_ros_preflight")
@@ -94,16 +121,32 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
     topics = ros_config.get("topics", {}) or {}
     actions = _action_groups(config, joint_names)
     controller_states = topics.get("controller_states", (topics.get("controller_state", "/joint_trajectory_controller/state"),))
+    extra_specs = _extra_topic_specs(config)
     required = {
         str(topics.get("joint_states", "/joint_states")): "sensor_msgs/msg/JointState",
         str(topics.get("flange_wrench", "/ft_sensor_command_broadcaster/wrench")): "geometry_msgs/msg/WrenchStamped",
     }
     required.update({str(name): "control_msgs/msg/JointTrajectoryControllerState" for name in controller_states})
+    optional: dict[str, str | None] = {
+        str(item["name"]): item["type"] for item in extra_specs if not item["required"]
+    }
+    required.update({str(item["name"]): item["type"] for item in extra_specs if item["required"] and item["type"]})
     try:
         for action_name, _ in actions:
             action_client = ros["ActionClient"](node, ros["FollowJointTrajectory"], action_name)
             if not action_client.wait_for_server(timeout_sec=float(ros_config.get("preflight_timeout", 5.0))):
                 raise RuntimeError(f"ROS preflight failed; action server unavailable: {action_name}")
+        service_status: dict[str, bool] = {}
+        lifecycle = ros_config.get("motor_services") or {}
+        if check_motor_services and lifecycle:
+            for role in ("enable", "disable"):
+                name = str(lifecycle.get(role, ""))
+                if not name:
+                    raise RuntimeError(f"ROS preflight failed; motor_services.{role} is empty")
+                client = node.create_client(ros["Trigger"], name)
+                service_status[name] = bool(client.wait_for_service(timeout_sec=float(ros_config.get("preflight_timeout", 5.0))))
+                if not service_status[name]:
+                    raise RuntimeError(f"ROS preflight failed; motor {role} service unavailable: {name}")
         deadline = time.monotonic() + float(config.get("ros", {}).get("preflight_timeout", 5.0))
         found: dict[str, str] = {}
         while time.monotonic() < deadline:
@@ -118,6 +161,13 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
         wrong = {name: found[name] for name in found if found[name] != required[name]}
         if missing or wrong:
             raise RuntimeError(f"ROS preflight failed; missing={missing}, wrong_types={wrong}")
+        optional_found: dict[str, str] = {}
+        for name, expected in optional.items():
+            observed = _topic_type(node, name)
+            if observed:
+                optional_found[name] = observed
+                if expected and observed != expected:
+                    raise RuntimeError(f"ROS preflight failed; optional topic {name} has type {observed}, expected {expected}")
         samples: dict[str, Any] = {}
         subscriptions = []
         subscriptions.append(node.create_subscription(JointState, next(name for name in required if required[name] == "sensor_msgs/msg/JointState"), lambda msg: samples.setdefault("joint_states", msg), 10))
@@ -130,6 +180,8 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
         joint = samples.get("joint_states")
         if joint is None:
             raise RuntimeError("no JointState sample received during ROS preflight")
+        if samples.get("controller") is None:
+            raise RuntimeError("no joint_trajectory_controller state sample received during ROS preflight")
         by_name = {name: i for i, name in enumerate(joint.name)}
         if any(name not in by_name for name in joint_names):
             raise RuntimeError("/joint_states does not contain every configured active joint")
@@ -147,7 +199,16 @@ def preflight_ros(config: Mapping[str, Any], joint_names: Sequence[str]) -> dict
         values = (wrench.wrench.force.x, wrench.wrench.force.y, wrench.wrench.force.z, wrench.wrench.torque.x, wrench.wrench.torque.y, wrench.wrench.torque.z)
         if not all(np.isfinite(value) for value in values):
             raise RuntimeError("flange wrench preflight received non-finite force/torque")
-        return {"topics": found, "action_servers": [name for name, _ in actions], "joint_names": list(joint_names), "topic_types": required, "sample_validated": True}
+        return {
+            "topics": found | optional_found,
+            "action_servers": [name for name, _ in actions],
+            "joint_names": list(joint_names),
+            "topic_types": required,
+            "optional_topics": optional_found,
+            "motor_services": service_status,
+            "rosbag_available": True,
+            "sample_validated": True,
+        }
     finally:
         node.destroy_node()
         if rclpy.ok():
@@ -292,7 +353,19 @@ class _Capture:
         return base.reset_index(drop=True)
 
 
-def _send_trajectory(node: Any, config: Mapping[str, Any], trajectory: MaterializedTrajectory, capture: _Capture, timeout: float) -> dict[str, Any]:
+def _ensure_bag_alive(bag: Any) -> None:
+    if bag is not None and bag.poll() is not None:
+        raise RuntimeError("rosbag2 exited during trajectory execution; raw recording is incomplete")
+
+
+def _send_trajectory(
+    node: Any,
+    config: Mapping[str, Any],
+    trajectory: MaterializedTrajectory,
+    capture: _Capture,
+    timeout: float,
+    bag: Any = None,
+) -> dict[str, Any]:
     """Dispatch all configured controller groups before waiting for completion."""
     ros = _ros_imports()
     pending = []
@@ -309,12 +382,19 @@ def _send_trajectory(node: Any, config: Mapping[str, Any], trajectory: Materiali
             point.velocities = trajectory.velocity[row, list(indices)].tolist()
             if trajectory.acceleration is not None:
                 point.accelerations = trajectory.acceleration[row, list(indices)].tolist()
+            # Do not synthesize or inject effort commands. Measured efforts are
+            # captured from JointState.effort and controller-published desired
+            # efforts are preserved when the controller exposes them.
             sec = int(t)
             point.time_from_start.sec = sec
             point.time_from_start.nanosec = int(round((float(t) - sec) * 1.0e9))
             goal.trajectory.points.append(point)
         pending.append((action_name, client.send_goal_async(goal)))
+    deadline = time.monotonic() + timeout
     while not all(future.done() for _, future in pending):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for FollowJointTrajectory goal response")
+        _ensure_bag_alive(bag)
         ros["rclpy"].spin_once(node, timeout_sec=0.05)
         if capture.error is not None:
             raise RuntimeError(capture.error)
@@ -323,7 +403,11 @@ def _send_trajectory(node: Any, config: Mapping[str, Any], trajectory: Materiali
     if rejected:
         raise RuntimeError(f"FollowJointTrajectory goal was rejected by {rejected}")
     results = [(name, handle.get_result_async()) for name, handle in handles]
+    deadline = time.monotonic() + timeout
     while not all(future.done() for _, future in results):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for FollowJointTrajectory result")
+        _ensure_bag_alive(bag)
         ros["rclpy"].spin_once(node, timeout_sec=0.05)
         if capture.error is not None:
             raise RuntimeError(capture.error)
@@ -340,67 +424,67 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
     """Preflight, bag, execute saved points, and return normalized observations."""
     if not trajectories:
         raise ValueError("at least one trajectory is required")
-    preflight = preflight_ros(config, trajectories[0].joint_names)
+    preflight = preflight_ros(config, trajectories[0].joint_names, check_motor_services=not no_motor_control)
     ros = _ros_imports()
     rclpy = ros["rclpy"]
     if not rclpy.ok():
         rclpy.init(args=None)
     node = rclpy.create_node("elastic_sim_experiment")
     capture = _Capture(node, config, trajectories[0].joint_names)
+    ros_config = config.get("ros", {}) or {}
     topics = ros_topics(config)
-    lifecycle = config.get("ros", {}).get("motor_services")
+    lifecycle = ros_config.get("motor_services")
     manage_motors = bool(lifecycle) and not no_motor_control
+    bag_config = ros_config.get("bag", {}) or {}
+    bag_mode = str(bag_config.get("mode", "all")).lower()
+    if bag_mode not in {"all", "selected"}:
+        raise ValueError("ros.bag.mode must be 'all' or 'selected'")
     motor_enabled = False
     bag = None
+    bag_exit_code: int | None = None
+    results: list[dict[str, Any]] = []
+    frame: pd.DataFrame | None = None
     try:
-        bag = start_rosbag(output_dir, topics)
-        time.sleep(float(config.get("ros", {}).get("bag_startup_delay", 0.5)))
-        if bag.poll() is not None:
-            raise RuntimeError("rosbag2 exited during startup; inspect raw/rosbag2.stderr.log")
+        bag = start_rosbag(output_dir, topics, record_all=bag_mode == "all")
+        time.sleep(float(ros_config.get("bag_startup_delay", 0.5)))
+        _ensure_bag_alive(bag)
         if manage_motors:
             client = node.create_client(ros["Trigger"], str(lifecycle["enable"]))
             if not client.wait_for_service(timeout_sec=5.0):
                 raise RuntimeError("motor enable service unavailable")
             future = client.call_async(ros["Trigger"].Request())
             while not future.done():
+                _ensure_bag_alive(bag)
                 rclpy.spin_once(node, timeout_sec=0.05)
             if not future.result().success:
                 raise RuntimeError("motor enable service returned failure")
             motor_enabled = True
-        results = []
         for index, trajectory in enumerate(trajectories):
             capture.trajectory_id = index
-            results.append(_send_trajectory(node, config, trajectory, capture, float(config.get("ros", {}).get("action_timeout", trajectory.duration + 10.0))))
+            results.append(_send_trajectory(
+                node, config, trajectory, capture,
+                float(ros_config.get("action_timeout", trajectory.duration + 10.0)),
+                bag,
+            ))
             # Drain callbacks after the action result so the final samples are retained.
             end = time.monotonic() + 0.25
             while time.monotonic() < end:
+                _ensure_bag_alive(bag)
                 rclpy.spin_once(node, timeout_sec=0.05)
             if capture.error is not None:
                 raise RuntimeError(capture.error)
         if motor_enabled:
             client = node.create_client(ros["Trigger"], str(lifecycle["disable"]))
-            if client.wait_for_service(timeout_sec=5.0):
-                future = client.call_async(ros["Trigger"].Request())
-                while not future.done():
-                    rclpy.spin_once(node, timeout_sec=0.05)
+            if not client.wait_for_service(timeout_sec=5.0):
+                raise RuntimeError("motor disable service unavailable")
+            future = client.call_async(ros["Trigger"].Request())
+            while not future.done():
+                _ensure_bag_alive(bag)
+                rclpy.spin_once(node, timeout_sec=0.05)
+            if not future.result().success:
+                raise RuntimeError("motor disable service returned failure")
+            motor_enabled = False
         frame = capture.frame(trajectories[-1], len(trajectories) - 1)
-        # Capture currently holds all samples.  Rebuild plan columns per id for
-        # multi-trajectory runs; the base rows remain fully timestamped.
-        frames = []
-        for index, trajectory in enumerate(trajectories):
-            subset = frame[frame["trajectory_id"] == index].copy()
-            if len(subset):
-                grid = subset["relative_t"].to_numpy(float)
-                for prefix, values in (("q_ref", trajectory.position), ("dq_ref", trajectory.velocity), ("ddq_ref", trajectory.acceleration)):
-                    if values is not None:
-                        for col, joint in enumerate(trajectory.joint_names):
-                            subset[f"{prefix}__{joint}"] = np.interp(grid, trajectory.time, values[:, col])
-                action_result = results[index]
-                subset["action_accepted"] = bool(action_result["accepted"])
-                subset["action_error_code"] = int(action_result["error_code"])
-                subset["action_error_string"] = str(action_result["error_string"])
-                frames.append(subset)
-        return pd.concat(frames, ignore_index=True), {"preflight": preflight, "action_results": results, "topics": topics}
     finally:
         if motor_enabled:
             try:
@@ -412,11 +496,47 @@ def execute_real_trajectories(config: Mapping[str, Any], trajectories: Sequence[
             except Exception:
                 pass
         if bag is not None:
-            bag.terminate()
             try:
+                if bag.poll() is None:
+                    bag.send_signal(signal.SIGINT)
                 bag.wait(timeout=10)
             except Exception:
-                bag.kill()
+                try:
+                    bag.kill()
+                finally:
+                    bag.wait(timeout=10)
+            bag_exit_code = bag.returncode
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
+    if bag_exit_code not in (None, 0, 130, -signal.SIGINT):
+        raise RuntimeError(f"rosbag2 exited with code {bag_exit_code}; raw recording is incomplete")
+    if frame is None:
+        raise RuntimeError("real execution produced no normalized capture")
+    # Capture currently holds all samples. Rebuild plan columns per trajectory;
+    # the base rows remain fully timestamped.
+    frames = []
+    for index, trajectory in enumerate(trajectories):
+        subset = frame[frame["trajectory_id"] == index].copy()
+        if len(subset):
+            grid = subset["relative_t"].to_numpy(float)
+            for prefix, values in (("q_ref", trajectory.position), ("dq_ref", trajectory.velocity), ("ddq_ref", trajectory.acceleration)):
+                if values is not None:
+                    for col, joint in enumerate(trajectory.joint_names):
+                        subset[f"{prefix}__{joint}"] = np.interp(grid, trajectory.time, values[:, col])
+            action_result = results[index]
+            subset["action_accepted"] = bool(action_result["accepted"])
+            subset["action_error_code"] = int(action_result["error_code"])
+            subset["action_error_string"] = str(action_result["error_string"])
+            frames.append(subset)
+    if not frames:
+        raise RuntimeError("real execution produced no samples for any trajectory")
+    return pd.concat(frames, ignore_index=True), {
+        "preflight": preflight,
+        "action_results": results,
+        "topics": topics,
+        "bag_mode": bag_mode,
+        "bag_path": str(Path(output_dir) / "rosbag2"),
+        "bag_exit_code": bag_exit_code,
+    }

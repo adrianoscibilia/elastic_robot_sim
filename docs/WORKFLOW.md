@@ -70,13 +70,22 @@ source install/setup.bash
 
 Start the robot controller, joint-state publisher, flange sensor broadcaster, TF tree if used, and any motor lifecycle services. Confirm the configured topics before running the experiment. The runner checks topic names and message types and waits for valid samples before motion.
 
+Use the non-moving preflight on the hardware host before collection:
+
+```bash
+ros2 run elastic_robot_sim run_experiment \
+  --config config/assets/fmrr_tecnobody_sim2real.yaml \
+  --preflight-only
+```
+
 For environment-aware validation, start the robot's MoveIt planning scene and pass `--moveit-validate`. The optional adapter checks every materialized state through `check_state_validity`; MoveIt remains external to `uv` and is never imported for portable simulation.
 
 ## 5. Execute and record
 
 ```bash
 ros2 run elastic_robot_sim run_experiment \
-  --config config/assets/fmrr_tecnobody_sim2real.yaml
+  --config config/assets/fmrr_tecnobody_sim2real.yaml \
+  --real-only
 ```
 
 The sequence is:
@@ -85,12 +94,12 @@ The sequence is:
 2. Materialize and save every trajectory.
 3. Run selected simulation backends.
 4. Validate required ROS topics and first samples.
-5. Start rosbag2.
+5. Start the complete `rosbag2 --all` capture.
 6. Enable motors unless `--no-motor-control` is supplied.
 7. Send each exact trajectory through `FollowJointTrajectory`.
 8. Capture joint state, controller state, flange wrench, source/receipt timestamps, and configured extras.
 9. Disable motors in normal and failure cleanup paths.
-10. Stop rosbag2 and write `manifest.yaml`.
+10. Stop rosbag2, verify its exit status, and write `manifest.yaml`.
 
 If any required preflight check fails, the command aborts before motion. If a runtime JointState effort becomes missing or non-finite, the capture records an error and aborts rather than substituting zero.
 

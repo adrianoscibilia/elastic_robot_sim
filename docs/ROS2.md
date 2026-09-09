@@ -21,6 +21,17 @@ Start, in the robot-specific order required by the hardware stack:
 
 The repository does not prescribe a universal hardware launch file. Topic names, action namespace, and motor services belong in the asset sim2real YAML.
 
+Before motion, run the non-moving preflight:
+
+```bash
+ros2 run elastic_robot_sim run_experiment \
+  --config config/assets/fmrr_tecnobody_sim2real.yaml \
+  --preflight-only
+```
+
+For the actual collection, use `--real-only`; this prevents the limited
+hardware session from also running the configured simulation backends.
+
 ## Required interfaces
 
 The preflight requires these exact types:
@@ -32,7 +43,12 @@ The preflight requires these exact types:
 | Controller state | `/joint_trajectory_controller/state` | `control_msgs/msg/JointTrajectoryControllerState`; desired/actual/error fields are retained when published. |
 | Action | `/joint_trajectory_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory`. |
 
-The raw bag includes the action's `send_goal`, `get_result`, `feedback`, `cancel_goal`, and `status` topics, plus every configured `extra_topics` name.
+The safety-default raw bag uses `ros2 bag record --all`, so it includes the
+action's `send_goal`, `get_result`, `feedback`, `cancel_goal`, and `status`
+topics, TF, and any other ROS topics published during the run. Set
+`ros.bag.mode: selected` only for a deliberate diagnostic capture; in that
+mode the explicit action topics, configured `extra_topics`, and TF topics are
+recorded.
 
 ## Joint effort rule
 
@@ -61,9 +77,12 @@ When published, desired, actual, and error points are preserved for positions, v
 
 ## Motor lifecycle and failure cleanup
 
-By default, the runner calls the configured enable Trigger service before the first goal and the disable Trigger service after execution. Disable is attempted again in the `finally` cleanup path. Use `--no-motor-control` only when the surrounding test setup owns the motor lifecycle.
+By default, the runner calls the configured enable Trigger service before the first goal and the disable Trigger service after execution. Disable is attempted again in the `finally` cleanup path. The preflight checks both services before motion. Use `--no-motor-control` only when the surrounding test setup owns the motor lifecycle.
 
-The runner starts rosbag2 before motor enable and checks that the process remains alive. It terminates the bag after execution and stores stdout/stderr under `raw/`. Inspect `raw/rosbag2.stderr.log` when bag startup fails.
+The runner starts rosbag2 before motor enable, checks that the process remains
+alive during every action, stops it with SIGINT, checks its exit status, and
+stores stdout/stderr under `raw/`. A bag failure aborts the run and prevents a
+successful manifest. Inspect `raw/rosbag2.stderr.log` when bag startup fails.
 
 ## Useful checks before running
 

@@ -53,14 +53,28 @@ On macOS, MuJoCo interactive runs must use its `mjpython` launcher; `--headless`
 
 ### Record a real experiment
 
-Build and source the ROS 2 package first, start the robot controller and flange sensor, then run:
+Build and source the ROS 2 package first, start the robot controller, flange
+sensor, TF publishers, and configured motor services, then run the canonical
+real-robot entry point:
 
 ```bash
 ros2 run elastic_robot_sim run_experiment \
-  --config config/assets/fmrr_tecnobody_sim2real.yaml
+  --config config/assets/fmrr_tecnobody_sim2real.yaml \
+  --real-only
 ```
 
-The runner performs topic/type/data preflight before enabling motors. It saves the trajectory before motion, starts rosbag2, executes the saved points through `FollowJointTrajectory`, records the configured signals, disables the motors, and writes a manifest.
+The runner performs topic/type/data preflight before enabling motors. It saves
+the trajectory before motion, starts a complete `rosbag2 --all` capture,
+executes the saved Cartesian points through `FollowJointTrajectory`, records
+normalized signals, disables the motors, and writes a manifest.
+
+Run the hardware checks without moving:
+
+```bash
+ros2 run elastic_robot_sim run_experiment \
+  --config config/assets/fmrr_tecnobody_sim2real.yaml \
+  --preflight-only
+```
 
 For a controlled test that does not call the configured motor services:
 
@@ -200,14 +214,21 @@ paths:
   calibrations_root: data/calibrations
 
 trajectory:
+  space: cartesian
   mode: ptp                 # hold, sin/sinusoidal, or ptp
   num_trajectories: 3
   duration: 10.0
   time_step: 0.01
+  max_velocity: 0.5
+  max_acceleration: 0.5
+  speed_scale: 1.0
   seed: 20260903
   ptp:
     waypoints: 5
-    limit_margin: 0.12
+  cartesian:
+    groups: [cartesian]
+    workspace:
+      cartesian: {x: [-0.7, 0.7], y: [-0.7, 0.8], z: [-0.2, 0.25]}
 
 simulation:
   backends: [newton, mujoco]
@@ -244,6 +265,8 @@ ros:
     enable: /ethercat_checker/start_motors
     disable: /ethercat_checker/stop_motors
   extra_topics: []
+  bag:
+    mode: all                  # all (safety default) or selected
 ```
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every supported field and parameter-registry examples.
@@ -260,7 +283,11 @@ Before motion, the runner requires these topics with these message types:
 
 JointState effort is never replaced by zero and is never inferred from controller effort. The flange wrench is retained in its original frame; an optional TF transform and/or axis permutation creates the configured link-side channel. A flange wrench is not silently converted into joint torque.
 
-The raw bag also records the FollowJointTrajectory action topics and every configured `extra_topics` entry. See [docs/ROS2.md](docs/ROS2.md) for setup, preflight behavior, safety, and topic customization.
+The safety-default raw bag records all ROS topics, including the
+FollowJointTrajectory action protocol, TF, controller state, JointState, FT
+wrench, and any platform-specific topics. A selected-topic mode remains
+available for diagnostics but is not the recommended hardware mode. See
+[docs/ROS2.md](docs/ROS2.md) for setup, preflight behavior, safety, and topic customization.
 
 ## Simulation-only tools
 

@@ -37,6 +37,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--sim-only", action="store_true", help="simulate without ROS; add --save to persist")
     parser.add_argument("--real-only", action="store_true", help="write only below data/recorded/<robot>")
     parser.add_argument("--dry-run", action="store_true", help="validate without creating artifacts or contacting ROS")
+    parser.add_argument("--preflight-only", action="store_true", help="validate ROS topics, samples, services, and rosbag2 without motion or artifacts")
     parser.add_argument("--backends", nargs="+", choices=("newton", "mujoco"), default=None)
     parser.add_argument("--headless", action="store_true", help="disable simulator and plot windows")
     parser.add_argument("--plot", action="store_true", help="show post-run joint, Cartesian, and clearance plots")
@@ -61,6 +62,11 @@ def _validate(config: dict, asset) -> None:
         raise ValueError("trajectory.duration must be positive")
     if float(trajectory.get("time_step", 0.01)) <= 0.0:
         raise ValueError("trajectory.time_step must be positive")
+    if int(trajectory.get("num_trajectories", 1)) < 1:
+        raise ValueError("trajectory.num_trajectories must be positive")
+    speed_scale = float(trajectory.get("speed_scale", 1.0))
+    if not 0.0 < speed_scale <= 1.0:
+        raise ValueError("trajectory.speed_scale must be in (0, 1]")
 
 
 def _save_trajectories(store: ExperimentStore, trajectories) -> None:
@@ -79,6 +85,20 @@ def _manifest(config: dict, asset, trajectories, backends, digest: str, kind: st
         "config_path": str(Path(config["_config_path"]).resolve()),
         "config_hash": digest,
         "trajectory": {"count": len(trajectories), "joint_names": list(asset.joint_names), "digests": [item.digest() for item in trajectories]},
+        "execution": {
+            "requested_velocity_limit": trajectories[0].metadata.get("requested_speed"),
+            "requested_acceleration_limit": trajectories[0].metadata.get("requested_acceleration"),
+            "speed_scale": trajectories[0].metadata.get("speed_scale"),
+            "effective_velocity": trajectories[0].metadata.get("effective_speed"),
+            "effective_acceleration": trajectories[0].metadata.get("effective_acceleration"),
+            "effective_velocity_limit": trajectories[0].metadata.get("effective_velocity_limit"),
+            "effective_acceleration_limit": trajectories[0].metadata.get("effective_acceleration_limit"),
+        },
+        "safety": {
+            "joint_workspace": trajectories[0].metadata.get("workspace"),
+            "cartesian_workspace": trajectories[0].metadata.get("cartesian_workspace", {}),
+            "collision": trajectories[0].metadata.get("collision", {}),
+        },
         "backends": list(backends),
         "parameters": config.get("model", {}),
         "software": {
@@ -104,6 +124,10 @@ def main() -> int:
     args = _args()
     if args.sim_only and args.real_only:
         raise SystemExit("--sim-only and --real-only are mutually exclusive")
+    if args.dry_run and getattr(args, "preflight_only", False):
+        raise SystemExit("--dry-run and --preflight-only are mutually exclusive")
+    if getattr(args, "preflight_only", False) and args.sim_only:
+        raise SystemExit("--preflight-only cannot be combined with --sim-only")
     if args.realtime_scale <= 0.0:
         raise SystemExit("--realtime-scale must be positive")
     config = load_experiment_config(args.config)
@@ -121,6 +145,13 @@ def main() -> int:
         print(f"asset={asset.name} joints={list(asset.joint_names)}")
         print(f"trajectories={count} samples={[len(item.time) for item in trajectories]} backends={list(backends)}")
         print(f"config_hash={digest}")
+        return 0
+    if getattr(args, "preflight_only", False):
+        from elastic_sim.ros_experiment import preflight_ros
+        report = preflight_ros(config, asset.joint_names, check_motor_services=not args.no_motor_control)
+        print(f"ROS preflight complete: asset={asset.name} joints={list(asset.joint_names)}")
+        print(f"validated_topics={sorted(report['topics'])}")
+        print(f"action_servers={report['action_servers']} rosbag_available={report['rosbag_available']}")
         return 0
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -189,7 +220,7 @@ def main() -> int:
             real_store.save_frame(real, "observations.parquet")
             real_store.save_frame(real, "real.parquet")
             real_manifest["ros"] = ros_manifest
-            real_manifest["raw_bag_path"] = str(real_store.path / "raw" / "rosbag2")
+            real_manifest["raw_bag_path"] = ros_manifest.get("bag_path", str(real_store.path / "raw" / "rosbag2"))
             real_manifest["completion_status"] = "complete"
             real_manifest["end_timestamp"] = datetime.now(timezone.utc).isoformat()
             real_store.save_manifest(real_manifest)

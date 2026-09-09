@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""ROS 2 node: record a single real-robot rollout for sim-to-real calibration.
+"""Deprecated legacy recorder.
+
+Use ``ros2 run elastic_robot_sim run_experiment --real-only --config ...``.
+This module belongs to the pre-restructuring trajectory/recorder stack and is
+kept only so old source checkouts fail with an explicit migration message.
+
+Original usage (for historical reference):
 
 Usage (ROS 2 Jazzy, sourced workspace):
 
@@ -51,6 +57,11 @@ except ImportError:
 
 
 def main() -> None:
+    raise SystemExit(
+        "record_real_rollout is deprecated; use "
+        "ros2 run elastic_robot_sim run_experiment --real-only --config "
+        "config/assets/fmrr_tecnobody_sim2real.yaml"
+    )
     parser = argparse.ArgumentParser(
         description="Record a single real-robot rollout for sim-to-real calibration."
     )

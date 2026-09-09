@@ -1,7 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import elastic_sim.experiment as experiment_module
+import elastic_sim.ros_experiment as ros_module
 
 from elastic_sim.experiment import (
     ExperimentStore,
@@ -85,10 +88,11 @@ def test_artifact_roots_are_kind_first_and_reject_mixed_paths(tmp_path):
 
 
 def test_ros_topic_manifest_contains_required_and_extra_topics():
-    topics = ros_topics({"ros": {"action_server": "/controller/follow_joint_trajectory", "extra_topics": [{"name": "/imu", "type": "sensor_msgs/msg/Imu"}]}})
+    topics = ros_topics({"ros": {"action_server": "/controller/follow_joint_trajectory", "extra_topics": [{"name": "/imu", "type": "sensor_msgs/msg/Imu"}], "sensor": {"link_side_frame": "flange"}}})
     assert "/joint_states" in topics
     assert "/controller/follow_joint_trajectory/_action/feedback" in topics
     assert "/imu" in topics
+    assert "/tf" in topics and "/tf_static" in topics
 
 
 def test_multi_controller_actions_cover_all_joints_and_are_bagged():
@@ -104,3 +108,103 @@ def test_multi_controller_actions_cover_all_joints_and_are_bagged():
     topics = ros_topics(config)
     assert "/left/follow_joint_trajectory/_action/feedback" in topics
     assert "/right/follow_joint_trajectory/_action/feedback" in topics
+
+
+def test_fmrr_cartesian_workspace_and_execution_limits():
+    path = ROOT / "config/assets/fmrr_tecnobody_sim2real.yaml"
+    config = load_experiment_config(path)
+    asset = resolve_asset(config, path)
+    trajectory = generate_materialized_trajectory(asset, config, 20260903)
+    assert trajectory.metadata["space"] == "cartesian"
+    assert np.all(trajectory.position >= np.array([[-0.7, -0.7, -0.2]]) - 1.0e-9)
+    assert np.all(trajectory.position <= np.array([[0.7, 0.8, 0.25]]) + 1.0e-9)
+    assert np.max(np.abs(trajectory.velocity)) <= 0.5 + 1.0e-8
+    assert np.max(np.abs(trajectory.acceleration)) <= 0.5 + 1.0e-8
+
+    slower_config = {**config, "trajectory": {**config["trajectory"], "speed_scale": 0.5}}
+    slower = generate_materialized_trajectory(asset, slower_config, 20260903)
+    assert slower.metadata["speed_scale"] == 0.5
+    assert slower.metadata["effective_velocity_limit"] == 0.25
+    assert np.max(np.abs(slower.velocity)) <= 0.25 + 1.0e-8
+
+
+def test_explicit_fmrr_cartesian_waypoint_outside_workspace_is_rejected():
+    path = ROOT / "config/assets/fmrr_tecnobody_sim2real.yaml"
+    config = load_experiment_config(path)
+    asset = resolve_asset(config, path)
+    config["trajectory"] = {
+        **config["trajectory"],
+        "duration": 0.1,
+        "time_step": 0.05,
+        "cartesian": {
+            **config["trajectory"]["cartesian"],
+            "waypoints": {"cartesian": [[0.8, 0.0, 0.0]]},
+        },
+    }
+    with np.testing.assert_raises_regex(ValueError, "exceeds its safety workspace"):
+        generate_materialized_trajectory(asset, config, 1)
+
+
+def test_full_rosbag_command_is_the_default(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        pass
+
+    monkeypatch.setattr(experiment_module, "rosbag_available", lambda: True)
+    monkeypatch.setattr(
+        experiment_module.subprocess,
+        "Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)) or FakeProcess(),
+    )
+    experiment_module.start_rosbag(tmp_path, ["/joint_states"])
+    command = calls[0][0]
+    assert command[-1] == "--all"
+    assert "/joint_states" not in command
+
+    calls.clear()
+    experiment_module.start_rosbag(tmp_path / "selected", ["/joint_states"], record_all=False)
+    command = calls[0][0]
+    assert command[-2:] == ["--topics", "/joint_states"]
+
+
+def test_capture_preserves_joint_and_controller_efforts(monkeypatch):
+    class FakeMessage:
+        pass
+
+    class FakeNode:
+        def get_clock(self):
+            return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
+
+        def create_subscription(self, *args):
+            return object()
+
+    monkeypatch.setattr(
+        ros_module,
+        "_ros_imports",
+        lambda: {
+            "JointState": FakeMessage,
+            "WrenchStamped": FakeMessage,
+            "JointTrajectoryControllerState": FakeMessage,
+        },
+    )
+    capture = ros_module._Capture(FakeNode(), {"ros": {"topics": {}}}, ("joint_x",))
+    header = SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=0), frame_id="")
+    joint = SimpleNamespace(
+        header=header,
+        name=["joint_x"],
+        position=[0.1],
+        velocity=[0.2],
+        effort=[3.4],
+    )
+    capture.on_joint(joint)
+    controller = SimpleNamespace(
+        header=header,
+        joint_names=["joint_x"],
+        desired=SimpleNamespace(positions=[0.1], velocities=[0.2], accelerations=[0.0], efforts=[4.5]),
+        actual=SimpleNamespace(positions=[0.1], velocities=[0.2], accelerations=[0.0], efforts=[3.4]),
+        error=SimpleNamespace(positions=[0.0], velocities=[0.0], accelerations=[0.0], efforts=[1.1]),
+    )
+    capture.on_controller(controller)
+    assert capture.joint[0]["tau_joint_state__joint_x"] == 3.4
+    assert capture.controller[0]["controller_desired_efforts__joint_x"] == 4.5

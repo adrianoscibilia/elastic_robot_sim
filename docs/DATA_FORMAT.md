@@ -59,7 +59,7 @@ Only fields actually published by the controller are populated. The action resul
 
 ## `real.parquet` versus `observations.parquet`
 
-Both files are written by the experiment runner. `real.parquet` is the stable calibration input. `observations.parquet` is the broader joined observation frame and is intended to retain additional channels when future losses or analysis need them. Raw message provenance belongs in the rosbag; normalized Parquet data preserves source/receipt timestamps and validity masks.
+Both files are written by the experiment runner. `real.parquet` is the stable calibration input. `observations.parquet` is the broader joined observation frame and is intended to retain additional channels when future losses or analysis need them. Raw message provenance belongs in the rosbag; normalized Parquet data preserves source/receipt timestamps and validity masks. Real runs default to a complete `ros2 bag record --all` capture under `raw/rosbag2`; this is authoritative when a normalized channel is absent.
 
 ## `manifest.yaml`
 
@@ -79,6 +79,7 @@ software
 start_timestamp / end_timestamp
 completion_status
 raw_bag_path
+ros.bag_mode / ros.bag_exit_code
 error                         # only for incomplete runs
 ```
 

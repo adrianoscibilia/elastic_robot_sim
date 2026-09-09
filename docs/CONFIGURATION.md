@@ -29,8 +29,9 @@ trajectory:
   duration: 8.0
   time_step: 0.01
   seed: 20260903
-  max_velocity: null        # optional global cap in asset units/s
-  max_acceleration: null    # optional global cap; timing is stretched
+  max_velocity: 0.5         # global cap in asset units/s
+  max_acceleration: 0.5     # global cap; timing is stretched
+  speed_scale: 1.0          # (0, 1], applied after timing limits
   workspace:                # optional; otherwise URDF limits are used
     joint_a: [-1.0, 1.0]
   ptp:
@@ -70,7 +71,7 @@ trajectory:
       right_arm: {x: [0.35, 0.55], y: [-0.35, -0.15], z: [0.75, 1.05]}
 ```
 
-With no Cartesian workspace, generation uses a small box around the initial pose and holds its orientation. Explicit per-group `waypoints` accept XYZ values or mappings containing `position` and quaternion `orientation`. Every joint- or Cartesian-generated result is checked against limits and the asset's non-adjacent self-collision pairs before simulation or ROS execution.
+With no Cartesian workspace, generation uses a small box around the initial pose and holds its orientation. Explicit per-group `waypoints` accept XYZ values or mappings containing `position` and quaternion `orientation`; every interpolated sample is checked against the configured Cartesian workspace. Every joint- or Cartesian-generated result is checked against limits and the asset's non-adjacent self-collision pairs before simulation or ROS execution. `speed_scale` can only slow a trajectory and is included in the materialized metadata.
 
 ## Simulation and model
 
@@ -183,6 +184,8 @@ ros:
     - name: /some/topic
       type: package/msg/Type
       required: false
+  bag:
+    mode: all                  # all (safety default) or selected
   motor_services:
     enable: /ethercat_checker/start_motors
     disable: /ethercat_checker/stop_motors
@@ -195,4 +198,4 @@ ros:
   bag_startup_delay: 0.5
 ```
 
-The `required` flag on extra topics controls validation policy; all configured extra topics are still included in the raw bag. Required core topic types are fixed by the message contract and are validated before motion. See [ROS2.md](ROS2.md) for details.
+The `required` flag on extra topics controls validation policy; all configured extra topics are still included in the raw bag. Required core topic types are fixed by the message contract and are validated before motion. `bag.mode: all` records every ROS topic and is the safety default; `selected` records only the configured contract topics. TF and `/tf_static` are automatically included in the selected topic list when a sensor frame transform is configured. See [ROS2.md](ROS2.md) for details.
