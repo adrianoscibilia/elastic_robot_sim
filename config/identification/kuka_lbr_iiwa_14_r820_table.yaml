@@ -16,7 +16,7 @@ backends: [mujoco, newton]
 # Pinocchio's analytic inverse dynamics.  The stiffness ladder runs from
 # near-rigid down to visibly compliant.
 tiers:
-  rigid: true
+  rigid: false
   stiffness: [1.0e6, 4.0e4]
   transmission_damping_ratio: 0.1
   rotor_inertia: 0.1          # reflected motor inertia [kg m^2], as armature

@@ -74,9 +74,12 @@ class NewtonVisualizer:
                     _WARNING_COLOR if warning else (1.0, 0.9, 0.2), width=0.009,
                 )
             target = wp.array([reference[min(len(reference) - 1, len(actual) - 1), :3]], dtype=wp.vec3, device=self.viewer.device)
+            # ViewerGL's signature accepts scalar radii and tuple colors, but its
+            # GL instancer only handles warp arrays, so pass arrays explicitly.
             self.viewer.log_points(
-                f"trajectory/target/{name}", target, 0.018,
-                _WARNING_COLOR if warning else _COLORS[index % len(_COLORS)],
+                f"trajectory/target/{name}", target,
+                wp.full(1, 0.018, dtype=wp.float32, device=self.viewer.device),
+                wp.array([_WARNING_COLOR if warning else _COLORS[index % len(_COLORS)]], dtype=wp.vec3, device=self.viewer.device),
             )
             starts, ends = _frame_segments(poses[name])
             self.viewer.log_lines(
