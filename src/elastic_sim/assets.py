@@ -33,6 +33,11 @@ class UrdfJoint:
     effort: float | None = None
     velocity: float | None = None
     mimic: str | None = None
+    # ``<dynamics>`` values are the manufacturer-declared viscous damping and
+    # Coulomb friction.  Identification treats them as part of the nominal
+    # model, so they are carried alongside the limits rather than discarded.
+    damping: float | None = None
+    friction: float | None = None
 
     @property
     def is_one_dof(self) -> bool:
@@ -154,6 +159,7 @@ def discover_urdf_joints(urdf_path: str | Path) -> tuple[UrdfJoint, ...]:
             raise ValueError(f"Joint {name!r} axis must contain three values")
         limit = element.find("limit")
         mimic = element.find("mimic")
+        dynamics = element.find("dynamics")
         joints.append(
             UrdfJoint(
                 name=name,
@@ -166,6 +172,8 @@ def discover_urdf_joints(urdf_path: str | Path) -> tuple[UrdfJoint, ...]:
                 effort=_optional_float(limit, "effort", properties),
                 velocity=_optional_float(limit, "velocity", properties),
                 mimic=None if mimic is None else mimic.get("joint"),
+                damping=_optional_float(dynamics, "damping", properties),
+                friction=_optional_float(dynamics, "friction", properties),
             )
         )
     return tuple(joints)

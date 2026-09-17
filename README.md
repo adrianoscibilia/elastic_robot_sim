@@ -310,6 +310,24 @@ uv run python scripts/run_asset_dataset_generation.py \
 
 These commands are not calibration inputs. Calibration discovers only complete paired experiment directories produced by `run_experiment.py`.
 
+## Identification datasets without a robot
+
+A second, hardware-free path builds a scene, designs trajectories that excite the robot's dynamics, and runs them as torque-driven rollouts whose recorded torque is exact by construction. It is described in [docs/IDENTIFICATION_DATASET.md](docs/IDENTIFICATION_DATASET.md).
+
+```bash
+# Mount an asset on a table of arbitrary height and register the scene
+uv run python scripts/compose_scene_urdf.py \
+  --asset kuka_lbr_iiwa_14_r820 --table-height 0.75 --write-asset-yaml
+
+# Watch one rollout and save nothing, to check the trajectory and the numbers
+uv run python scripts/run_identification_simulation.py --visualize
+
+# Generate the dataset (defaults come from config/identification/*.yaml)
+uv run python scripts/generate_identification_dataset.py
+```
+
+Unlike the calibration path, this one uses `computed torque` rather than position tracking, neutralizes the two importers' conflicting readings of the URDF `<dynamics>` tag, and validates the result by recovering the robot's base inertial parameters from the generated data.
+
 ## Repository map
 
 The concise module guide is in [docs/MODULES.md](docs/MODULES.md). At a glance:
@@ -328,6 +346,16 @@ src/elastic_sim/mujoco_runner.py FMRR MuJoCo backend
 src/elastic_sim/generic_*_runner.py generic serial-asset backends
 src/elastic_sim/optimizers/     CMA-ES, Bayesian optimization, skrl adapters
 tests/                          trajectory, asset, simulator, optimizer, workflow tests
+
+config/identification/*.yaml    identification dataset configurations
+scripts/compose_scene_urdf.py   mount an asset on a table as a new scene asset
+scripts/run_identification_simulation.py  one rollout, viewer and diagnostics, no output
+scripts/generate_identification_dataset.py  full dataset build
+src/elastic_sim/scene.py        derived scene URDF composition
+src/elastic_sim/excitation.py   Fourier excitation design and conditioning
+src/elastic_sim/identification.py Pinocchio inverse dynamics, regressor, base parameters
+src/elastic_sim/torque_runners.py torque-driven rollouts with exact labels
+src/elastic_sim/dataset.py      tiers, conditions, and the consumer's CSV contract
 ```
 
 ## ROS 2 package build
@@ -358,6 +386,7 @@ For a guide to adding a new robot, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md
 - [Workflow guide](docs/WORKFLOW.md) — installation, dry runs, simulation, ROS execution, and calibration.
 - [Configuration reference](docs/CONFIGURATION.md) — trajectory, model, optimizer, loss, ROS, and registry settings.
 - [Data format](docs/DATA_FORMAT.md) — trajectory JSON, Parquet channels, manifest, and calibration history.
+- [Identification datasets](docs/IDENTIFICATION_DATASET.md) — simulation-only excitation design, torque-driven rollouts, backend parity, and the dataset contract.
 - [ROS 2 guide](docs/ROS2.md) — controller/sensor requirements, preflight, bagging, and safety.
 - [Module guide](docs/MODULES.md) — what each Python module and script does.
 - [Development guide](docs/DEVELOPMENT.md) — adding assets, running tests, and extending backends.

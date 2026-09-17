@@ -1,0 +1,284 @@
+"""Periodic excitation trajectories for dynamic model identification.
+
+Random point-to-point motion moves a robot around but does not necessarily
+*excite* its dynamics: whole groups of inertial parameters can stay nearly
+unobservable, which makes any later identification ill-conditioned.  The
+standard remedy is a finite Fourier series per joint whose coefficients are
+optimized so the base-parameter regressor is well conditioned.
+
+For joint ``i`` with base frequency ``w`` and ``H`` harmonics::
+
+    q_i(t)   = q_i0 + sum_k [  a_ik/(k w) sin(k w t) - b_ik/(k w) cos(k w t) ]
+    dq_i(t)  =        sum_k [  a_ik       cos(k w t) + b_ik       sin(k w t) ]
+    ddq_i(t) =        sum_k [ -a_ik (k w) sin(k w t) + b_ik (k w) cos(k w t) ]
+
+Constraining ``sum_k a_ik = 0`` and ``sum_k k b_ik = 0`` makes velocity and
+acceleration vanish at ``t = 0``; because the series is periodic they vanish
+again at the end of every period, so the robot starts and stops at rest and a
+trajectory can be repeated back to back or averaged over periods.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+
+from .assets import AssetSpec
+from .materialized import MaterializedTrajectory
+
+
+@dataclass(frozen=True)
+class FourierExcitationConfig:
+    """Shape and limits of a periodic excitation trajectory."""
+
+    n_harmonics: int = 5
+    base_frequency: float = 0.1
+    n_periods: int = 1
+    time_step: float = 0.002
+    limit_margin: float = 0.12
+    max_acceleration: float = 3.0
+    velocity_fraction: float = 0.6
+    settle_time: float = 0.0
+    metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.n_harmonics < 2:
+            raise ValueError("n_harmonics must be at least two")
+        if self.base_frequency <= 0.0 or self.time_step <= 0.0:
+            raise ValueError("base_frequency and time_step must be positive")
+        if self.n_periods < 1:
+            raise ValueError("n_periods must be at least one")
+        if not 0.0 <= self.limit_margin < 0.5:
+            raise ValueError("limit_margin must be in [0, 0.5)")
+        if self.max_acceleration <= 0.0:
+            raise ValueError("max_acceleration must be positive")
+        if not 0.0 < self.velocity_fraction <= 1.0:
+            raise ValueError("velocity_fraction must be in (0, 1]")
+
+    @property
+    def period(self) -> float:
+        return 1.0 / self.base_frequency
+
+    @property
+    def duration(self) -> float:
+        return self.n_periods * self.period
+
+
+def project_coefficients(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Enforce zero velocity and acceleration at the period boundaries.
+
+    ``dq(0) = sum_k a_ik`` and ``ddq(0) = w * sum_k k b_ik``, so ``a`` is
+    projected off the all-ones direction and ``b`` off the harmonic-index
+    direction.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    harmonics = np.arange(1, a.shape[1] + 1, dtype=float)
+    a = a - a.mean(axis=1, keepdims=True)
+    b = b - np.outer(b @ harmonics / float(harmonics @ harmonics), harmonics)
+    return a, b
+
+
+def evaluate_series(
+    a: np.ndarray, b: np.ndarray, offset: np.ndarray, omega: float, time: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(q, dq, ddq)`` sampled at ``time`` for the Fourier series."""
+    harmonics = np.arange(1, a.shape[1] + 1, dtype=float)
+    scaled = harmonics * omega
+    phase = np.outer(np.asarray(time, dtype=float), scaled)
+    sin, cos = np.sin(phase), np.cos(phase)
+    q = sin @ (a / scaled).T - cos @ (b / scaled).T + np.asarray(offset, dtype=float)
+    dq = cos @ a.T + sin @ b.T
+    ddq = -(sin @ (a * scaled).T) + cos @ (b * scaled).T
+    return q, dq, ddq
+
+
+def joint_bounds(asset: AssetSpec, config: FourierExcitationConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(safe_lower, safe_upper, velocity_limit)`` for the active joints."""
+    joints = asset.resolve_active_joints()
+    lower, upper, velocity = [], [], []
+    for joint in joints:
+        lo, hi = joint.lower, joint.upper
+        if lo is None or hi is None or not np.isfinite([lo, hi]).all() or lo >= hi:
+            lo, hi = -np.pi, np.pi
+        lower.append(float(lo))
+        upper.append(float(hi))
+        velocity.append(float(joint.velocity) if joint.velocity else 1.0)
+    lower = np.asarray(lower)
+    upper = np.asarray(upper)
+    span = upper - lower
+    return (
+        lower + config.limit_margin * span,
+        upper - config.limit_margin * span,
+        np.asarray(velocity) * config.velocity_fraction,
+    )
+
+
+def _fit_to_limits(
+    a: np.ndarray,
+    b: np.ndarray,
+    omega: float,
+    time: np.ndarray,
+    safe_lower: np.ndarray,
+    safe_upper: np.ndarray,
+    velocity_limit: np.ndarray,
+    max_acceleration: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Scale each joint's series to the largest feasible amplitude.
+
+    Position deviation, velocity and acceleration are all linear in the
+    coefficients, so a single per-joint factor makes every limit feasible at
+    once and one pass is exact.  Scaling *up* is allowed and wanted: a larger
+    feasible amplitude excites the dynamics more.
+    """
+    centre = 0.5 * (safe_lower + safe_upper)
+    q, dq, ddq = evaluate_series(a, b, np.zeros(a.shape[0]), omega, time)
+    half_span = 0.5 * (safe_upper - safe_lower)
+    deviation = 0.5 * (q.max(axis=0) - q.min(axis=0))
+    peak_velocity = np.abs(dq).max(axis=0)
+    peak_acceleration = np.abs(ddq).max(axis=0)
+
+    def _ratio(limit: np.ndarray, peak: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(peak > 1.0e-12, limit / np.maximum(peak, 1.0e-12), np.inf)
+
+    scale = np.minimum.reduce([
+        _ratio(half_span, deviation),
+        _ratio(velocity_limit, peak_velocity),
+        _ratio(np.full_like(peak_acceleration, max_acceleration), peak_acceleration),
+    ])
+    scale = np.where(np.isfinite(scale), scale, 1.0)
+    a = a * scale[:, None]
+    b = b * scale[:, None]
+    q, _, _ = evaluate_series(a, b, np.zeros(a.shape[0]), omega, time)
+    # Centre the achieved range inside the safe band.
+    offset = centre - 0.5 * (q.max(axis=0) + q.min(axis=0))
+    return a, b, offset
+
+
+def sample_candidate(
+    asset: AssetSpec,
+    config: FourierExcitationConfig,
+    rng: np.random.Generator,
+    time: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Draw one feasible coefficient set ``(a, b, offset)``."""
+    n = len(asset.joint_names)
+    safe_lower, safe_upper, velocity_limit = joint_bounds(asset, config)
+    a = rng.normal(size=(n, config.n_harmonics))
+    b = rng.normal(size=(n, config.n_harmonics))
+    a, b = project_coefficients(a, b)
+    omega = 2.0 * np.pi * config.base_frequency
+    return _fit_to_limits(a, b, omega, time, safe_lower, safe_upper, velocity_limit, config.max_acceleration)
+
+
+def optimize_excitation(
+    asset: AssetSpec,
+    config: FourierExcitationConfig | None = None,
+    *,
+    seed: int = 0,
+    n_candidates: int = 96,
+    refine_iterations: int = 0,
+    kinematics: Any | None = None,
+    include_friction: bool = True,
+    condition_stride: int = 10,
+) -> MaterializedTrajectory:
+    """Search for a well-conditioned, feasible periodic excitation trajectory.
+
+    Candidates are drawn at random, scaled to the joint limits and scored by
+    the condition number of the base-parameter regressor.  The best feasible
+    candidate is returned as a :class:`MaterializedTrajectory`, so trajectory
+    JSON, the parquet writer, the collision checker and both simulator
+    backends consume it unchanged.
+    """
+    from . import identification as idn
+
+    config = config or FourierExcitationConfig()
+    pin, model, data = idn.build_model(asset)
+    basis = idn.base_parameter_basis(pin, model, data, seed=seed, include_friction=include_friction)
+    time = np.arange(0.0, config.duration + 0.5 * config.time_step, config.time_step)
+    omega = 2.0 * np.pi * config.base_frequency
+    rng = np.random.default_rng(seed)
+
+    best: dict[str, Any] | None = None
+    rejected_for_collision = 0
+    for index in range(int(n_candidates)):
+        a, b, offset = sample_candidate(asset, config, rng, time)
+        q, dq, ddq = evaluate_series(a, b, offset, omega, time)
+        # Conditioning is a property of the sampled state distribution, so a
+        # strided subset is enough and keeps the search affordable.
+        condition = idn.regressor_condition(
+            pin, model, data, q[::condition_stride], dq[::condition_stride], ddq[::condition_stride],
+            basis, include_friction=include_friction,
+        )
+        if not np.isfinite(condition):
+            continue
+        if best is not None and condition >= best["condition"]:
+            continue
+        if kinematics is not None:
+            report = kinematics.validate_path(
+                q,
+                margin=float(asset.metadata.get("collision", {}).get("margin", 0.0)),
+                max_joint_step=float(asset.metadata.get("collision", {}).get("max_joint_step", 0.05)),
+            )
+            if not report.valid:
+                rejected_for_collision += 1
+                continue
+        best = {"condition": condition, "a": a, "b": b, "offset": offset, "index": index,
+                "q": q, "dq": dq, "ddq": ddq}
+
+    if best is None:
+        raise RuntimeError(
+            f"No feasible excitation trajectory found for {asset.name!r} in {n_candidates} candidates "
+            f"({rejected_for_collision} rejected for collision)"
+        )
+
+    metadata = {
+        "generator": "fourier_excitation",
+        "asset": asset.name,
+        "seed": int(seed),
+        "condition_number": float(best["condition"]),
+        "n_harmonics": int(config.n_harmonics),
+        "base_frequency": float(config.base_frequency),
+        "n_periods": int(config.n_periods),
+        "limit_margin": float(config.limit_margin),
+        "max_acceleration": float(config.max_acceleration),
+        "velocity_fraction": float(config.velocity_fraction),
+        "candidates": int(n_candidates),
+        "candidate_index": int(best["index"]),
+        "collision_rejections": int(rejected_for_collision),
+        "include_friction": bool(include_friction),
+        "coefficients_a": np.asarray(best["a"]).tolist(),
+        "coefficients_b": np.asarray(best["b"]).tolist(),
+        "offset": np.asarray(best["offset"]).tolist(),
+        **dict(config.metadata),
+    }
+    return MaterializedTrajectory(
+        time=time,
+        position=best["q"],
+        velocity=best["dq"],
+        acceleration=best["ddq"],
+        joint_names=tuple(asset.joint_names),
+        metadata=metadata,
+    )
+
+
+def trajectory_from_metadata(
+    asset: AssetSpec, metadata: dict, *, time_step: float | None = None
+) -> MaterializedTrajectory:
+    """Rebuild an excitation trajectory from its stored coefficients."""
+    a = np.asarray(metadata["coefficients_a"], dtype=float)
+    b = np.asarray(metadata["coefficients_b"], dtype=float)
+    offset = np.asarray(metadata["offset"], dtype=float)
+    base_frequency = float(metadata["base_frequency"])
+    n_periods = int(metadata.get("n_periods", 1))
+    step = float(time_step if time_step is not None else metadata.get("time_step", 0.002))
+    duration = n_periods / base_frequency
+    time = np.arange(0.0, duration + 0.5 * step, step)
+    q, dq, ddq = evaluate_series(a, b, offset, 2.0 * np.pi * base_frequency, time)
+    return MaterializedTrajectory(
+        time=time, position=q, velocity=dq, acceleration=ddq,
+        joint_names=tuple(asset.joint_names), metadata=dict(metadata),
+    )

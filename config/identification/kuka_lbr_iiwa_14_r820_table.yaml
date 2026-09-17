@@ -1,0 +1,60 @@
+# Default settings for the simulation-only identification workflow.
+#
+# Shared by scripts/generate_identification_dataset.py (whole dataset) and
+# scripts/run_identification_simulation.py (one rollout, optionally with a
+# viewer).  Every key here can still be overridden on the command line.
+schema_version: 1
+
+asset: kuka_lbr_iiwa_14_r820_table
+
+# Simulator backends.  Newton's SolverFeatherstone is an independent
+# cross-check on the rigid tier; on elastic tiers Newton falls back to
+# SolverMuJoCo and is therefore not independent (see docs).
+backends: [mujoco, newton]
+
+# Model-fidelity tiers.  `rigid` is the reference tier, validated against
+# Pinocchio's analytic inverse dynamics.  The stiffness ladder runs from
+# near-rigid down to visibly compliant.
+tiers:
+  rigid: true
+  stiffness: [1.0e6, 4.0e4]
+  transmission_damping_ratio: 0.1
+  rotor_inertia: 0.1          # reflected motor inertia [kg m^2], as armature
+
+# Periodic Fourier excitation.
+#
+# These two values decide dataset quality, so they default to the good end of
+# the range rather than the fast end.  A longer period and a wider candidate
+# search both lower the regressor condition number, and that number is the
+# factor by which torque error is amplified into parameter error:
+#
+#   base_frequency 0.1 Hz (10 s), candidates 48  ->  condition ~150
+#   base_frequency 0.5 Hz  (2 s), candidates 8   ->  condition ~38000
+#
+# Pass --base-frequency 0.5 --candidates 8 for a quick smoke run.
+excitation:
+  n_harmonics: 5
+  base_frequency: 0.1         # Hz; trajectory period is 1/base_frequency
+  n_periods: 1
+  limit_margin: 0.12          # fraction of joint span kept clear of limits
+  velocity_fraction: 0.6      # fraction of the URDF velocity limit
+  max_acceleration: 2.0       # rad/s^2
+  candidates: 48              # random candidates scored per trajectory
+
+dataset:
+  trajectories: 2
+  friction_samples: 2
+  friction_scale: [0.5, 2.0]  # log-uniform multiplier on the URDF values
+  seed: 20260917
+  output: data/identification/kuka_lbr_iiwa_14_r820_table.csv
+
+simulation:
+  control_frequency: 25.0     # closed-loop bandwidth [rad/s]
+  control_damping_ratio: 1.0
+  rigid_time_step: 5.0e-4
+  max_time_step: 5.0e-4       # elastic tiers may need less; never more
+  sample_time_step: 0.002     # uniform output grid [s]
+
+visualization:
+  enabled: false
+  realtime_scale: 1.0         # 1.0 is real time; raise it to fast-forward

@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Run and inspect ONE identification rollout, without writing a dataset.
+
+This is the debugging counterpart to ``generate_identification_dataset.py``.
+It shares the same YAML config, runs a single trajectory under a single tier
+and backend, prints whether the numbers make sense, and saves nothing unless
+``--output`` is given.
+
+Examples
+--------
+Watch the arm execute an excitation trajectory::
+
+    python scripts/run_identification_simulation.py --visualize
+
+Check a trajectory without starting a simulator at all::
+
+    python scripts/run_identification_simulation.py --trajectory-only
+
+Inspect the softest tier in Newton and keep the samples::
+
+    python scripts/run_identification_simulation.py \
+        --tier k1e04 --backend newton --output /tmp/one_rollout.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, os.fspath(_REPO / "src"))
+
+from elastic_sim import excitation as exc
+from elastic_sim import identification as idn
+from elastic_sim.assets import AssetRegistry, load_asset_spec
+from elastic_sim.dataset import DEFAULT_CONFIG, RIGID_TIER, load_config, rollout_frame, run_condition
+from elastic_sim.kinematics import PortableKinematics
+
+
+def _load_asset(reference: str):
+    candidate = Path(reference)
+    if candidate.is_file():
+        return load_asset_spec(candidate)
+    return AssetRegistry.for_repository(_REPO).load(reference)
+
+
+def _resolve(path: str) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else _REPO / candidate
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML defaults (see config/identification/)")
+    parser.add_argument("--asset", default=None)
+    parser.add_argument("--backend", default=None, choices=("mujoco", "newton"))
+    parser.add_argument("--tier", default=None, help=f"Tier name, e.g. {RIGID_TIER} or k4e04")
+    parser.add_argument("--seed", type=int, default=None, help="Trajectory seed")
+    parser.add_argument("--base-frequency", type=float, default=None)
+    parser.add_argument("--max-acceleration", type=float, default=None)
+    parser.add_argument("--candidates", type=int, default=None)
+    parser.add_argument("--control-frequency", type=float, default=None)
+    parser.add_argument("--visualize", action="store_true", help="Open the native viewer")
+    parser.add_argument("--realtime-scale", type=float, default=None, help="1.0 is real time")
+    parser.add_argument("--trajectory-only", action="store_true",
+                        help="Design and check the trajectory; do not simulate")
+    parser.add_argument("--save-trajectory", default=None, help="Optional trajectory JSON path")
+    parser.add_argument("--output", default=None, help="Optional CSV; nothing is written without it")
+    args = parser.parse_args()
+
+    config = load_config(_resolve(args.config))
+    asset_name = args.asset or config.asset
+    asset = _load_asset(asset_name)
+    asset.resolve_active_joints()
+    asset.validate_resources()
+
+    excitation = config.excitation
+    if args.base_frequency is not None or args.max_acceleration is not None:
+        excitation = exc.FourierExcitationConfig(
+            n_harmonics=excitation.n_harmonics,
+            base_frequency=args.base_frequency or excitation.base_frequency,
+            n_periods=excitation.n_periods,
+            time_step=excitation.time_step,
+            limit_margin=excitation.limit_margin,
+            max_acceleration=args.max_acceleration or excitation.max_acceleration,
+            velocity_fraction=excitation.velocity_fraction,
+        )
+    seed = config.seed if args.seed is None else args.seed
+    candidates = args.candidates or config.candidates
+
+    print(f"asset      : {asset.name} ({len(asset.joint_names)} joints)")
+    print(f"config     : {_resolve(args.config)}")
+    kinematics = PortableKinematics(asset)
+    trajectory = exc.optimize_excitation(
+        asset, excitation, seed=seed, n_candidates=candidates, kinematics=kinematics
+    )
+    _report_trajectory(asset, trajectory, kinematics)
+    if args.save_trajectory:
+        trajectory.save(args.save_trajectory)
+        print(f"  saved trajectory to {args.save_trajectory}")
+    if args.trajectory_only:
+        return
+
+    tier_name = args.tier or config.tiers[0].name
+    matches = [tier for tier in config.tiers if tier.name == tier_name]
+    if not matches:
+        parser.error(f"unknown tier {tier_name!r}; config has {[t.name for t in config.tiers]}")
+    tier = matches[0]
+    backend = args.backend or config.backends[0]
+
+    from dataclasses import replace
+
+    run_config = replace(
+        config,
+        visualize=bool(args.visualize) or config.visualize,
+        realtime_scale=args.realtime_scale if args.realtime_scale is not None else config.realtime_scale,
+        control_frequency=args.control_frequency or config.control_frequency,
+    )
+    friction = idn.FrictionModel.from_asset(asset)
+    print(f"\ntier {tier.name!r} on {backend}"
+          + ("" if tier.is_rigid else f" (stiffness {tier.stiffness:.3g} Nm/rad)")
+          + (" with viewer" if run_config.visualize else ""))
+    result = run_condition(asset, trajectory, tier, backend, friction, run_config)
+    _report_rollout(asset, result, friction)
+
+    if not args.output:
+        print("\nNothing written (pass --output to save this rollout).")
+        return
+    frame = rollout_frame(
+        asset, trajectory, result, bag=f"{tier.name}_{backend}", tier=tier,
+        backend=backend, friction=friction, resample_step=config.sample_time_step,
+    )
+    target = Path(args.output).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(target, index=False)
+    print(f"\nWrote {len(frame)} samples to {target}")
+
+
+def _report_trajectory(asset, trajectory, kinematics) -> None:
+    metadata = trajectory.metadata
+    lower, upper, velocity = exc.joint_bounds(
+        asset,
+        exc.FourierExcitationConfig(
+            n_harmonics=metadata["n_harmonics"], base_frequency=metadata["base_frequency"],
+            n_periods=metadata["n_periods"], limit_margin=metadata["limit_margin"],
+            max_acceleration=metadata["max_acceleration"],
+            velocity_fraction=metadata["velocity_fraction"],
+        ),
+    )
+    print(f"\ntrajectory : {trajectory.duration:.2f}s, {len(trajectory.time)} samples, "
+          f"seed {metadata['seed']}")
+    print(f"  regressor condition number : {metadata['condition_number']:.0f}"
+          "   (lower excites the dynamics better)")
+    print(f"  peak |dq| / limit          : "
+          f"{np.round(np.abs(trajectory.velocity).max(axis=0) / velocity, 2)}")
+    print(f"  peak |ddq|                 : {np.abs(trajectory.acceleration).max():.3f} "
+          f"/ {metadata['max_acceleration']:.3f} rad/s^2")
+    print(f"  starts and ends at rest    : "
+          f"{bool(np.abs(trajectory.velocity[[0, -1]]).max() < 1e-9)}")
+    inside = bool((trajectory.position >= lower - 1e-9).all() and (trajectory.position <= upper + 1e-9).all())
+    print(f"  inside joint-limit band    : {inside}")
+    margin = float(asset.metadata.get("collision", {}).get("margin", 0.0))
+    report = kinematics.validate_path(
+        trajectory.position, margin=margin,
+        max_joint_step=float(asset.metadata.get("collision", {}).get("max_joint_step", 0.05)),
+    )
+    print(f"  collision-free (margin {margin:g}) : {report.valid} "
+          f"(closest {report.minimum_distance:.4f} m, {report.closest_pair})")
+
+
+def _report_rollout(asset, result, friction) -> None:
+    q, dq, ddq = result["q_link"], result["dq_link"], result["ddq_link"]
+    tau, q_ref = result["tau_motor"], result["q_ref"]
+    print(f"  wall time                  : {result['wall_time']:.1f}s"
+          + (f" ({result['solver']})" if "solver" in result else ""))
+    print(f"  tracking RMS |q - q_ref|   : {np.sqrt(np.mean((q - q_ref) ** 2)):.3e} rad")
+    print(f"  max |q - q_ref|            : {np.abs(q - q_ref).max():.3e} rad")
+    ratio = np.mean(np.abs(result["tau_feedback"])) / max(np.mean(np.abs(result["tau_feedforward"])), 1e-12)
+    print(f"  feedback / feedforward     : {ratio:.4f}   (small means the data is dynamics, not control)")
+    limits = np.asarray([j.effort or np.inf for j in asset.resolve_active_joints()])
+    print(f"  torque RMS per joint [Nm]  : {np.round(np.sqrt(np.mean(tau ** 2, axis=0)), 2)}")
+    print(f"  peak |tau| / effort limit  : {np.round(np.abs(tau).max(axis=0) / limits, 3)}")
+    if result.get("mode") == "elastic":
+        deflection = np.abs(result["q_link"] - result["q_motor"])
+        print(f"  max transmission deflection: {deflection.max():.3e} rad")
+        print(f"  RMS |tau_link - tau_motor| : "
+              f"{np.sqrt(np.mean((result['tau_link'] - tau) ** 2)):.3f} Nm  (target vs input)")
+        if not result.get("independent_of_mujoco", True):
+            print("  note: this Newton run uses SolverMuJoCo and is not independent of MuJoCo")
+    else:
+        pin, model, data = idn.build_model(asset)
+        stride = slice(None, None, max(1, len(q) // 400))
+        predicted = np.asarray([
+            idn.inverse_dynamics(pin, model, data, qi, dqi, ddqi, friction=friction)
+            for qi, dqi, ddqi in zip(q[stride], dq[stride], ddq[stride])
+        ])
+        residual = tau[stride] - predicted
+        print(f"  |tau - inverse dynamics|   : {np.sqrt(np.mean(residual ** 2)):.3e} Nm "
+              "(should be ~0: the label must match the model)")
+
+
+if __name__ == "__main__":
+    main()
