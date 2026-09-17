@@ -325,7 +325,7 @@ def run_mujoco_torque(
         ff_rows.append(command.feedforward)
         fb_rows.append(command.feedback)
         if pacer.should_render(index):
-            viewer.render(q)
+            viewer.render(float(sample_time), q)
             pacer.pace()
         if index + 1 == len(grid):
             break
@@ -721,7 +721,7 @@ def run_mujoco_elastic_torque(
         rows["ddq"].append(np.asarray([data.qacc[addresses[n]["motor_dof"]] + data.qacc[addresses[n]["elastic_dof"]]
                                        for n in names]))
         if pacer.should_render(index):
-            viewer.render(link_q)
+            viewer.render(float(sample_time), link_q)
             pacer.pace()
         if index + 1 == len(grid):
             break

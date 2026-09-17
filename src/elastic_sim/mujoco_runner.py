@@ -442,7 +442,7 @@ def run_rollout(
             tau_motor_list.append(tau_motor)
             tau_link_list.append(tau_link)
         if viewer is not None:
-            viewer.render(np.array([q_meas[ex], q_meas[ey], q_meas[ez]]))
+            viewer.render(t, np.array([q_meas[ex], q_meas[ey], q_meas[ez]]))
             import time as time_module
             time_module.sleep(time_step / realtime_scale)
         if sample_index + 1 >= len(time_grid):

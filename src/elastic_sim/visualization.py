@@ -28,7 +28,8 @@ class NewtonVisualizer:
     def __init__(self, asset: AssetSpec, trajectory: Any) -> None:
         self.asset, self.trajectory = asset, trajectory
         self.kinematics = PortableKinematics(asset)
-        self.reference = cartesian_samples(self.kinematics, _trajectory_positions(trajectory))
+        self.reference_time, positions = _trajectory_samples(trajectory)
+        self.reference = cartesian_samples(self.kinematics, positions)
         self.actual: dict[str, list[np.ndarray]] = {name: [] for name in self.reference}
         self.viewer = None
         self._frame_index = 0
@@ -73,7 +74,7 @@ class NewtonVisualizer:
                     wp.array(actual[1:], dtype=wp.vec3, device=self.viewer.device),
                     _WARNING_COLOR if warning else (1.0, 0.9, 0.2), width=0.009,
                 )
-            target = wp.array([reference[min(len(reference) - 1, len(actual) - 1), :3]], dtype=wp.vec3, device=self.viewer.device)
+            target = wp.array([_reference_at(reference, self.reference_time, sim_time)], dtype=wp.vec3, device=self.viewer.device)
             # ViewerGL's signature accepts scalar radii and tuple colors, but its
             # GL instancer only handles warp arrays, so pass arrays explicitly.
             self.viewer.log_points(
@@ -115,7 +116,8 @@ class MujocoVisualizer:
     def __init__(self, asset: AssetSpec, trajectory: Any) -> None:
         self.asset, self.trajectory = asset, trajectory
         self.kinematics = PortableKinematics(asset)
-        self.reference = cartesian_samples(self.kinematics, _trajectory_positions(trajectory))
+        self.reference_time, positions = _trajectory_samples(trajectory)
+        self.reference = cartesian_samples(self.kinematics, positions)
         self.actual: dict[str, list[np.ndarray]] = {name: [] for name in self.reference}
         self.viewer = None
         self._frame_index = 0
@@ -132,7 +134,7 @@ class MujocoVisualizer:
     def is_running(self) -> bool:
         return self.viewer is not None and self.viewer.is_running()
 
-    def render(self, q: np.ndarray) -> None:
+    def render(self, sim_time: float, q: np.ndarray) -> None:
         if self.viewer is None:
             return
         import mujoco
@@ -146,7 +148,7 @@ class MujocoVisualizer:
             _mujoco_polyline(mujoco, scene, _thin(reference[:, :3], 180), (*_COLORS[index % len(_COLORS)], 0.8), 0.006)
             actual_color = (*(_WARNING_COLOR if warning else (1.0, 0.9, 0.2)), 1.0)
             _mujoco_polyline(mujoco, scene, _thin(np.asarray(self.actual[name]), 180), actual_color, 0.009)
-            target = reference[min(len(reference) - 1, len(self.actual[name]) - 1), :3]
+            target = _reference_at(reference, self.reference_time, sim_time)
             _mujoco_point(
                 mujoco, scene, target,
                 (*(_WARNING_COLOR if warning else _COLORS[index % len(_COLORS)]), 1.0), 0.018,
@@ -176,13 +178,28 @@ def _thin(points: np.ndarray, maximum: int = 300) -> np.ndarray:
     return np.asarray(points[indices], dtype=np.float32)
 
 
-def _trajectory_positions(trajectory: Any) -> np.ndarray:
+def _trajectory_samples(trajectory: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(time, joint positions)`` of the planned path."""
     if hasattr(trajectory, "position"):
-        return np.asarray(trajectory.position, dtype=float)
+        position = np.asarray(trajectory.position, dtype=float)
+        time = getattr(trajectory, "time", None)
+        if time is None:
+            time = np.linspace(0.0, float(trajectory.duration), len(position))
+        return np.asarray(time, dtype=float).reshape(-1), position
     from .serial_trajectory import SerialArmTrajectory
     evaluator = SerialArmTrajectory(trajectory)
     count = max(2, min(500, int(np.ceil(trajectory.duration / 0.02)) + 1))
-    return np.asarray([evaluator(t)[0] for t in np.linspace(0.0, trajectory.duration, count)])
+    time = np.linspace(0.0, trajectory.duration, count)
+    return time, np.asarray([evaluator(t)[0] for t in time])
+
+
+def _reference_at(reference: np.ndarray, time: np.ndarray, sim_time: float) -> np.ndarray:
+    """Planned Cartesian position at ``sim_time``.
+
+    Indexed by time, not by frames drawn: runners render only every few
+    integration steps, so a frame count drifts away from the robot.
+    """
+    return np.asarray([np.interp(float(sim_time), time, reference[:, axis]) for axis in range(3)], dtype=np.float32)
 
 
 def _mujoco_polyline(mujoco: Any, scene: Any, points: np.ndarray, rgba: tuple[float, ...], width: float) -> None:

@@ -138,7 +138,7 @@ class GenericMujocoTrajectoryRunner:
                         data.qfrc_applied[dof] += tau[index]
                     mujoco.mj_step(model, data)
                 if viewer is not None:
-                    viewer.render(measured_q)
+                    viewer.render(float(sample_time), measured_q)
                     _sleep(time_step / realtime_scale)
         finally:
             if viewer is not None:
@@ -250,7 +250,7 @@ def _run_explicit_elastic(
                 data.qfrc_applied[addresses[name]["motor_dof"]] = tau[index]
             mujoco.mj_step(model, data)
             if viewer is not None:
-                viewer.render(link_q)
+                viewer.render(float(sample_time), link_q)
                 _sleep(time_step / realtime_scale)
     finally:
         if viewer is not None:
