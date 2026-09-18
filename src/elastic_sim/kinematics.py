@@ -250,7 +250,19 @@ class PortableKinematics:
             raise ValueError("Path shape does not match asset active joints")
         if max_joint_step <= 0.0:
             raise ValueError("collision.max_joint_step must be positive")
-        # Include every materialized sample.  When adjacent samples are too
+        # Drop samples finer than the bound before checking.  Excitation
+        # trajectories are materialized at 2 ms, hundreds of times finer than
+        # the geometry needs, and each dropped sample still lies within
+        # ``max_joint_step`` of a checked one, so the resolution guarantee is
+        # unchanged while the distance queries fall by an order of magnitude.
+        if len(values) > 2:
+            kept = [values[0]]
+            for row in values[1:-1]:
+                if float(np.max(np.abs(row - kept[-1]))) >= max_joint_step:
+                    kept.append(row)
+            kept.append(values[-1])
+            values = np.asarray(kept)
+        # Include every remaining sample.  When adjacent samples are too
         # far apart, recursively bisect the segment (a power-of-two number of
         # subdivisions) until every checked increment is within the bound.
         expanded: list[np.ndarray] = [values[0]]

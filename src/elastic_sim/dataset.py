@@ -13,6 +13,7 @@ both and the joint's inertia, so the config never states a damping value.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -25,6 +26,7 @@ from .assets import AssetSpec
 from .backend_comparison import ComparisonThresholds, compare_backends, format_report, summarize
 from .excitation import FourierExcitationConfig, optimize_excitation
 from .identification import FrictionModel
+from .kinematics import PortableKinematics
 from .materialized import MaterializedTrajectory
 from .torque_runners import (
     ComputedTorqueController,
@@ -162,6 +164,7 @@ class DatasetConfig:
     tiers: tuple[Tier, ...] = (Tier(RIGID_TIER),)
     comparison: ComparisonThresholds = field(default_factory=ComparisonThresholds)
     n_trajectories: int = 4
+    trajectories_per_robot: bool = False
     n_friction_samples: int = 2
     friction_scale_range: tuple[float, float] = (0.5, 2.0)
     seed: int = 20260917
@@ -231,6 +234,7 @@ def load_config(path: str | Path) -> DatasetConfig:
         tiers=tiers,
         comparison=ComparisonThresholds.from_mapping(raw.get("comparison")),
         n_trajectories=int(data_cfg.get("trajectories", 4)),
+        trajectories_per_robot=bool(data_cfg.get("trajectories_per_robot", False)),
         n_friction_samples=int(data_cfg.get("friction_samples", 2)),
         friction_scale_range=(float(scale[0]), float(scale[1])),
         seed=seed,
@@ -242,6 +246,7 @@ def load_config(path: str | Path) -> DatasetConfig:
             limit_margin=float(exc_cfg.get("limit_margin", 0.12)),
             max_acceleration=float(exc_cfg.get("max_acceleration", 3.0)),
             velocity_fraction=float(exc_cfg.get("velocity_fraction", 0.6)),
+            centre_jitter=float(exc_cfg.get("centre_jitter", 0.0)),
         ),
         candidates=int(exc_cfg.get("candidates", 48)),
         control_frequency=float(sim_cfg.get("control_frequency", 25.0)),
@@ -253,6 +258,20 @@ def load_config(path: str | Path) -> DatasetConfig:
         visualize=bool(view_cfg.get("enabled", False)),
         realtime_scale=float(view_cfg.get("realtime_scale", 1.0)),
     )
+
+
+def trajectory_seed(config: DatasetConfig, tier: Tier, index: int) -> int:
+    """Seed of trajectory ``index``, per robot when they are not shared.
+
+    Both scripts derive it the same way, so ``--tier e03`` reproduces the
+    trajectory that robot ran in the dataset.  The per-robot offset comes from
+    the robot's *name*, not its position, so dropping the rigid tier or adding
+    robots leaves the others' trajectories untouched.
+    """
+    if not config.trajectories_per_robot:
+        return config.seed + index
+    digest = hashlib.blake2b(tier.name.encode("utf-8"), digest_size=4).digest()
+    return config.seed + index + 1000 * (1 + int.from_bytes(digest, "big") % 100_000)
 
 
 def sample_friction(base: FrictionModel, rng: np.random.Generator, scale_range: tuple[float, float]) -> FrictionModel:
@@ -430,18 +449,28 @@ def generate(
                       f" | top mode {transmission.natural_frequency().max():.0f} Hz"
                       f" | step {robots[-1]['time_step']:.1e} s")
 
-    trajectories: dict[int, MaterializedTrajectory] = {}
-    for index in range(config.n_trajectories):
-        trajectories[index] = optimize_excitation(
-            asset, config.excitation, seed=config.seed + index, n_candidates=config.candidates
-        )
-        if verbose:
-            print(f"trajectory {index}: condition={trajectories[index].metadata['condition_number']:.0f}")
+    # Contacts are disabled during a rollout, so a trajectory that collides
+    # would be simulated straight through the geometry: validate here, where
+    # the trajectory is chosen, rather than trusting it afterwards.
+    kinematics = PortableKinematics(asset)
+    trajectories: dict[tuple[str, int], MaterializedTrajectory] = {}
+    for tier in (config.tiers if config.trajectories_per_robot else config.tiers[:1]):
+        key = tier.name if config.trajectories_per_robot else ""
+        for index in range(config.n_trajectories):
+            trajectories[(key, index)] = optimize_excitation(
+                asset, config.excitation, seed=trajectory_seed(config, tier, index),
+                n_candidates=config.candidates, kinematics=kinematics,
+            )
+            if verbose:
+                metadata = trajectories[(key, index)].metadata
+                label = f"trajectory {index}" + (f" for {tier.name}" if config.trajectories_per_robot else "")
+                print(f"{label}: condition={metadata['condition_number']:.0f}"
+                      f" ({metadata['collision_rejections']} candidates rejected for collision)")
 
     frames: list[pd.DataFrame] = []
     records: list[dict[str, Any]] = []
     for bag_index, (traj_index, tier, friction_index, backend) in enumerate(iter_conditions(config)):
-        trajectory = trajectories[traj_index]
+        trajectory = trajectories[(tier.name if config.trajectories_per_robot else "", traj_index)]
         friction = frictions[friction_index]
         bag = f"t{traj_index}_{tier.name}_f{friction_index}_{backend}"
         result = run_condition(asset, trajectory, tier, backend, friction, config, link_inertia=link_inertia)
@@ -478,6 +507,8 @@ def generate(
         "joint_names": list(asset.joint_names),
         "sample_time_step": config.sample_time_step,
         "seed": config.seed,
+        "trajectories_per_robot": config.trajectories_per_robot,
+        "distinct_trajectories": len(trajectories),
         "backends": list(config.backends),
         "tiers": [t.name for t in config.tiers],
         "rigid_reference": config.rigid_reference,

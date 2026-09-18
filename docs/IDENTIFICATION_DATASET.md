@@ -25,7 +25,7 @@ uv run python scripts/generate_identification_dataset.py
 # ...or override whatever you need.
 uv run python scripts/generate_identification_dataset.py \
     --backends mujoco --robots 12 \
-    --trajectories 8 --friction-samples 3 \
+    --trajectories 10 --no-rigid \
     --output data/identification/iiwa14_table.csv
 
 # 3. Re-check MuJoCo/Newton agreement of a written dataset, no simulation.
@@ -67,7 +67,7 @@ so a whole dataset build can be watched or rehearsed without writing anything.
 
 Lower `--base-frequency` and more `--candidates` give a better-conditioned
 trajectory. The config defaults to the good end (0.1 Hz over 10 s, 48
-candidates, condition number ≈150); `--base-frequency 0.5 --candidates 8` runs
+candidates, condition number ≈110); `--base-frequency 0.5 --candidates 8` runs
 in a fraction of the time but conditions around 38000, which amplifies torque
 error into parameter error by the same factor. Use the fast values for smoke
 runs, not for a dataset you intend to train on.
@@ -250,6 +250,30 @@ Measured near-rigid convergence (MuJoCo, 2 s excitation, uniform stiffness):
 | 2e5 | 2.7e-4 | 7.1e-5 |
 | 4e4 | 1.4e-3 | 3.3e-4 |
 | 1e4 | 6.2e-3 | 1.3e-3 |
+
+### Friction is not a useful axis of variation
+
+`friction_samples` defaults to 1, and raising it does not add information.
+The controller compensates friction exactly and the runner subtracts the same
+friction from the plant, so it cancels: two friction samples of one condition
+produce bit-identical motion and a bit-identical link-side target, differing
+only in the recorded motor torque. For a model learning `ft` from
+`(q, dq, tau)` that is a contradiction, not extra data. Vary robots and
+trajectories instead.
+
+A friction sample would only become a real condition if the controller were
+given a *different* friction model from the plant, which is a deliberate
+model-mismatch experiment rather than a dataset axis.
+
+### What the payload-free wrist can teach
+
+The learning target is the link-side torque. With no tool fitted, the link
+past the A7 transmission is the bare flange (`M_77 = 3e-4 kg m^2`), so its
+link-side torque is essentially zero: measured RMS per joint is about
+`[1.3, 31, 1.7, 9.7, 0.2, 0.2, 0.0] Nm`, while the *motor* torque at those
+joints is 4-7 Nm of friction and rotor inertia. The distal channels therefore
+carry almost no signal, and per-channel normalization will amplify their
+noise. Only a payload or tool changes this; larger accelerations do not.
 
 ## Backend comparison
 

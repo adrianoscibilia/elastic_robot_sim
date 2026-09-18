@@ -39,6 +39,7 @@ from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.dataset import (
     DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, rollout_frame, run_condition,
+    trajectory_seed,
 )
 from elastic_sim.kinematics import PortableKinematics
 from elastic_sim.torque_runners import link_inertia_envelope
@@ -81,18 +82,22 @@ def main() -> None:
     asset.resolve_active_joints()
     asset.validate_resources()
 
+    from dataclasses import replace
+
     excitation = config.excitation
     if args.base_frequency is not None or args.max_acceleration is not None:
-        excitation = exc.FourierExcitationConfig(
-            n_harmonics=excitation.n_harmonics,
+        excitation = replace(
+            excitation,
             base_frequency=args.base_frequency or excitation.base_frequency,
-            n_periods=excitation.n_periods,
-            time_step=excitation.time_step,
-            limit_margin=excitation.limit_margin,
             max_acceleration=args.max_acceleration or excitation.max_acceleration,
-            velocity_fraction=excitation.velocity_fraction,
         )
-    seed = config.seed if args.seed is None else args.seed
+    tier_name = args.tier or config.tiers[0].name
+    matches = [tier for tier in config.tiers if tier.name == tier_name]
+    if not matches:
+        parser.error(f"unknown tier {tier_name!r}; config has {[t.name for t in config.tiers]}")
+    tier = matches[0]
+    # Same rule as the dataset, so --tier eNN reproduces that robot's trajectory.
+    seed = trajectory_seed(config, tier, 0) if args.seed is None else args.seed
     candidates = args.candidates or config.candidates
 
     print(f"asset      : {asset.name} ({len(asset.joint_names)} joints)")
@@ -108,14 +113,7 @@ def main() -> None:
     if args.trajectory_only:
         return
 
-    tier_name = args.tier or config.tiers[0].name
-    matches = [tier for tier in config.tiers if tier.name == tier_name]
-    if not matches:
-        parser.error(f"unknown tier {tier_name!r}; config has {[t.name for t in config.tiers]}")
-    tier = matches[0]
     backend = args.backend or config.backends[0]
-
-    from dataclasses import replace
 
     run_config = replace(
         config,

@@ -62,13 +62,26 @@ excitation:
   base_frequency: 0.1         # Hz; trajectory period is 1/base_frequency
   n_periods: 1
   limit_margin: 0.12          # fraction of joint span kept clear of limits
-  velocity_fraction: 0.6      # fraction of the URDF velocity limit
-  max_acceleration: 2.0       # rad/s^2
+  velocity_fraction: 0.75     # fraction of the URDF velocity limit
+  max_acceleration: 4.0       # rad/s^2
+  # 0 centres every trajectory in the middle of the joint range, 1 spreads the
+  # centres over the whole feasible band.  Spreading them changes the gravity
+  # load from trajectory to trajectory, which is where most of the information
+  # in the dataset comes from; it raises joint-range coverage from ~0.6 to
+  # ~0.8 without hurting the regressor condition number.
+  centre_jitter: 1.0
   candidates: 48              # random candidates scored per trajectory
 
 dataset:
-  trajectories: 2
-  friction_samples: 2
+  trajectories: 10
+  # Give every elastic variant its own trajectories instead of replaying one
+  # shared set: the file then holds robots x trajectories distinct paths.
+  trajectories_per_robot: true
+  # Friction is compensated exactly by the controller and subtracted from the
+  # plant, so it cancels: sampling it leaves the motion and the link-side
+  # target untouched and only shifts the recorded motor torque.  One sample,
+  # the URDF's own values, is therefore all that is meaningful here.
+  friction_samples: 1
   friction_scale: [0.5, 2.0]  # log-uniform multiplier on the URDF values
   seed: 20260917
   output: data/identification/kuka_lbr_iiwa_14_r820_table.csv

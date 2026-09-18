@@ -40,6 +40,11 @@ class FourierExcitationConfig:
     limit_margin: float = 0.12
     max_acceleration: float = 3.0
     velocity_fraction: float = 0.6
+    # Fraction of the feasible operating band the trajectory centre is drawn
+    # from: 0 pins every trajectory to the middle of the joint range, 1 spreads
+    # them over the whole band the amplitude leaves free.  Spreading the centre
+    # is what varies the gravity load, and so what a dataset learns from.
+    centre_jitter: float = 0.0
     settle_time: float = 0.0
     metadata: dict = field(default_factory=dict)
 
@@ -56,6 +61,8 @@ class FourierExcitationConfig:
             raise ValueError("max_acceleration must be positive")
         if not 0.0 < self.velocity_fraction <= 1.0:
             raise ValueError("velocity_fraction must be in (0, 1]")
+        if not 0.0 <= self.centre_jitter <= 1.0:
+            raise ValueError("centre_jitter must be in [0, 1]")
 
     @property
     def period(self) -> float:
@@ -125,6 +132,8 @@ def _fit_to_limits(
     safe_upper: np.ndarray,
     velocity_limit: np.ndarray,
     max_acceleration: float,
+    rng: np.random.Generator | None = None,
+    centre_jitter: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Scale each joint's series to the largest feasible amplitude.
 
@@ -133,7 +142,6 @@ def _fit_to_limits(
     once and one pass is exact.  Scaling *up* is allowed and wanted: a larger
     feasible amplitude excites the dynamics more.
     """
-    centre = 0.5 * (safe_lower + safe_upper)
     q, dq, ddq = evaluate_series(a, b, np.zeros(a.shape[0]), omega, time)
     half_span = 0.5 * (safe_upper - safe_lower)
     deviation = 0.5 * (q.max(axis=0) - q.min(axis=0))
@@ -153,9 +161,15 @@ def _fit_to_limits(
     a = a * scale[:, None]
     b = b * scale[:, None]
     q, _, _ = evaluate_series(a, b, np.zeros(a.shape[0]), omega, time)
-    # Centre the achieved range inside the safe band.
-    offset = centre - 0.5 * (q.max(axis=0) + q.min(axis=0))
-    return a, b, offset
+    # Offsets that keep the achieved range inside the safe band.  Their middle
+    # centres the motion in the joint range, as every trajectory did before
+    # ``centre_jitter``; anywhere in between is equally feasible.
+    lowest, highest = safe_lower - q.min(axis=0), safe_upper - q.max(axis=0)
+    middle = 0.5 * (lowest + highest)
+    if rng is None or centre_jitter <= 0.0:
+        return a, b, middle
+    drawn = rng.uniform(np.minimum(lowest, highest), np.maximum(lowest, highest))
+    return a, b, middle + centre_jitter * (drawn - middle)
 
 
 def sample_candidate(
@@ -171,7 +185,8 @@ def sample_candidate(
     b = rng.normal(size=(n, config.n_harmonics))
     a, b = project_coefficients(a, b)
     omega = 2.0 * np.pi * config.base_frequency
-    return _fit_to_limits(a, b, omega, time, safe_lower, safe_upper, velocity_limit, config.max_acceleration)
+    return _fit_to_limits(a, b, omega, time, safe_lower, safe_upper, velocity_limit,
+                          config.max_acceleration, rng=rng, centre_jitter=config.centre_jitter)
 
 
 def optimize_excitation(
@@ -246,6 +261,7 @@ def optimize_excitation(
         "limit_margin": float(config.limit_margin),
         "max_acceleration": float(config.max_acceleration),
         "velocity_fraction": float(config.velocity_fraction),
+        "centre_jitter": float(config.centre_jitter),
         "candidates": int(n_candidates),
         "candidate_index": int(best["index"]),
         "collision_rejections": int(rejected_for_collision),

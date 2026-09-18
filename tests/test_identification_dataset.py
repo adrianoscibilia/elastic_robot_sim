@@ -206,6 +206,52 @@ def test_excitation_beats_random_point_to_point(asset, model):
     assert optimized < np.median(baseline)
 
 
+def test_centre_jitter_spreads_operating_points_without_leaving_limits(asset):
+    """Coverage of the joint range is what varies the gravity load."""
+    lower, upper = np.array([j.lower for j in asset.resolve_active_joints()]), np.array(
+        [j.upper for j in asset.resolve_active_joints()]
+    )
+    centres = {}
+    for jitter in (0.0, 1.0):
+        config = exc.FourierExcitationConfig(
+            n_harmonics=4, base_frequency=0.5, time_step=0.002, max_acceleration=2.0, centre_jitter=jitter
+        )
+        trajectories = [exc.optimize_excitation(asset, config, seed=s, n_candidates=4) for s in range(6)]
+        for trajectory in trajectories:
+            assert (trajectory.position >= lower - 1e-9).all() and (trajectory.position <= upper + 1e-9).all()
+        centres[jitter] = np.asarray([t.position.mean(axis=0) for t in trajectories])
+    assert centres[1.0].std(axis=0).mean() > 2.0 * centres[0.0].std(axis=0).mean()
+
+
+def test_path_validation_decimates_without_missing_a_collision(asset):
+    """Checking every 2 ms sample is far finer than the geometry needs."""
+    kinematics = PortableKinematics(asset)
+    home = np.asarray(asset.metadata["default_configuration"], dtype=float)
+    penetrating = np.array([0.0, -2.09, 0.0, 1.219, 0.0, 0.0, 0.0])
+    path = np.repeat(home[None, :], 1001, axis=0)
+    ramp = np.linspace(0.0, 1.0, 40)
+    path[480:520] = home + np.outer(ramp, penetrating - home)
+    path[520:560] = penetrating + np.outer(ramp, home - penetrating)
+    decimated = kinematics.validate_path(path, margin=0.01, max_joint_step=0.05)
+    every_sample = kinematics.collision_report(path, margin=0.01)
+    assert decimated.valid is every_sample.valid is False
+    assert decimated.minimum_distance == pytest.approx(every_sample.minimum_distance, abs=1e-9)
+    assert decimated.checked_configurations < len(path) // 4, "decimation must actually cut the work"
+    clear = kinematics.validate_path(np.repeat(home[None, :], 1001, axis=0), margin=0.01, max_joint_step=0.05)
+    assert clear.valid
+
+
+def test_trajectory_seeds_differ_per_robot_when_not_shared():
+    from elastic_sim.dataset import DatasetConfig, Tier, trajectory_seed
+
+    tiers = (Tier("rigid"), Tier("e00", stiffness=1.0e4), Tier("e01", stiffness=2.0e4))
+    shared = DatasetConfig(tiers=tiers, seed=100, trajectories_per_robot=False)
+    per_robot = DatasetConfig(tiers=tiers, seed=100, trajectories_per_robot=True)
+    assert [trajectory_seed(shared, tier, 0) for tier in tiers] == [100, 100, 100]
+    seeds = [trajectory_seed(per_robot, tier, index) for tier in tiers for index in range(3)]
+    assert len(set(seeds)) == len(seeds), "every robot/index pair needs its own trajectory"
+
+
 def test_excitation_round_trips_through_metadata(asset, short_trajectory):
     rebuilt = exc.trajectory_from_metadata(
         asset, short_trajectory.metadata, time_step=float(np.diff(short_trajectory.time)[0])
