@@ -1,16 +1,20 @@
 """Identification dataset generation and export.
 
-One *condition* is a choice of model tier (rigid or a transmission stiffness),
-a friction sample and a simulator backend.  One *bag* is one excitation
-trajectory executed under one condition.  The generator writes the
-repository's canonical wide parquet for every bag; the exporter flattens a run
-into the single CSV that ``dynamic_model_nn`` consumes.
+One *condition* is a choice of model tier (the rigid reference or one sampled
+elastic robot), a friction sample and a simulator backend.  One *bag* is one
+excitation trajectory executed under one condition.  The exporter flattens a
+run into the single CSV that ``dynamic_model_nn`` consumes.
+
+Elastic robots are sampled rather than laddered: every joint draws its own
+transmission stiffness log-uniformly from a physically plausible interval and
+its own damping ratio uniformly, and the damping coefficient is derived from
+both and the joint's inertia, so the config never states a damping value.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -18,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .assets import AssetSpec
+from .backend_comparison import ComparisonThresholds, compare_backends, format_report, summarize
 from .excitation import FourierExcitationConfig, optimize_excitation
 from .identification import FrictionModel
 from .materialized import MaterializedTrajectory
@@ -25,6 +30,7 @@ from .torque_runners import (
     ComputedTorqueController,
     SeaMotorController,
     TransmissionSpec,
+    link_inertia_envelope,
     run_mujoco_elastic_torque,
     run_mujoco_torque,
     run_newton_elastic_torque,
@@ -33,38 +39,108 @@ from .torque_runners import (
 
 RIGID_TIER = "rigid"
 
+# (median, minimum) link-side inertia per joint, see ``link_inertia_envelope``.
+LinkInertia = tuple[np.ndarray, np.ndarray]
+
+
+def _per_joint(values: Sequence[float], n_dof: int, name: str) -> np.ndarray:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    if len(array) not in (1, n_dof):
+        raise ValueError(f"{name} has {len(array)} values; expected 1 or {n_dof}")
+    return np.broadcast_to(array, (n_dof,)).copy()
+
 
 @dataclass(frozen=True)
 class Tier:
-    """One model-fidelity level of the dataset."""
+    """One model-fidelity level: the rigid reference or one elastic robot.
+
+    Elastic values are per joint; a single value applies to every joint.
+    """
 
     name: str
-    stiffness: float | None = None
-    transmission_damping_ratio: float = 0.1
-    rotor_inertia: float = 0.1
+    stiffness: tuple[float, ...] | None = None
+    damping_ratio: tuple[float, ...] = (0.1,)
+    rotor_inertia: tuple[float, ...] = (0.1,)
+
+    def __post_init__(self) -> None:
+        for name in ("stiffness", "damping_ratio", "rotor_inertia"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, tuple(float(v) for v in np.atleast_1d(np.asarray(value, dtype=float))))
 
     @property
     def is_rigid(self) -> bool:
         return self.stiffness is None
 
-    def transmission(self, n_dof: int) -> TransmissionSpec | None:
+    def transmission(self, n_dof: int, link_inertia: LinkInertia | None = None) -> TransmissionSpec | None:
+        """Build the transmission; without ``link_inertia`` damping uses the rotor alone."""
         if self.is_rigid:
             return None
-        return TransmissionSpec.uniform(
-            n_dof, float(self.stiffness),
-            damping_ratio=self.transmission_damping_ratio,
-            rotor_inertia=self.rotor_inertia,
-        )
+        stiffness = _per_joint(self.stiffness, n_dof, "stiffness")
+        zeta = _per_joint(self.damping_ratio, n_dof, "damping_ratio")
+        rotor = _per_joint(self.rotor_inertia, n_dof, "rotor_inertia")
+        if link_inertia is None:
+            return TransmissionSpec(stiffness, 2.0 * zeta * np.sqrt(stiffness * rotor), rotor, damping_ratio=zeta)
+        nominal, floor = link_inertia
+        return TransmissionSpec.from_damping_ratio(stiffness, zeta, rotor, nominal, floor)
 
 
-def default_tiers(stiffnesses: Sequence[float] = (1.0e6, 2.0e5, 4.0e4, 1.0e4)) -> tuple[Tier, ...]:
-    """Rigid reference plus a stiffness ladder from near-rigid to compliant.
+@dataclass(frozen=True)
+class TransmissionSampling:
+    """How elastic robots are drawn.
 
-    The stiffest tier exists to be checked against the rigid one: if it does
-    not reproduce it, the elastic path is wrong and nothing below it can be
-    trusted.
+    ``stiffness`` holds one ``(min, max)`` interval per joint [Nm/rad], sampled
+    log-uniformly so a wide interval is not dominated by its stiff end.
+    ``damping_ratio`` is one ``(min, max)`` interval shared by all joints and
+    sampled uniformly per joint.  ``rotor_inertia`` is the reflected rotor
+    inertia [kg m^2], one value or one per joint; it is not sampled.
     """
-    return (Tier(RIGID_TIER), *(Tier(f"k{value:.0e}".replace("+", ""), stiffness=value) for value in stiffnesses))
+
+    robots: int = 0
+    stiffness: tuple[tuple[float, float], ...] = ()
+    damping_ratio: tuple[float, float] = (0.05, 0.2)
+    rotor_inertia: tuple[float, ...] = (0.1,)
+    inertia_samples: int = 512
+
+    def __post_init__(self) -> None:
+        if self.robots < 0 or self.inertia_samples < 1:
+            raise ValueError("transmission.robots must be >= 0 and inertia_samples positive")
+        if self.robots and not self.stiffness:
+            raise ValueError("transmission.stiffness needs one [min, max] interval per joint")
+        for low, high in self.stiffness:
+            if not 0.0 < low <= high:
+                raise ValueError(f"stiffness interval [{low}, {high}] must satisfy 0 < min <= max")
+        low, high = self.damping_ratio
+        if not 0.0 <= low <= high:
+            raise ValueError(f"damping_ratio interval [{low}, {high}] must satisfy 0 <= min <= max")
+        if len(self.rotor_inertia) not in (1, max(1, len(self.stiffness))) or min(self.rotor_inertia) <= 0.0:
+            raise ValueError("rotor_inertia needs one positive value or one per joint")
+
+
+def sample_robots(sampling: TransmissionSampling, seed: int) -> tuple[Tier, ...]:
+    """Draw ``sampling.robots`` elastic robots named ``e00, e01, ...``.
+
+    Robots are drawn in order from their own random stream, so a robot's
+    parameters depend only on the seed and its index: raising ``robots`` adds
+    robots without changing the existing ones.
+    """
+    rng = np.random.default_rng((int(seed), 1))
+    intervals = np.asarray(sampling.stiffness, dtype=float).reshape(-1, 2)
+    robots = []
+    for index in range(sampling.robots):
+        stiffness = np.exp(rng.uniform(np.log(intervals[:, 0]), np.log(intervals[:, 1])))
+        zeta = rng.uniform(sampling.damping_ratio[0], sampling.damping_ratio[1], size=len(intervals))
+        robots.append(Tier(f"e{index:02d}", stiffness=tuple(stiffness), damping_ratio=tuple(zeta),
+                           rotor_inertia=sampling.rotor_inertia))
+    return tuple(robots)
+
+
+def build_tiers(rigid_reference: bool, sampling: TransmissionSampling, seed: int) -> tuple[Tier, ...]:
+    """The rigid reference, if kept, followed by the sampled elastic robots."""
+    tiers = ((Tier(RIGID_TIER),) if rigid_reference else ()) + sample_robots(sampling, seed)
+    if not tiers:
+        raise ValueError("no tiers selected: keep the rigid reference or sample at least one robot")
+    return tiers
 
 
 DEFAULT_CONFIG_DIR = "config/identification"
@@ -73,11 +149,18 @@ DEFAULT_CONFIG = "config/identification/kuka_lbr_iiwa_14_r820_table.yaml"
 
 @dataclass(frozen=True)
 class DatasetConfig:
-    """Everything that defines a dataset build."""
+    """Everything that defines a dataset build.
+
+    ``tiers`` is derived from ``rigid_reference``, ``transmission`` and
+    ``seed``; rebuild it with :func:`build_tiers` after changing any of them.
+    """
 
     asset: str = "kuka_lbr_iiwa_14_r820_table"
     backends: tuple[str, ...] = ("mujoco", "newton")
-    tiers: tuple[Tier, ...] = field(default_factory=default_tiers)
+    rigid_reference: bool = True
+    transmission: TransmissionSampling = field(default_factory=TransmissionSampling)
+    tiers: tuple[Tier, ...] = (Tier(RIGID_TIER),)
+    comparison: ComparisonThresholds = field(default_factory=ComparisonThresholds)
     n_trajectories: int = 4
     n_friction_samples: int = 2
     friction_scale_range: tuple[float, float] = (0.5, 2.0)
@@ -94,6 +177,9 @@ class DatasetConfig:
     realtime_scale: float = 1.0
 
 
+_TRANSMISSION_KEYS = {"robots", "stiffness", "damping_ratio", "rotor_inertia", "inertia_samples"}
+
+
 def load_config(path: str | Path) -> DatasetConfig:
     """Read a YAML identification config into a :class:`DatasetConfig`."""
     import yaml
@@ -102,41 +188,52 @@ def load_config(path: str | Path) -> DatasetConfig:
     raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"identification config must be a mapping: {source}")
-    known = {"schema_version", "asset", "backends", "tiers", "excitation",
-             "dataset", "simulation", "visualization"}
+    if "tiers" in raw:
+        raise ValueError(
+            f"{source}: the `tiers` ladder was replaced by `rigid_reference` and a sampled "
+            "`transmission` block (see config/identification/kuka_lbr_iiwa_14_r820_table.yaml)"
+        )
+    known = {"schema_version", "asset", "backends", "rigid_reference", "transmission", "comparison",
+             "excitation", "dataset", "simulation", "visualization"}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown keys in {source}: {', '.join(unknown)}")
 
-    tier_cfg = raw.get("tiers", {}) or {}
-    stiffness = [float(value) for value in tier_cfg.get("stiffness", []) or []]
-    tiers = default_tiers(stiffness)
-    if not tier_cfg.get("rigid", True):
-        tiers = tuple(tier for tier in tiers if not tier.is_rigid)
-    tiers = tuple(
-        tier if tier.is_rigid else Tier(
-            tier.name, tier.stiffness,
-            transmission_damping_ratio=float(tier_cfg.get("transmission_damping_ratio", 0.1)),
-            rotor_inertia=float(tier_cfg.get("rotor_inertia", 0.1)),
-        )
-        for tier in tiers
+    tr_cfg = raw.get("transmission", {}) or {}
+    unknown = sorted(set(tr_cfg) - _TRANSMISSION_KEYS)
+    if unknown:
+        raise ValueError(f"unknown transmission keys in {source}: {', '.join(unknown)}")
+    zeta = tr_cfg.get("damping_ratio", [0.05, 0.2])
+    sampling = TransmissionSampling(
+        robots=int(tr_cfg.get("robots", 0)),
+        stiffness=tuple((float(low), float(high)) for low, high in tr_cfg.get("stiffness", []) or []),
+        damping_ratio=(float(zeta[0]), float(zeta[1])),
+        rotor_inertia=tuple(float(value) for value in np.atleast_1d(tr_cfg.get("rotor_inertia", 0.1))),
+        inertia_samples=int(tr_cfg.get("inertia_samples", 512)),
     )
-    if not tiers:
-        raise ValueError(f"{source} selects no tiers: enable rigid or list stiffness values")
 
     exc_cfg = raw.get("excitation", {}) or {}
     sim_cfg = raw.get("simulation", {}) or {}
     data_cfg = raw.get("dataset", {}) or {}
     view_cfg = raw.get("visualization", {}) or {}
     scale = data_cfg.get("friction_scale", [0.5, 2.0])
+    seed = int(data_cfg.get("seed", 20260917))
+    rigid_reference = bool(raw.get("rigid_reference", True))
+    try:
+        tiers = build_tiers(rigid_reference, sampling, seed)
+    except ValueError as exc:
+        raise ValueError(f"{source}: {exc}") from exc
     return DatasetConfig(
         asset=str(raw.get("asset", "kuka_lbr_iiwa_14_r820_table")),
         backends=tuple(raw.get("backends", ["mujoco"])),
+        rigid_reference=rigid_reference,
+        transmission=sampling,
         tiers=tiers,
+        comparison=ComparisonThresholds.from_mapping(raw.get("comparison")),
         n_trajectories=int(data_cfg.get("trajectories", 4)),
         n_friction_samples=int(data_cfg.get("friction_samples", 2)),
         friction_scale_range=(float(scale[0]), float(scale[1])),
-        seed=int(data_cfg.get("seed", 20260917)),
+        seed=seed,
         excitation=FourierExcitationConfig(
             n_harmonics=int(exc_cfg.get("n_harmonics", 5)),
             base_frequency=float(exc_cfg.get("base_frequency", 0.1)),
@@ -166,6 +263,10 @@ def sample_friction(base: FrictionModel, rng: np.random.Generator, scale_range: 
     return FrictionModel(viscous, coulomb)
 
 
+def elastic_time_step(transmission: TransmissionSpec, config: DatasetConfig) -> float:
+    return min(config.max_time_step, transmission.required_time_step())
+
+
 def run_condition(
     asset: AssetSpec,
     trajectory: MaterializedTrajectory,
@@ -173,29 +274,56 @@ def run_condition(
     backend: str,
     friction: FrictionModel,
     config: DatasetConfig,
+    *,
+    link_inertia: LinkInertia | None = None,
 ) -> dict[str, Any]:
-    """Execute one trajectory under one condition and return the rollout."""
+    """Execute one trajectory under one condition and return the rollout.
+
+    ``link_inertia`` is computed from the asset when not given; pass it when
+    running many conditions, since it is the same for all of them.
+    """
     n_dof = len(asset.joint_names)
-    transmission = tier.transmission(n_dof)
     view = {"visualize": config.visualize, "realtime_scale": config.realtime_scale}
-    if transmission is None:
+    if tier.is_rigid:
         controller = ComputedTorqueController(
             asset, trajectory, friction=friction,
             natural_frequency=config.control_frequency,
             damping_ratio=config.control_damping_ratio,
         )
         runner = run_mujoco_torque if backend == "mujoco" else run_newton_torque
-        return runner(asset, trajectory, controller, time_step=config.rigid_time_step,
-                      friction=friction, **view)
-    time_step = min(config.max_time_step, transmission.required_time_step())
+        result = runner(asset, trajectory, controller, time_step=config.rigid_time_step,
+                        friction=friction, **view)
+        result.update(transmission=None, time_step=config.rigid_time_step)
+        return result
+    if link_inertia is None:
+        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
+    transmission = tier.transmission(n_dof, link_inertia)
+    time_step = elastic_time_step(transmission, config)
     controller = SeaMotorController(
         asset, trajectory, transmission, friction=friction,
         natural_frequency=config.control_frequency,
         damping_ratio=config.control_damping_ratio,
     )
     runner = run_mujoco_elastic_torque if backend == "mujoco" else run_newton_elastic_torque
-    return runner(asset, trajectory, controller, transmission, time_step=time_step,
-                  friction=friction, **view)
+    result = runner(asset, trajectory, controller, transmission, time_step=time_step,
+                    friction=friction, **view)
+    result.update(transmission=transmission, time_step=time_step)
+    return result
+
+
+def describe_transmission(transmission: TransmissionSpec | None, time_step: float | None = None) -> dict[str, Any]:
+    """JSON-serializable per-joint transmission parameters."""
+    if transmission is None:
+        return {"stiffness": None, "damping": None, "damping_ratio": None, "rotor_inertia": None,
+                "mode_frequency_hz": None, "time_step": time_step}
+    return {
+        "stiffness": transmission.stiffness.tolist(),
+        "damping": transmission.damping.tolist(),
+        "damping_ratio": None if transmission.damping_ratio is None else transmission.damping_ratio.tolist(),
+        "rotor_inertia": transmission.rotor_inertia.tolist(),
+        "mode_frequency_hz": transmission.natural_frequency().tolist(),
+        "time_step": time_step,
+    }
 
 
 def iter_conditions(config: DatasetConfig) -> Iterator[tuple[int, Tier, int, str]]:
@@ -263,21 +391,45 @@ def rollout_frame(
     frame["experiment"] = bag
     frame["tier"] = tier.name
     frame["backend"] = backend
-    frame["stiffness"] = np.nan if tier.is_rigid else float(tier.stiffness)
+    transmission = describe_transmission(result.get("transmission"))
     for index, name in enumerate(names):
         frame[f"viscous__{name}"] = friction.viscous[index]
         frame[f"coulomb__{name}"] = friction.coulomb[index]
+        for key in ("stiffness", "damping", "damping_ratio", "rotor_inertia"):
+            values = transmission[key]
+            frame[f"{key}__{name}"] = np.nan if values is None else values[index]
     return frame
 
 
-def generate(config: DatasetConfig, asset: AssetSpec, *, verbose: bool = True) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Build the whole dataset and return ``(frame, manifest)``."""
+def generate(
+    config: DatasetConfig, asset: AssetSpec, *, verbose: bool = True
+) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
+    """Build the whole dataset and return ``(frame, manifest, backend_comparison)``."""
     base_friction = FrictionModel.from_asset(asset)
     rng = np.random.default_rng(config.seed)
     frictions = [base_friction] + [
         sample_friction(base_friction, rng, config.friction_scale_range)
         for _ in range(max(0, config.n_friction_samples - 1))
     ]
+    n_dof = len(asset.joint_names)
+    link_inertia = None
+    robots: list[dict[str, Any]] = []
+    if any(not tier.is_rigid for tier in config.tiers):
+        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
+        if verbose:
+            print(f"link inertia M_ii [kg m^2]: median {np.array2string(link_inertia[0], precision=4)}")
+            print(f"                            floor  {np.array2string(link_inertia[1], precision=4)}")
+        for tier in config.tiers:
+            if tier.is_rigid:
+                continue
+            transmission = tier.transmission(n_dof, link_inertia)
+            robots.append({"name": tier.name, **describe_transmission(transmission, elastic_time_step(transmission, config))})
+            if verbose:
+                print(f"robot {tier.name}: k [Nm/rad] {np.array2string(transmission.stiffness, precision=0, floatmode='fixed')}"
+                      f"\n           zeta {np.array2string(transmission.damping_ratio, precision=3)}"
+                      f" | top mode {transmission.natural_frequency().max():.0f} Hz"
+                      f" | step {robots[-1]['time_step']:.1e} s")
+
     trajectories: dict[int, MaterializedTrajectory] = {}
     for index in range(config.n_trajectories):
         trajectories[index] = optimize_excitation(
@@ -292,12 +444,12 @@ def generate(config: DatasetConfig, asset: AssetSpec, *, verbose: bool = True) -
         trajectory = trajectories[traj_index]
         friction = frictions[friction_index]
         bag = f"t{traj_index}_{tier.name}_f{friction_index}_{backend}"
-        result = run_condition(asset, trajectory, tier, backend, friction, config)
+        result = run_condition(asset, trajectory, tier, backend, friction, config, link_inertia=link_inertia)
         frames.append(rollout_frame(asset, trajectory, result, bag=bag, tier=tier, backend=backend,
                                     friction=friction, resample_step=config.sample_time_step))
         records.append({
             "bag": bag, "bag_index": bag_index, "trajectory": traj_index, "tier": tier.name,
-            "stiffness": None if tier.is_rigid else float(tier.stiffness),
+            **describe_transmission(result["transmission"], result["time_step"]),
             "friction_index": friction_index, "backend": backend,
             "solver": result.get("solver"), "wall_time": float(result.get("wall_time", 0.0)),
             "samples": int(len(result["time"])),
@@ -305,37 +457,59 @@ def generate(config: DatasetConfig, asset: AssetSpec, *, verbose: bool = True) -
             "condition_number": float(trajectory.metadata["condition_number"]),
             "viscous": friction.viscous.tolist(), "coulomb": friction.coulomb.tolist(),
             "tracking_rms": float(np.sqrt(np.mean((np.asarray(result["q_link"]) - np.asarray(result["q_ref"])) ** 2))),
+            "max_deflection": float(np.abs(np.asarray(result["q_motor"]) - np.asarray(result["q_link"])).max()),
             "feedback_ratio": float(
                 np.mean(np.abs(result["tau_feedback"])) / max(np.mean(np.abs(result["tau_feedforward"])), 1e-12)
             ),
         })
         if verbose:
-            print(f"  [{bag_index + 1}] {bag:34s} {records[-1]['wall_time']:6.1f}s "
-                  f"trk={records[-1]['tracking_rms']:.2e}")
+            print(f"  [{bag_index + 1}] {bag:30s} {records[-1]['wall_time']:6.1f}s "
+                  f"trk={records[-1]['tracking_rms']:.2e} defl={records[-1]['max_deflection']:.2e}")
 
     frame = pd.concat(frames, ignore_index=True)
+    comparison = compare_backends(frame, records, config.comparison)
+    if verbose and len(config.backends) > 1:
+        print("\n" + format_report(comparison, config.comparison))
     manifest = {
         "asset": asset.name,
         "n_bags": len(records),
         "n_samples": int(len(frame)),
-        "n_dof": len(asset.joint_names),
+        "n_dof": n_dof,
         "joint_names": list(asset.joint_names),
         "sample_time_step": config.sample_time_step,
         "seed": config.seed,
         "backends": list(config.backends),
         "tiers": [t.name for t in config.tiers],
+        "rigid_reference": config.rigid_reference,
+        "transmission_sampling": asdict(config.transmission),
+        "link_inertia": None if link_inertia is None else {
+            "median": link_inertia[0].tolist(), "floor": link_inertia[1].tolist(),
+        },
+        "robots": robots,
+        "backend_comparison": summarize(comparison, config.comparison),
         "target": "ft0..ft{n-1} = link-side joint torque [Nm]",
         "input": "q0..q{n-1} [rad], dq0..dq{n-1} [rad/s], tau0..tau{n-1} = applied motor torque [Nm]",
         "records": records,
     }
-    return frame, manifest
+    return frame, manifest, comparison
 
 
-def write_dataset(frame: pd.DataFrame, manifest: Mapping[str, Any], output: str | Path) -> tuple[Path, Path]:
-    """Write the flat CSV plus its manifest next to it."""
+def write_dataset(
+    frame: pd.DataFrame, manifest: Mapping[str, Any], output: str | Path,
+    comparison: pd.DataFrame | None = None,
+) -> tuple[Path, Path, Path | None]:
+    """Write the flat CSV, its manifest and, if any pairs, the backend comparison."""
     csv_path = Path(output).expanduser().resolve()
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(csv_path, index=False)
     manifest_path = csv_path.with_suffix(".manifest.json")
     manifest_path.write_text(json.dumps(dict(manifest), indent=2), encoding="utf-8")
-    return csv_path, manifest_path
+    comparison_path = None
+    if comparison is not None and not comparison.empty:
+        comparison_path = comparison_report_path(csv_path)
+        comparison.to_csv(comparison_path, index=False)
+    return csv_path, manifest_path, comparison_path
+
+
+def comparison_report_path(csv_path: str | Path) -> Path:
+    return Path(csv_path).with_suffix(".backend_comparison.csv")

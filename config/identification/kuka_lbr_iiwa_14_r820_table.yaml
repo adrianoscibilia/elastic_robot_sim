@@ -8,18 +8,43 @@ schema_version: 1
 asset: kuka_lbr_iiwa_14_r820_table
 
 # Simulator backends.  Newton's SolverFeatherstone is an independent
-# cross-check on the rigid tier; on elastic tiers Newton falls back to
+# cross-check on the rigid reference; on elastic robots Newton falls back to
 # SolverMuJoCo and is therefore not independent (see docs).
 backends: [mujoco, newton]
 
-# Model-fidelity tiers.  `rigid` is the reference tier, validated against
-# Pinocchio's analytic inverse dynamics.  The stiffness ladder runs from
-# near-rigid down to visibly compliant.
-tiers:
-  rigid: false
-  stiffness: [1.0e6, 4.0e4]
-  transmission_damping_ratio: 0.1
-  rotor_inertia: 0.1          # reflected motor inertia [kg m^2], as armature
+# One rigid bag per trajectory and friction sample, validated against
+# Pinocchio's analytic inverse dynamics.
+rigid_reference: true
+
+# Sampled elastic robots, payload 0.  Each robot draws every joint's stiffness
+# log-uniformly from its interval and its damping ratio uniformly; damping is
+# derived, d = 2 zeta sqrt(k J_eff), with J_eff the rotor/link reduced inertia.
+#
+# Stiffness intervals are order-of-magnitude values for a harmonic drive in
+# series with a joint torque sensor (LWR/iiwa class), stiffer at the base than
+# at the wrist.  They are not datasheet values.  With them the transmission
+# modes sit near 50-170 Hz at A1-A6 and 600-900 Hz at A7, whose link-side
+# inertia is only 3e-4 kg m^2; that mode sets the integration step (~6e-5 s).
+transmission:
+  robots: 6
+  stiffness:                  # [min, max] Nm/rad, joints A1..A7
+    - [1.5e4, 3.5e4]
+    - [1.5e4, 3.5e4]
+    - [1.0e4, 2.5e4]
+    - [1.0e4, 2.5e4]
+    - [5.0e3, 1.5e4]
+    - [3.0e3, 1.0e4]
+    - [3.0e3, 1.0e4]
+  damping_ratio: [0.05, 0.2]  # sampled per joint
+  rotor_inertia: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # reflected [kg m^2], as armature; to refine
+  inertia_samples: 512        # configurations used for the link-inertia envelope
+
+# MuJoCo/Newton agreement limits per bag pair, on the worst joint.  Failing
+# pairs are reported and flagged in the manifest, never dropped.
+comparison:
+  q_link_rms: 1.0e-4          # rad
+  ft_relative_rms: 0.01       # link torque difference / link torque RMS
+  deflection_relative_rms: 0.05  # (q_motor - q_link), elastic robots only
 
 # Periodic Fourier excitation.
 #
@@ -52,7 +77,7 @@ simulation:
   control_frequency: 25.0     # closed-loop bandwidth [rad/s]
   control_damping_ratio: 1.0
   rigid_time_step: 5.0e-4
-  max_time_step: 5.0e-4       # elastic tiers may need less; never more
+  max_time_step: 5.0e-4       # elastic robots use less, set by their fastest mode
   sample_time_step: 0.002     # uniform output grid [s]
 
 visualization:

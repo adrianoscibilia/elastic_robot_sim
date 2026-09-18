@@ -51,12 +51,33 @@ def joint_inertia_floor(pin: Any, model: Any, data: Any, configurations: np.ndar
     a single scalar PD gain that is gentle at the base is violently unstable
     at the wrist.  Gains are therefore scaled by this per-joint inertia.
     """
+    return np.min(_inertia_diagonals(pin, model, data, configurations), axis=0)
+
+
+def _inertia_diagonals(pin: Any, model: Any, data: Any, configurations: np.ndarray) -> np.ndarray:
     configurations = np.atleast_2d(np.asarray(configurations, dtype=float))
-    diagonals = []
-    for q in configurations:
-        mass_matrix = np.asarray(pin.crba(model, data, q), dtype=float)
-        diagonals.append(np.diag(mass_matrix).copy())
-    return np.min(np.asarray(diagonals), axis=0)
+    return np.asarray([np.diag(np.asarray(pin.crba(model, data, q), dtype=float)).copy() for q in configurations])
+
+
+def link_inertia_envelope(asset: AssetSpec, *, n_samples: int = 512, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Median and minimum link-side inertia ``M_ii`` of each joint over its range.
+
+    This is a property of the robot, not of any one trajectory, so it is
+    sampled uniformly inside the joint limits.  The median sizes transmission
+    damping; the minimum bounds the highest transmission mode, which on the
+    iiwa is the wrist (``M_77 = 3e-4 kg m^2``), not the rotor.
+    """
+    from . import identification as idn
+
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive")
+    pin, model, data = idn.build_model(asset)
+    joints = asset.resolve_active_joints()
+    lower = np.asarray([-np.pi if joint.lower is None else joint.lower for joint in joints], dtype=float)
+    upper = np.asarray([np.pi if joint.upper is None else joint.upper for joint in joints], dtype=float)
+    rng = np.random.default_rng(seed)
+    diagonals = _inertia_diagonals(pin, model, data, lower + (upper - lower) * rng.random((n_samples, len(joints))))
+    return np.median(diagonals, axis=0), np.min(diagonals, axis=0)
 
 
 class ComputedTorqueController:
@@ -473,6 +494,13 @@ def run_newton_torque(
 # Elastic transmissions
 # ---------------------------------------------------------------------------
 
+def effective_inertia(rotor_inertia: np.ndarray, link_inertia: np.ndarray) -> np.ndarray:
+    """Reduced inertia of a rotor and a link coupled by a spring."""
+    rotor = np.asarray(rotor_inertia, dtype=float)
+    link = np.asarray(link_inertia, dtype=float)
+    return rotor * link / (rotor + link)
+
+
 @dataclass(frozen=True)
 class TransmissionSpec:
     """Series-elastic transmission parameters for every active joint.
@@ -491,12 +519,21 @@ class TransmissionSpec:
 
     The body's *mass* is kept negligible so that inserting a transmission does
     not add weight the real robot does not carry.
+
+    ``link_inertia_floor`` is the smallest link-side inertia each joint sees.
+    The transmission mode is a two-mass oscillation of rotor against link, at
+    ``sqrt(k / J_eff)`` with ``J_eff = J_rotor J_link / (J_rotor + J_link)``;
+    when the link is far lighter than the rotor, as at the iiwa wrist, the
+    mode is set by the link and is many times faster than the rotor alone
+    suggests.  Without it the rotor-only estimate is used.
     """
 
     stiffness: np.ndarray
     damping: np.ndarray
     rotor_inertia: np.ndarray
     intermediate_mass: float = 1.0e-3
+    link_inertia_floor: np.ndarray | None = None
+    damping_ratio: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         stiffness = np.asarray(self.stiffness, dtype=float).reshape(-1)
@@ -511,6 +548,34 @@ class TransmissionSpec:
         object.__setattr__(self, "stiffness", stiffness)
         object.__setattr__(self, "damping", damping)
         object.__setattr__(self, "rotor_inertia", rotor)
+        for name in ("link_inertia_floor", "damping_ratio"):
+            value = getattr(self, name)
+            if value is not None:
+                value = np.broadcast_to(np.asarray(value, dtype=float).reshape(-1), stiffness.shape).copy()
+                if name == "link_inertia_floor" and np.any(value <= 0.0):
+                    raise ValueError("link_inertia_floor must be positive")
+                object.__setattr__(self, name, value)
+
+    @classmethod
+    def from_damping_ratio(
+        cls, stiffness: np.ndarray, damping_ratio: np.ndarray, rotor_inertia: np.ndarray,
+        link_inertia: np.ndarray, link_inertia_floor: np.ndarray | None = None, **kwargs,
+    ) -> "TransmissionSpec":
+        """Derive damping from stiffness and inertia: ``d = 2 zeta sqrt(k J_eff)``.
+
+        ``link_inertia`` is a nominal (typically median) value, so ``zeta`` is
+        the damping ratio of the transmission mode in a typical configuration.
+        """
+        stiffness = np.asarray(stiffness, dtype=float).reshape(-1)
+        shape = stiffness.shape
+        zeta = np.broadcast_to(np.asarray(damping_ratio, dtype=float).reshape(-1), shape)
+        rotor = np.broadcast_to(np.asarray(rotor_inertia, dtype=float).reshape(-1), shape)
+        link = np.broadcast_to(np.asarray(link_inertia, dtype=float).reshape(-1), shape)
+        if np.any(zeta < 0.0) or np.any(link <= 0.0):
+            raise ValueError("damping_ratio must be non-negative and link_inertia positive")
+        damping = 2.0 * zeta * np.sqrt(stiffness * effective_inertia(rotor, link))
+        floor = link if link_inertia_floor is None else link_inertia_floor
+        return cls(stiffness, damping, rotor, link_inertia_floor=floor, damping_ratio=zeta, **kwargs)
 
     @classmethod
     def uniform(
@@ -524,8 +589,11 @@ class TransmissionSpec:
         return cls(stiffness_array, damping, rotor, **kwargs)
 
     def natural_frequency(self) -> np.ndarray:
-        """Transmission resonance in Hz, used to bound the integration step."""
-        return np.sqrt(self.stiffness / self.rotor_inertia) / (2.0 * np.pi)
+        """Highest transmission resonance in Hz, used to bound the integration step."""
+        inertia = self.rotor_inertia if self.link_inertia_floor is None else effective_inertia(
+            self.rotor_inertia, self.link_inertia_floor
+        )
+        return np.sqrt(self.stiffness / inertia) / (2.0 * np.pi)
 
     def required_time_step(self, samples_per_period: float = 20.0) -> float:
         return float(1.0 / (samples_per_period * float(np.max(self.natural_frequency()))))

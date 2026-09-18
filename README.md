@@ -351,11 +351,13 @@ config/identification/*.yaml    identification dataset configurations
 scripts/compose_scene_urdf.py   mount an asset on a table as a new scene asset
 scripts/run_identification_simulation.py  one rollout, viewer and diagnostics, no output
 scripts/generate_identification_dataset.py  full dataset build
+scripts/compare_identification_backends.py  MuJoCo/Newton agreement of a written dataset
 src/elastic_sim/scene.py        derived scene URDF composition
 src/elastic_sim/excitation.py   Fourier excitation design and conditioning
 src/elastic_sim/identification.py Pinocchio inverse dynamics, regressor, base parameters
 src/elastic_sim/torque_runners.py torque-driven rollouts with exact labels
-src/elastic_sim/dataset.py      tiers, conditions, and the consumer's CSV contract
+src/elastic_sim/dataset.py      rigid tier, sampled elastic robots, conditions, CSV contract
+src/elastic_sim/backend_comparison.py per-pair MuJoCo/Newton agreement report
 ```
 
 ## ROS 2 package build

@@ -24,9 +24,13 @@ uv run python scripts/generate_identification_dataset.py
 
 # ...or override whatever you need.
 uv run python scripts/generate_identification_dataset.py \
-    --backends mujoco --stiffness 1e6 2e5 4e4 1e4 \
+    --backends mujoco --robots 12 \
     --trajectories 8 --friction-samples 3 \
     --output data/identification/iiwa14_table.csv
+
+# 3. Re-check MuJoCo/Newton agreement of a written dataset, no simulation.
+uv run python scripts/compare_identification_backends.py \
+    data/identification/kuka_lbr_iiwa_14_r820_table.csv
 ```
 
 ## Looking before you save
@@ -39,9 +43,9 @@ numbers make sense before committing to a full dataset build.
 # Watch the arm move, save nothing.
 uv run python scripts/run_identification_simulation.py --visualize
 
-# Fast-forward 4x, and look at the softest tier in Newton.
+# Fast-forward 4x, and look at sampled elastic robot e03 in Newton.
 uv run python scripts/run_identification_simulation.py \
-    --visualize --realtime-scale 4 --tier k4e04 --backend newton
+    --visualize --realtime-scale 4 --tier e03 --backend newton
 
 # Check a trajectory without starting a simulator at all.
 uv run python scripts/run_identification_simulation.py --trajectory-only
@@ -53,8 +57,9 @@ uv run python scripts/run_identification_simulation.py --output /tmp/one.csv
 It reports the regressor condition number, peak velocity and acceleration
 against their limits, whether the path starts and ends at rest and stays inside
 the joint-limit band and collision margin, then the tracking error, the
-feedback/feedforward ratio, torque against the effort limit, and — for rigid
-tiers — the residual against Pinocchio's inverse dynamics, which should be
+feedback/feedforward ratio, torque against the effort limit, for an elastic
+robot its stiffness, damping, mode frequencies and integration step, and — for
+the rigid tier — the residual against Pinocchio's inverse dynamics, which should be
 about 1e-8 Nm.
 
 `generate_identification_dataset.py` takes `--visualize` and `--no-save` too,
@@ -72,8 +77,9 @@ runs, not for a dataset you intend to train on.
 > six-line stock MuJoCo script and is not specific to this repository.
 
 The result is one flat CSV plus a `.manifest.json` recording every bag's tier,
-stiffness, friction sample, backend, solver, trajectory digest and regressor
-condition number.
+per-joint transmission parameters, friction sample, backend, solver, trajectory
+digest and regressor condition number, and — when more than one backend ran —
+a `.backend_comparison.csv` (see [Backend comparison](#backend-comparison)).
 
 ## Why torque-driven rollouts
 
@@ -133,10 +139,10 @@ and `SolverSemiImplicit` both diverge within a few milliseconds on the
 doubled-degree-of-freedom elastic chain — at every transmission-body size and
 time step tried — so that path falls back to `SolverMuJoCo` and is **not** an
 independent check on the MuJoCo rollout. Every rollout reports this as
-`independent_of_mujoco`, and it is also about twenty times slower than the
-MuJoCo elastic runner. Unless you specifically need it, generate elastic tiers
-with `--backends mujoco` and use `--backends mujoco newton` for the rigid tier,
-where the cross-check is real.
+`independent_of_mujoco`, and it is also several times slower than the MuJoCo
+elastic runner. It still runs a different implementation (MuJoCo Warp, single
+precision, on the GPU), so agreement is a useful consistency check, but not a
+second physics model.
 
 Contacts are disabled during a rollout. Excitation trajectories are validated
 collision-free against the real geometry beforehand, so contacts can only add
@@ -167,18 +173,59 @@ condition number of the base-parameter regressor and checked for collision.
 On this asset the optimized result conditions the regressor about 1.9x better
 than the existing random point-to-point generator (≈145 against ≈277).
 
-## Tiers
+## Tiers and sampled robots
 
-A tier is a model-fidelity level. The rigid tier uses the URDF's own inertials
-plus its declared `damping = 10.0 Nm s/rad` and `friction = 0.1 Nm`. The
-elastic tiers add a series-elastic transmission at decreasing stiffness.
+A tier is a model-fidelity level. The **rigid** tier uses the URDF's own
+inertials plus its declared `damping = 10.0 Nm s/rad` and `friction = 0.1 Nm`.
+The other tiers are **sampled elastic robots** `e00, e01, …`: the same arm with
+a series-elastic transmission at every joint, payload 0.
 
-The elastic tiers exist because a rigid dataset cannot identify elastic
+Elastic robots exist because a rigid dataset cannot identify elastic
 parameters: with `q_motor ≡ q_link` the elastic potential has no observable
 effect, and the link-side target would equal the motor-side input, degenerating
-the learning task. The stiffest tier is a validation tier — if it does not
-reproduce the rigid tier, the elastic path is wrong and nothing below it can be
-trusted.
+the learning task.
+
+### Sampling
+
+Configured in the `transmission` block of the YAML:
+
+- **Stiffness** — one `[min, max]` interval per joint, sampled log-uniformly
+  (as the original FMRR generator did), so a wide interval is not dominated by
+  its stiff end. The defaults are order-of-magnitude values for a harmonic
+  drive in series with a joint torque sensor, stiffer at the base than at the
+  wrist: A1–A2 1.5e4–3.5e4, A3–A4 1e4–2.5e4, A5 5e3–1.5e4, A6–A7 3e3–1e4
+  Nm/rad. They are not datasheet values; refine them when measurements exist.
+- **Damping ratio** — one interval, sampled uniformly per joint (default
+  0.05–0.2, the lightly damped range of a geared joint).
+- **Damping coefficient** — never configured. It is derived as
+  `d = 2 ζ sqrt(k J_eff)`.
+- **Rotor inertia** — reflected rotor inertia per joint, applied as armature;
+  fixed, not sampled.
+
+Robots are drawn from their own random stream in index order, so a robot
+depends only on the dataset seed and its index: raising `robots` adds robots
+without changing existing ones, and `run_identification_simulation.py --tier
+e03` reproduces the dataset's `e03`. Rigid and elastic bags interleave in the
+file (see below).
+
+### Why the link inertia matters
+
+A transmission mode is a rotor oscillating against a link through the spring,
+at `sqrt(k / J_eff)` with `J_eff = J_rotor J_link / (J_rotor + J_link)`. The
+link-side inertia `M_ii` is sampled over the joint range with Pinocchio: on
+this arm it spans about 2–3 kg m² at A1–A2 down to **3e-4 kg m² at A7**, where
+the link is far lighter than the rotor and sets the mode alone. The median
+`M_ii` sizes the damping; the minimum bounds the highest mode, and so the
+integration step.
+
+The earlier rotor-only estimate put every joint's mode at `sqrt(k / 0.1)`: at
+`k = 1e6` it predicted 503 Hz where the wrist mode is 9.1 kHz, so the step it
+chose could not resolve the wrist.
+
+With the default intervals the modes sit at about 50–170 Hz for A1–A6 and
+600–900 Hz for A7, giving a step of about 6–8e-5 s. The dataset is sampled at
+2 ms (Nyquist 250 Hz): proximal modes are visible in the data, the wrist mode
+only through its quasi-static deflection `tau / k`.
 
 Two details are easy to get wrong and are handled explicitly:
 
@@ -195,7 +242,7 @@ Two details are easy to get wrong and are handled explicitly:
 the transmission mode and reports the step actually needed, rather than
 producing noise that looks like physics.
 
-Measured near-rigid convergence (MuJoCo, 2 s excitation):
+Measured near-rigid convergence (MuJoCo, 2 s excitation, uniform stiffness):
 
 | stiffness [Nm/rad] | max deflection [rad] | RMS vs rigid [rad] |
 |---|---|---|
@@ -203,6 +250,37 @@ Measured near-rigid convergence (MuJoCo, 2 s excitation):
 | 2e5 | 2.7e-4 | 7.1e-5 |
 | 4e4 | 1.4e-3 | 3.3e-4 |
 | 1e4 | 6.2e-3 | 1.3e-3 |
+
+## Backend comparison
+
+When a dataset runs more than one backend, every pair of bags that differs only
+by backend (same trajectory, tier and friction sample) is compared on the common
+output grid. Per joint:
+
+| metric | meaning |
+|---|---|
+| `q_link_rms`, `q_link_max` | link position difference [rad] |
+| `dq_link_rms`, `q_motor_rms` | link velocity and motor position difference |
+| `ft_relative_rms`, `tau_relative_rms` | link and motor torque difference over that torque's RMS |
+| `deflection_relative_rms` | difference of `q_motor − q_link` over its RMS (elastic only) |
+
+A pair passes when its worst joint is within the `comparison` limits in the
+YAML (defaults `q_link_rms 1e-4 rad`, `ft_relative_rms 1 %`,
+`deflection_relative_rms 5 %`). Failing pairs are **flagged, never dropped**:
+the table is printed at the end of generation, written to
+`<dataset>.backend_comparison.csv` and summarized in the manifest.
+
+The torque is closed-loop, so a state difference feeds back into the recorded
+label; that is why torques are compared as well as states. The `independent`
+column is `True` only where Newton ran its own solver (rigid, Featherstone).
+On elastic bags it ran `SolverMuJoCo`, and the table marks these pairs
+`(same engine)`.
+
+`scripts/compare_identification_backends.py` runs the same comparison on a
+written dataset, with limits overridable on the command line.
+
+Measured on a 2 s smoke run: rigid pair `8.8e-8 rad`; elastic pairs
+`1.8e-6 rad`, link torque `0.29 %`.
 
 ## Output contract
 
@@ -217,7 +295,7 @@ One row per sample, consumed directly by `dynamic_model_nn`'s `CustomDataset`.
 | `tau0..tau{n-1}` | applied **motor-side** torque [Nm] — model input |
 | `ft0..ft{n-1}` | **link-side** torque [Nm] — training target |
 | `q_motor*`, `dq_motor*`, `q_link*`, `dq_link*` | ingested, available to elastic models |
-| `tier`, `stiffness`, `backend`, `viscous__*`, `coulomb__*`, `experiment` | metadata, ignored by the loader |
+| `tier`, `backend`, `experiment`, `viscous__<joint>`, `coulomb__<joint>`, `stiffness__<joint>`, `damping__<joint>`, `damping_ratio__<joint>`, `rotor_inertia__<joint>` | metadata, ignored by the loader; transmission columns are empty on rigid bags |
 
 `ddq` is deliberately **not** emitted: the consumer always recomputes it with a
 Savitzky-Golay filter and ignores the column. That filter requires a uniform
@@ -245,7 +323,10 @@ fixed six-channel form so a 7-channel target is not silently truncated.
 uv run pytest tests/test_identification_dataset.py -q
 ```
 
-The suite locks in: MuJoCo/Pinocchio agreement to 1e-6; the regressor
+The suite locks in: MuJoCo/Pinocchio agreement to 1e-6; the transmission mode
+using the rotor/link reduced inertia and damping reproducing the sampled ratio;
+robot sampling staying inside its intervals, log-uniform and seed-stable; the
+backend comparison pairing bags and flagging a divergent backend; the regressor
 reproducing inverse dynamics; 43 rigid and 57 friction-augmented base
 parameters; excitation endpoint conditions and limit compliance; the optimized
 trajectory beating the point-to-point baseline; the recorded torque being the

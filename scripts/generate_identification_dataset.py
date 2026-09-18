@@ -3,8 +3,10 @@
 
 Excitation trajectories are optimized for regressor conditioning, executed as
 torque-driven rollouts in MuJoCo and/or Newton across a rigid tier and a
-transmission-stiffness ladder, and written as one flat CSV in the schema that
-``dynamic_model_nn`` consumes.
+set of sampled elastic robots, and written as one flat CSV in the schema that
+``dynamic_model_nn`` consumes.  When more than one backend runs, every bag
+pair that differs only by backend is compared and the result written next to
+the dataset.
 
 Settings come from a YAML file under ``config/identification/``; every one of
 them can be overridden on the command line.  See
@@ -14,7 +16,7 @@ rollout without writing a dataset.
 Examples
 --------
     python scripts/generate_identification_dataset.py
-    python scripts/generate_identification_dataset.py --backends mujoco --trajectories 8
+    python scripts/generate_identification_dataset.py --backends mujoco --trajectories 8 --robots 12
     python scripts/generate_identification_dataset.py --visualize --no-save
 """
 
@@ -30,7 +32,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(_REPO / "src"))
 
 from elastic_sim.assets import AssetRegistry, load_asset_spec
-from elastic_sim.dataset import DEFAULT_CONFIG, Tier, default_tiers, generate, load_config, write_dataset
+from elastic_sim.dataset import DEFAULT_CONFIG, build_tiers, generate, load_config, write_dataset
 from elastic_sim.excitation import FourierExcitationConfig
 
 
@@ -51,8 +53,8 @@ def main() -> None:
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML defaults (see config/identification/)")
     parser.add_argument("--asset", default=None)
     parser.add_argument("--backends", nargs="+", choices=("mujoco", "newton"), default=None)
-    parser.add_argument("--stiffness", nargs="*", type=float, default=None,
-                        help="Transmission stiffness ladder; pass with no values for rigid only")
+    parser.add_argument("--robots", type=int, default=None,
+                        help="Number of sampled elastic robots; 0 for the rigid reference only")
     parser.add_argument("--no-rigid", action="store_true", help="Omit the rigid reference tier")
     parser.add_argument("--trajectories", type=int, default=None)
     parser.add_argument("--friction-samples", type=int, default=None)
@@ -75,23 +77,18 @@ def main() -> None:
 
     config = load_config(_resolve(args.config))
 
-    tiers = config.tiers
-    if args.stiffness is not None:
-        tiers = default_tiers(args.stiffness)
-        template = next((tier for tier in config.tiers if not tier.is_rigid), None)
-        if template is not None:
-            tiers = tuple(
-                tier if tier.is_rigid else Tier(
-                    tier.name, tier.stiffness,
-                    transmission_damping_ratio=template.transmission_damping_ratio,
-                    rotor_inertia=template.rotor_inertia,
-                )
-                for tier in tiers
-            )
-    if args.no_rigid:
-        tiers = tuple(tier for tier in tiers if not tier.is_rigid)
-    if not tiers:
-        parser.error("no tiers selected: keep the rigid tier or pass --stiffness values")
+    if args.robots is not None and args.robots < 0:
+        parser.error("--robots must be >= 0")
+    try:
+        transmission = replace(config.transmission, robots=config.transmission.robots if args.robots is None else args.robots)
+    except ValueError as exc:
+        parser.error(str(exc))
+    rigid_reference = config.rigid_reference and not args.no_rigid
+    seed = config.seed if args.seed is None else args.seed
+    try:
+        tiers = build_tiers(rigid_reference, transmission, seed)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     excitation = config.excitation
     sample_step = args.sample_step or config.sample_time_step
@@ -108,12 +105,14 @@ def main() -> None:
         config,
         asset=args.asset or config.asset,
         backends=tuple(args.backends) if args.backends else config.backends,
+        rigid_reference=rigid_reference,
+        transmission=transmission,
         tiers=tiers,
         n_trajectories=args.trajectories or config.n_trajectories,
         n_friction_samples=args.friction_samples or config.n_friction_samples,
         friction_scale_range=(tuple(args.friction_scale) if args.friction_scale
                               else config.friction_scale_range),
-        seed=config.seed if args.seed is None else args.seed,
+        seed=seed,
         excitation=excitation,
         candidates=args.candidates or config.candidates,
         control_frequency=args.control_frequency or config.control_frequency,
@@ -134,13 +133,15 @@ def main() -> None:
               f"x backends {list(config.backends)} x {config.n_trajectories} trajectories "
               f"x {config.n_friction_samples} friction samples")
 
-    frame, manifest = generate(config, asset, verbose=not args.quiet)
+    frame, manifest, comparison = generate(config, asset, verbose=not args.quiet)
     if args.no_save:
         print(f"\n{len(frame)} samples in {manifest['n_bags']} bags; nothing written (--no-save).")
         return
-    csv_path, manifest_path = write_dataset(frame, manifest, _resolve(config.output))
+    csv_path, manifest_path, comparison_path = write_dataset(frame, manifest, _resolve(config.output), comparison)
     print(f"\nWrote {len(frame)} samples in {manifest['n_bags']} bags to {csv_path}")
     print(f"Wrote manifest to {manifest_path}")
+    if comparison_path is not None:
+        print(f"Wrote backend comparison to {comparison_path}")
 
 
 if __name__ == "__main__":

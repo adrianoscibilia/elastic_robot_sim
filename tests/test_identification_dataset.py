@@ -305,6 +305,41 @@ def test_transmission_rejects_an_unresolvable_time_step():
     transmission.require_stable_step(transmission.required_time_step())
 
 
+def test_transmission_mode_uses_the_reduced_inertia():
+    """A light link oscillates against a heavy rotor far faster than the rotor alone."""
+    from elastic_sim.torque_runners import effective_inertia
+
+    stiffness, rotor, link = np.array([1.0e4, 1.0e4]), np.array([0.1, 0.1]), np.array([2.0, 3.0e-4])
+    rotor_only = TransmissionSpec(stiffness, np.zeros(2), rotor)
+    spec = TransmissionSpec.from_damping_ratio(stiffness, 0.1, rotor, link, link)
+    expected = np.sqrt(stiffness / effective_inertia(rotor, link)) / (2.0 * np.pi)
+    assert np.allclose(spec.natural_frequency(), expected)
+    assert (spec.natural_frequency() >= rotor_only.natural_frequency()).all()
+    assert spec.natural_frequency()[1] > 15.0 * rotor_only.natural_frequency()[1]
+    assert spec.required_time_step() < rotor_only.required_time_step()
+
+
+def test_damping_is_derived_from_the_damping_ratio():
+    from elastic_sim.torque_runners import effective_inertia
+
+    stiffness, zeta = np.array([2.0e4, 5.0e3]), np.array([0.05, 0.2])
+    rotor, nominal, floor = np.array([0.1, 0.1]), np.array([2.0, 1.0e-2]), np.array([0.5, 3.0e-4])
+    spec = TransmissionSpec.from_damping_ratio(stiffness, zeta, rotor, nominal, floor)
+    recovered = spec.damping / (2.0 * np.sqrt(stiffness * effective_inertia(rotor, nominal)))
+    assert np.allclose(recovered, zeta)
+    assert np.allclose(spec.damping_ratio, zeta)
+    assert np.allclose(spec.link_inertia_floor, floor)
+
+
+def test_link_inertia_envelope_finds_the_light_wrist(asset):
+    from elastic_sim.torque_runners import link_inertia_envelope
+
+    median, floor = link_inertia_envelope(asset, n_samples=64)
+    assert median.shape == floor.shape == (7,)
+    assert (floor > 0.0).all() and (floor <= median + 1e-12).all()
+    assert floor[-1] < 1e-2 < median[1], "A7 carries only the flange, A2 the whole arm"
+
+
 def test_stiff_transmission_reproduces_the_rigid_case(asset, short_trajectory, rigid_rollout):
     """The near-rigid limit: as stiffness grows the elastic tier must converge."""
     pytest.importorskip("mujoco")
@@ -383,11 +418,12 @@ def test_default_config_loads_and_is_shared_by_both_scripts():
     config = load_config(os.path.join(_REPO, DEFAULT_CONFIG))
     assert config.asset == ASSET
     assert set(config.backends) <= {"mujoco", "newton"}
-    assert any(tier.is_rigid for tier in config.tiers)
-    assert any(not tier.is_rigid for tier in config.tiers)
     assert config.excitation.time_step == config.sample_time_step
     assert config.output.endswith(".csv")
     assert config.visualize is False
+    assert len(config.transmission.stiffness) == 7, "one stiffness interval per iiwa joint"
+    assert [tier.is_rigid for tier in config.tiers].count(True) == int(config.rigid_reference)
+    assert sum(not tier.is_rigid for tier in config.tiers) == config.transmission.robots
 
 
 def test_config_rejects_unknown_keys(tmp_path):
@@ -399,29 +435,68 @@ def test_config_rejects_unknown_keys(tmp_path):
         load_config(path)
 
 
+def test_config_rejects_the_old_tier_ladder(tmp_path):
+    from elastic_sim.dataset import load_config
+
+    path = tmp_path / "old.yaml"
+    path.write_text("asset: x\ntiers:\n  rigid: true\n  stiffness: [1.0e4]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="transmission"):
+        load_config(path)
+
+
 def test_config_can_select_rigid_only(tmp_path):
     from elastic_sim.dataset import load_config
 
     path = tmp_path / "rigid.yaml"
-    path.write_text("asset: x\ntiers:\n  rigid: true\n  stiffness: []\n", encoding="utf-8")
+    path.write_text("asset: x\nrigid_reference: true\n", encoding="utf-8")
     tiers = load_config(path).tiers
     assert len(tiers) == 1 and tiers[0].is_rigid
 
 
-def test_config_propagates_transmission_settings(tmp_path):
+def test_config_rejects_an_empty_selection(tmp_path):
+    from elastic_sim.dataset import load_config
+
+    path = tmp_path / "none.yaml"
+    path.write_text("asset: x\nrigid_reference: false\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no tiers"):
+        load_config(path)
+
+
+def test_config_samples_robots_inside_their_intervals(tmp_path):
     from elastic_sim.dataset import load_config
 
     path = tmp_path / "t.yaml"
     path.write_text(
-        "asset: x\ntiers:\n  rigid: false\n  stiffness: [1000.0]\n"
-        "  transmission_damping_ratio: 0.3\n  rotor_inertia: 0.25\n",
+        "asset: x\nrigid_reference: false\ndataset:\n  seed: 7\n"
+        "transmission:\n  robots: 40\n  stiffness: [[1.0e3, 1.0e5], [2.0e3, 2.0e3]]\n"
+        "  damping_ratio: [0.05, 0.2]\n  rotor_inertia: 0.25\n"
+        "comparison:\n  q_link_rms: 3.0e-4\n",
         encoding="utf-8",
     )
-    tier = load_config(path).tiers[0]
-    assert tier.stiffness == 1000.0
-    assert tier.transmission_damping_ratio == 0.3
-    assert tier.rotor_inertia == 0.25
-    assert np.allclose(tier.transmission(7).rotor_inertia, 0.25)
+    config = load_config(path)
+    assert [tier.name for tier in config.tiers][:3] == ["e00", "e01", "e02"]
+    stiffness = np.asarray([tier.stiffness for tier in config.tiers])
+    zeta = np.asarray([tier.damping_ratio for tier in config.tiers])
+    assert ((stiffness[:, 0] >= 1.0e3) & (stiffness[:, 0] <= 1.0e5)).all()
+    assert np.allclose(stiffness[:, 1], 2.0e3)
+    assert ((zeta >= 0.05) & (zeta <= 0.2)).all()
+    # Log-uniform: about half the draws fall below the geometric mean 1e4.
+    assert 0.25 < np.mean(stiffness[:, 0] < 1.0e4) < 0.75
+    spec = config.tiers[0].transmission(2)
+    assert np.allclose(spec.rotor_inertia, 0.25) and np.allclose(spec.damping_ratio, zeta[0])
+    assert config.comparison.q_link_rms == 3.0e-4
+    with pytest.raises(ValueError):
+        config.tiers[0].transmission(7)
+
+
+def test_robot_sampling_is_deterministic_and_prefix_stable():
+    from elastic_sim.dataset import TransmissionSampling, sample_robots
+
+    sampling = TransmissionSampling(robots=3, stiffness=((1.0e3, 1.0e5),) * 7)
+    more = TransmissionSampling(robots=5, stiffness=((1.0e3, 1.0e5),) * 7)
+    assert sample_robots(sampling, 11) == sample_robots(sampling, 11)
+    assert sample_robots(more, 11)[:3] == sample_robots(sampling, 11)
+    assert sample_robots(sampling, 11) != sample_robots(sampling, 12)
 
 
 def test_condition_order_interleaves_tiers():
@@ -429,9 +504,71 @@ def test_condition_order_interleaves_tiers():
     from elastic_sim.dataset import DatasetConfig, Tier, iter_conditions
 
     config = DatasetConfig(
-        backends=("mujoco",), tiers=(Tier("rigid"), Tier("soft", stiffness=1.0e4)),
+        backends=("mujoco",), tiers=(Tier("rigid"), Tier("e00", stiffness=1.0e4)),
         n_trajectories=2, n_friction_samples=1,
     )
     tiers = [tier.name for _, tier, _, _ in iter_conditions(config)]
     halfway = len(tiers) // 2
     assert set(tiers[:halfway]) == set(tiers[halfway:]), "each half must see every tier"
+
+
+# ---------------------------------------------------------------------------
+# Backend comparison
+# ---------------------------------------------------------------------------
+
+def _synthetic_bag(bag, backend, tier, rng, *, n=200, dof=2, offset=0.0, elastic=True):
+    import pandas as pd
+
+    t = np.arange(n) * 0.002
+    q = np.sin(np.outer(t, np.arange(1, dof + 1))) + offset
+    deflection = 1e-3 * np.cos(np.outer(t, np.arange(1, dof + 1))) if elastic else 0.0
+    frame = {"t": t, "bag": bag, "tier": tier, "backend": backend}
+    for j in range(dof):
+        frame[f"q{j}"] = q[:, j]
+        frame[f"dq{j}"] = np.gradient(q[:, j], t)
+        frame[f"q_motor{j}"] = q[:, j] + (deflection[:, j] if elastic else 0.0)
+        frame[f"tau{j}"] = 10.0 * q[:, j] + 1.0
+        frame[f"ft{j}"] = 9.0 * q[:, j] + 1.0
+    return pd.DataFrame(frame)
+
+
+def test_backend_comparison_pairs_and_passes_identical_bags():
+    import pandas as pd
+    from elastic_sim.backend_comparison import ComparisonThresholds, compare_backends
+
+    rng = np.random.default_rng(0)
+    frame = pd.concat([
+        _synthetic_bag("t0_rigid_f0_mujoco", "mujoco", "rigid", rng, elastic=False),
+        _synthetic_bag("t0_rigid_f0_newton", "newton", "rigid", rng, elastic=False),
+        _synthetic_bag("t0_e00_f0_mujoco", "mujoco", "e00", rng),
+        _synthetic_bag("t0_e00_f0_newton", "newton", "e00", rng),
+        _synthetic_bag("t1_e00_f0_mujoco", "mujoco", "e00", rng),  # no partner
+    ], ignore_index=True)
+    records = [{"bag": "t0_rigid_f0_newton", "solver": "SolverFeatherstone"},
+               {"bag": "t0_e00_f0_newton", "solver": "SolverMuJoCo"}]
+    report = compare_backends(frame, records, ComparisonThresholds()).set_index("pair")
+    assert list(report.index) == ["t0_rigid_f0", "t0_e00_f0"]
+    assert report["pass"].all()
+    assert (report[["q_link_rms", "ft_relative_rms"]] == 0.0).all().all()
+    assert not report.loc["t0_rigid_f0", "elastic"] and np.isnan(report.loc["t0_rigid_f0", "deflection_relative_rms"])
+    assert bool(report.loc["t0_rigid_f0", "independent"]) is True
+    assert bool(report.loc["t0_e00_f0", "independent"]) is False
+
+
+def test_backend_comparison_flags_a_divergent_backend():
+    import pandas as pd
+    from elastic_sim.backend_comparison import ComparisonThresholds, compare_backends, format_report, summarize
+
+    rng = np.random.default_rng(0)
+    frame = pd.concat([
+        _synthetic_bag("t0_e00_f0_mujoco", "mujoco", "e00", rng),
+        _synthetic_bag("t0_e00_f0_newton", "newton", "e00", rng, offset=1e-3),
+    ], ignore_index=True)
+    thresholds = ComparisonThresholds()
+    report = compare_backends(frame, (), thresholds)
+    row = report.iloc[0]
+    assert row["q_link_rms"] == pytest.approx(1e-3)
+    assert row["ft_relative_rms"] > 0.0 and not row["pass"]
+    assert row["independent"] is None, "solver is unknown without a manifest"
+    assert summarize(report, thresholds)["failed"] == ["t0_e00_f0"]
+    assert "FAIL" in format_report(report, thresholds)

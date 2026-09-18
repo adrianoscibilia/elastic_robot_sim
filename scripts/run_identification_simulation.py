@@ -16,10 +16,10 @@ Check a trajectory without starting a simulator at all::
 
     python scripts/run_identification_simulation.py --trajectory-only
 
-Inspect the softest tier in Newton and keep the samples::
+Inspect sampled elastic robot e03 in Newton and keep the samples::
 
     python scripts/run_identification_simulation.py \
-        --tier k1e04 --backend newton --output /tmp/one_rollout.csv
+        --tier e03 --backend newton --output /tmp/one_rollout.csv
 """
 
 from __future__ import annotations
@@ -37,8 +37,11 @@ sys.path.insert(0, os.fspath(_REPO / "src"))
 from elastic_sim import excitation as exc
 from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
-from elastic_sim.dataset import DEFAULT_CONFIG, RIGID_TIER, load_config, rollout_frame, run_condition
+from elastic_sim.dataset import (
+    DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, rollout_frame, run_condition,
+)
 from elastic_sim.kinematics import PortableKinematics
+from elastic_sim.torque_runners import link_inertia_envelope
 
 
 def _load_asset(reference: str):
@@ -58,7 +61,7 @@ def main() -> None:
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML defaults (see config/identification/)")
     parser.add_argument("--asset", default=None)
     parser.add_argument("--backend", default=None, choices=("mujoco", "newton"))
-    parser.add_argument("--tier", default=None, help=f"Tier name, e.g. {RIGID_TIER} or k4e04")
+    parser.add_argument("--tier", default=None, help=f"Tier name: {RIGID_TIER} or a sampled robot e00, e01, ...")
     parser.add_argument("--seed", type=int, default=None, help="Trajectory seed")
     parser.add_argument("--base-frequency", type=float, default=None)
     parser.add_argument("--max-acceleration", type=float, default=None)
@@ -121,10 +124,12 @@ def main() -> None:
         control_frequency=args.control_frequency or config.control_frequency,
     )
     friction = idn.FrictionModel.from_asset(asset)
-    print(f"\ntier {tier.name!r} on {backend}"
-          + ("" if tier.is_rigid else f" (stiffness {tier.stiffness:.3g} Nm/rad)")
-          + (" with viewer" if run_config.visualize else ""))
-    result = run_condition(asset, trajectory, tier, backend, friction, run_config)
+    print(f"\ntier {tier.name!r} on {backend}" + (" with viewer" if run_config.visualize else ""))
+    link_inertia = None
+    if not tier.is_rigid:
+        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
+        _report_transmission(tier.transmission(len(asset.joint_names), link_inertia), run_config)
+    result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia)
     _report_rollout(asset, result, friction)
 
     if not args.output:
@@ -170,6 +175,15 @@ def _report_trajectory(asset, trajectory, kinematics) -> None:
     )
     print(f"  collision-free (margin {margin:g}) : {report.valid} "
           f"(closest {report.minimum_distance:.4f} m, {report.closest_pair})")
+
+
+def _report_transmission(transmission, config) -> None:
+    print(f"  stiffness [Nm/rad]         : {np.round(transmission.stiffness, 0)}")
+    print(f"  damping ratio              : {np.round(transmission.damping_ratio, 3)}")
+    print(f"  damping [Nm s/rad]         : {np.round(transmission.damping, 2)}")
+    print(f"  rotor inertia [kg m^2]     : {np.round(transmission.rotor_inertia, 4)}")
+    print(f"  highest mode per joint [Hz]: {np.round(transmission.natural_frequency(), 0)}")
+    print(f"  integration step           : {elastic_time_step(transmission, config):.2e} s")
 
 
 def _report_rollout(asset, result, friction) -> None:
