@@ -72,8 +72,15 @@ def main() -> None:
                         help="Run everything but write nothing, for debugging")
     parser.add_argument("--visualize", action="store_true", help="Open the native viewer for each rollout")
     parser.add_argument("--realtime-scale", type=float, default=None, help="1.0 is real time")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="Parallel worker processes for the bag loop (forced to 1 under --visualize)")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
+    if args.visualize and args.jobs > 1:
+        parser.error("--jobs > 1 is incompatible with --visualize")
 
     config = load_config(_resolve(args.config))
 
@@ -133,11 +140,13 @@ def main() -> None:
               f"x backends {list(config.backends)} x {config.n_trajectories} trajectories "
               f"x {config.n_friction_samples} friction samples")
 
-    frame, manifest, comparison = generate(config, asset, verbose=not args.quiet)
+    frame, manifest, comparison = generate(config, asset, verbose=not args.quiet, jobs=args.jobs)
     if args.no_save:
         print(f"\n{len(frame)} samples in {manifest['n_bags']} bags; nothing written (--no-save).")
         return
-    csv_path, manifest_path, comparison_path = write_dataset(frame, manifest, _resolve(config.output), comparison)
+    csv_path, manifest_path, comparison_path = write_dataset(
+        frame, manifest, _resolve(config.output), comparison, metadata_columns=config.metadata_columns,
+    )
     print(f"\nWrote {len(frame)} samples in {manifest['n_bags']} bags to {csv_path}")
     print(f"Wrote manifest to {manifest_path}")
     if comparison_path is not None:

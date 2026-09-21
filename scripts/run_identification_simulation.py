@@ -38,8 +38,8 @@ from elastic_sim import excitation as exc
 from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.dataset import (
-    DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, rollout_frame, run_condition,
-    trajectory_seed,
+    DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, regime_excitation, rollout_frame,
+    run_condition, trajectory_seed,
 )
 from elastic_sim.kinematics import PortableKinematics
 from elastic_sim.torque_runners import link_inertia_envelope
@@ -57,13 +57,47 @@ def _resolve(path: str) -> Path:
     return candidate if candidate.is_absolute() else _REPO / candidate
 
 
+def _check_manifest_agrees(parser, config, manifest_path: Path) -> None:
+    """Fail loudly when this config could not have produced ``manifest_path``.
+
+    Stratified/Sobol sampling is defined by the whole batch (``robots``), so
+    ``--tier eNN`` against a dataset built with a different ``robots``,
+    ``sampling`` or ``seed`` silently reproduces the wrong robot instead of
+    erroring -- this is the mismatch class R3_03 introduces.
+    """
+    import json
+
+    if not manifest_path.is_file():
+        parser.error(f"--manifest {manifest_path} does not exist")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    recorded = manifest.get("transmission_sampling", {})
+    checks = (
+        ("robots", recorded.get("robots"), config.transmission.robots),
+        ("sampling", recorded.get("sampling"), config.transmission.sampling),
+        ("seed", manifest.get("seed"), config.seed),
+    )
+    mismatches = [f"{name}: manifest={recorded_value!r} config={config_value!r}"
+                  for name, recorded_value, config_value in checks if recorded_value != config_value]
+    if mismatches:
+        parser.error(
+            f"--manifest {manifest_path} disagrees with the current config, so --tier would not "
+            f"reproduce its robots: {'; '.join(mismatches)}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML defaults (see config/identification/)")
     parser.add_argument("--asset", default=None)
     parser.add_argument("--backend", default=None, choices=("mujoco", "newton"))
     parser.add_argument("--tier", default=None, help=f"Tier name: {RIGID_TIER} or a sampled robot e00, e01, ...")
+    parser.add_argument("--manifest", default=None,
+                        help="A written dataset's .manifest.json; with --tier, errors if this config's "
+                             "robots/sampling/seed disagree with the ones that produced it")
     parser.add_argument("--seed", type=int, default=None, help="Trajectory seed")
+    parser.add_argument("--trajectory", type=int, default=0,
+                        help="Trajectory index within the tier (0 by default); reproduces the dataset's "
+                             "regime for that index when excitation.regime is enabled")
     parser.add_argument("--base-frequency", type=float, default=None)
     parser.add_argument("--max-acceleration", type=float, default=None)
     parser.add_argument("--candidates", type=int, default=None)
@@ -82,22 +116,27 @@ def main() -> None:
     asset.resolve_active_joints()
     asset.validate_resources()
 
+    if args.manifest and args.tier:
+        _check_manifest_agrees(parser, config, _resolve(args.manifest))
+
     from dataclasses import replace
 
-    excitation = config.excitation
+    tier_name = args.tier or config.tiers[0].name
+    matches = [tier for tier in config.tiers if tier.name == tier_name]
+    if not matches:
+        parser.error(f"unknown tier {tier_name!r}; config has {[t.name for t in config.tiers]}")
+    tier = matches[0]
+    # Same rule as the dataset, so --tier eNN --trajectory k reproduces that
+    # robot's k-th trajectory, seed and (if excitation.regime is enabled)
+    # dynamic regime.
+    seed = trajectory_seed(config, tier, args.trajectory) if args.seed is None else args.seed
+    excitation = regime_excitation(config.excitation, config.regime, config.seed, seed)
     if args.base_frequency is not None or args.max_acceleration is not None:
         excitation = replace(
             excitation,
             base_frequency=args.base_frequency or excitation.base_frequency,
             max_acceleration=args.max_acceleration or excitation.max_acceleration,
         )
-    tier_name = args.tier or config.tiers[0].name
-    matches = [tier for tier in config.tiers if tier.name == tier_name]
-    if not matches:
-        parser.error(f"unknown tier {tier_name!r}; config has {[t.name for t in config.tiers]}")
-    tier = matches[0]
-    # Same rule as the dataset, so --tier eNN reproduces that robot's trajectory.
-    seed = trajectory_seed(config, tier, 0) if args.seed is None else args.seed
     candidates = args.candidates or config.candidates
 
     print(f"asset      : {asset.name} ({len(asset.joint_names)} joints)")

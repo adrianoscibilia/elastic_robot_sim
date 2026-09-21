@@ -19,7 +19,13 @@ dependencies = [
     "pycollada>=0.9",
     "pyglet>=2.1",
     "imgui-bundle>=1.92",
-    "pin==4.1.0",
+    # cmeel's pinocchio packaging (`pin>=3.8`) requires cmeel-assimp>=6.0.2,
+    # which ships no win_amd64 wheel, so pin==4.1.0 is unresolvable on
+    # Windows; pin==3.4.0 is the newest release still built against the
+    # older coal-library/cmeel-assimp chain that does. Keep Linux/macOS on
+    # the newer release and only fall back on Windows.
+    "pin==4.1.0; sys_platform != 'win32'",
+    "pin==3.4.0; sys_platform == 'win32'",
     "pin-pink==4.3.0",
     "proxsuite==0.7.3",
 ]
@@ -36,5 +42,18 @@ calibration = [
     "torch>=2.2",
 ]
 
+[tool.pytest.ini_options]
+markers = ["slow: needs a simulator backend and takes noticeably longer than the rest of the suite"]
+
 [tool.uv]
 package = false
+# A handful of pin==3.4.0's build-from-source dependencies on Windows (see
+# above; no win_amd64 wheel) ship a CMakeLists.txt whose
+# cmake_minimum_required predates CMake 4.0's removal of policies < 3.5
+# (cmeel-console-bridge in particular). Pinning the build-time cmake here
+# would break siblings that require cmake>=4 (e.g. cmeel-zlib), so this
+# cannot be solved from pyproject.toml alone: on Windows, `uv sync` needs
+# CMAKE_POLICY_VERSION_MINIMUM=3.5 set in the environment first, e.g.
+#   $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"; uv sync
+# It only affects source builds, so it is inert on platforms (Linux/macOS)
+# that already resolve prebuilt wheels for pin==4.1.0.

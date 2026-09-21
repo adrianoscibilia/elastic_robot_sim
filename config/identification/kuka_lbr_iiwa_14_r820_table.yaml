@@ -17,27 +17,59 @@ backends: [mujoco, newton]
 rigid_reference: true
 
 # Sampled elastic robots, payload 0.  Each robot draws every joint's stiffness
-# log-uniformly from its interval and its damping ratio uniformly; damping is
-# derived, d = 2 zeta sqrt(k J_eff), with J_eff the rotor/link reduced inertia.
-#
-# Stiffness intervals are order-of-magnitude values for a harmonic drive in
-# series with a joint torque sensor (LWR/iiwa class), stiffer at the base than
-# at the wrist.  They are not datasheet values.  With them the transmission
-# modes sit near 50-170 Hz at A1-A6 and 600-900 Hz at A7, whose link-side
-# inertia is only 3e-4 kg m^2; that mode sets the integration step (~6e-5 s).
+# log-uniformly (nominal x factor, see docs/PARAMETER_PROVENANCE.md for where
+# the nominals and the factor come from) and its damping ratio uniformly;
+# damping is derived, d = 2 zeta sqrt(k J_eff), with J_eff the rotor/link
+# reduced inertia.  With these values the transmission modes sit near
+# 50-170 Hz at A1-A6 and 600-900 Hz at A7, whose link-side inertia is only
+# 3e-4 kg m^2; that mode sets the integration step (~6e-5 s).
 transmission:
-  robots: 6
-  stiffness:                  # [min, max] Nm/rad, joints A1..A7
-    - [1.5e4, 3.5e4]
-    - [1.5e4, 3.5e4]
-    - [1.0e4, 2.5e4]
-    - [1.0e4, 2.5e4]
-    - [5.0e3, 1.5e4]
-    - [3.0e3, 1.0e4]
-    - [3.0e3, 1.0e4]
-  damping_ratio: [0.05, 0.2]  # sampled per joint
-  rotor_inertia: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # reflected [kg m^2], as armature; to refine
+  robots: 20
+  # 20 stratified draws give ~95% marginal coverage per joint versus ~40-70%
+  # at 6 i.i.d. draws (R3_03 F4); "sobol" is also available and prefix-stable.
+  sampling: stratified
+  stiffness_nominal: [2.4e4, 2.4e4, 1.6e4, 1.6e4, 9.0e3, 5.5e3, 5.5e3]  # Nm/rad, A1..A7
+  # k_j = nominal_j * exp(U(-ln r, +ln r)), r = 2.  Not a guess: it is the
+  # documented reproducibility of a harmonic-drive stiffness measurement (see
+  # "Why factor 2" in docs/PARAMETER_PROVENANCE.md).
+  stiffness_factor: [0.5, 2.0]
+  # Fraction of the log-uncertainty that is one arm-wide scale rather than
+  # per-joint: a real arm is built from one gearbox family, so its joint
+  # stiffnesses are correlated; independent per-joint draws would generate
+  # physically implausible arms (a very stiff A6 under a very soft A2).
+  # Trades per-joint coverage for that realism -- any value above ~0.1 pulls
+  # the achievable per-joint span well under the round's 0.9 coverage bar at
+  # this robot count, since hitting a joint's extreme then also requires the
+  # shared common factor to land at an extreme for the same robot.  0 keeps
+  # full per-joint coverage; raise it (0.3-0.5) if correlated arms matter
+  # more than range coverage for a given use of the dataset.
+  stiffness_common_fraction: 0.0
+  stiffness_provenance: [P, P, C, C, C, E, E]
+  damping_ratio: [0.05, 0.2]  # sampled per joint; unobservable until the excitation probe (below) is enabled
+  rotor_inertia_nominal: [1.0, 1.0, 0.5, 0.5, 0.25, 0.15, 0.15]  # reflected [kg m^2], as armature
+  rotor_inertia_factor: [0.5, 2.0]
+  rotor_inertia_provenance: [P, P, C, C, C, E, E]
   inertia_samples: 512        # configurations used for the link-inertia envelope
+
+# Randomized tool/payload rigidly attached to the flange.  Without one the
+# last three link-side torque channels are numerically zero (M_77 = 3e-4
+# kg m^2 on the bare flange) and per-channel normalization in the consumer
+# amplifies their noise to unit variance; a payload also makes the link-side
+# dynamics differ between sampled robots, which transmission stiffness alone
+# does not (R3_01).  0-6 kg stays well inside the 14 kg rating with headroom
+# under max_acceleration; effort-limit compliance is asserted at dataset time.
+payload:
+  enabled: true
+  mass: [0.0, 6.0]             # kg, sampled uniformly; 0 keeps the bare-flange case
+  # Offset of the payload centre of mass from the flange frame, in the flange
+  # frame [m].  Sampled uniformly and independently per axis.
+  offset_x: [-0.08, 0.08]
+  offset_y: [-0.08, 0.08]
+  offset_z: [0.02, 0.20]
+  size: [0.05, 0.25]           # m, cube edge; the payload is a uniform box
+  # Draw one payload per robot (a robot ships with a tool) or one per
+  # trajectory (the same robot is used with many tools).
+  per: robot
 
 # MuJoCo/Newton agreement limits per bag pair, on the worst joint.  Failing
 # pairs are reported and flagged in the manifest, never dropped.
@@ -71,9 +103,31 @@ excitation:
   # ~0.8 without hurting the regressor condition number.
   centre_jitter: 1.0
   candidates: 48              # random candidates scored per trajectory
+  # Modal probe.  Small-amplitude high harmonics that put energy at the
+  # transmission resonances (50-170 Hz on A1-A6), without which the sampled
+  # damping ratios leave no signature in the data at all and the stiffness is
+  # only visible as the static deflection tau/k (R3_02 F3).  Indices are
+  # multiples of base_frequency; 400 -> 40 Hz at base_frequency 0.1.  Keep the
+  # top index below 0.4 / sample_time_step (2000 here) to avoid aliasing the
+  # output grid.
+  probe_harmonics: [400, 700, 1000, 1300, 1600]
+  probe_acceleration_fraction: 0.2
+  # Per-trajectory regime randomization.  Without it every trajectory is
+  # amplitude-maximized against the same caps, so the acceleration and
+  # velocity distributions are near-identical bag to bag and the dataset
+  # spans a single dynamic regime (R3_02 F6).  base_frequency is
+  # deliberately left fixed for now (see RegimeSampling's docstring) so bag
+  # lengths stay uniform.
+  regime:
+    enabled: true
+    max_acceleration: [1.0, 8.0]     # rad/s^2
+    velocity_fraction: [0.3, 0.9]
 
 dataset:
-  trajectories: 10
+  # robots x trajectories is a budget; parameter coverage is the scarce axis
+  # (R3_03), so 20 robots x 3 trajectories keeps the same ~60-bag total as
+  # the old 6 x 10 while raising stiffness coverage from ~40-70% to ~95%.
+  trajectories: 3
   # Give every elastic variant its own trajectories instead of replaying one
   # shared set: the file then holds robots x trajectories distinct paths.
   trajectories_per_robot: true
@@ -85,6 +139,20 @@ dataset:
   friction_scale: [0.5, 2.0]  # log-uniform multiplier on the URDF values
   seed: 20260917
   output: data/identification/kuka_lbr_iiwa_14_r820_table.csv
+  # "inline" keeps ~42 per-bag-constant metadata columns on every row
+  # (simple, historical).  "sidecar" moves them to a <dataset>.bag_metadata
+  # .json keyed by bag instead, saving ~40% of file size -- worth it once
+  # `robots` pushes past ~25 (R3_06).  Use a .parquet `output` path (instead
+  # of .csv) for a further ~10x reduction via typed, compressed columns.
+  metadata_columns: inline
+  # How bags are assigned to train / validation / test.  "holdout_robots"
+  # reserves whole robots (the softest and stiffest strata), which is the
+  # only split that measures generalization to an unseen transmission --
+  # the reason the transmission is randomized at all (R3_05 F7).
+  split:
+    mode: holdout_robots
+    test_robots: 4
+    val_robots: 2
 
 simulation:
   control_frequency: 25.0     # closed-loop bandwidth [rad/s]
@@ -92,6 +160,14 @@ simulation:
   rigid_time_step: 5.0e-4
   max_time_step: 5.0e-4       # elastic robots use less, set by their fastest mode
   sample_time_step: 0.002     # uniform output grid [s]
+  # Evaluate the controller every N physics steps and hold the torque
+  # (zero-order hold) between updates -- a 4 Hz controller running at the
+  # ~640 Hz-16 kHz the transmission mode demands is 100-4000x oversampled
+  # (R3_06).  Left at 1 (no decimation) by default: raising it needs the
+  # feedback/feedforward and rigid-vs-Pinocchio-residual tests re-verified at
+  # the chosen value, which is a per-deployment check, not a default this
+  # config should silently opt into.
+  control_decimation: 1
 
 visualization:
   enabled: false

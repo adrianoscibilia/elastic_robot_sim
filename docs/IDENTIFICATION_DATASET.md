@@ -187,26 +187,66 @@ the learning task.
 
 ### Sampling
 
+The stiffness and rotor-inertia intervals are not estimates of the true
+values. Each is the support of a prior over a parameter the nominal model
+cannot observe, and the dataset is a domain-randomization ensemble drawn
+from that prior. An interval is therefore judged by two criteria only: does
+it contain the true value with high confidence, and is it no wider than the
+physically admissible range? Neither criterion requires knowing the true
+value, which is what makes the framing defensible without a measurement in
+hand. See `docs/PARAMETER_PROVENANCE.md` for the full argument, the anchors
+that ground each nominal, and why the multiplicative factor is `2` (not a
+guess -- it is the documented reproducibility of a harmonic-drive stiffness
+measurement).
+
 Configured in the `transmission` block of the YAML:
 
-- **Stiffness** — one `[min, max]` interval per joint, sampled log-uniformly
-  (as the original FMRR generator did), so a wide interval is not dominated by
-  its stiff end. The defaults are order-of-magnitude values for a harmonic
-  drive in series with a joint torque sensor, stiffer at the base than at the
-  wrist: A1–A2 1.5e4–3.5e4, A3–A4 1e4–2.5e4, A5 5e3–1.5e4, A6–A7 3e3–1e4
-  Nm/rad. They are not datasheet values; refine them when measurements exist.
+- **Stiffness** — `stiffness_nominal` (one value per joint, with provenance
+  recorded in `docs/PARAMETER_PROVENANCE.md`) times a log-uniform
+  `stiffness_factor`, `k_j = nominal_j * exp(U(-ln r, +ln r))`. A
+  `stiffness_common_fraction` splits that log-uncertainty between one
+  arm-wide scale (correlated joints, as a real gearbox family would produce)
+  and independent per-joint scatter; `0` keeps every joint independent and
+  maximizes marginal coverage, `1` gives a one-dimensional family. The legacy
+  `stiffness: [[min, max], ...]` interval form is still accepted (with a
+  deprecation warning) and maps directly to a per-joint log-uniform draw.
+- **Sampling method** (`transmission.sampling`) — `iid` (independent per
+  robot; a robot depends only on the seed and its index, so raising `robots`
+  leaves existing robots unchanged, but six-ish i.i.d. draws visit only
+  15–46 % of a wide declared interval), `stratified` (one draw per
+  equal-width stratum in log space, permuted independently per joint — full
+  marginal coverage at the same robot count, but redefines the whole set
+  when `robots` changes) or `sobol` (a scrambled Sobol sequence — full
+  coverage *and* prefix-stable, needs `scipy.stats.qmc`). The shipped config
+  uses `stratified` with `robots: 20`, giving ≥ 0.9 per-joint coverage versus
+  ~0.4–0.7 at the historical 6 i.i.d. robots.
 - **Damping ratio** — one interval, sampled uniformly per joint (default
-  0.05–0.2, the lightly damped range of a geared joint).
+  0.05–0.2, the lightly damped range of a geared joint). Left un-stratified
+  deliberately: it is unobservable in the data until the excitation modal
+  probe is enabled (see "Excitation trajectories" below), so widening its
+  coverage would only add label noise.
 - **Damping coefficient** — never configured. It is derived as
   `d = 2 ζ sqrt(k J_eff)`.
-- **Rotor inertia** — reflected rotor inertia per joint, applied as armature;
-  fixed, not sampled.
+- **Rotor inertia** — `rotor_inertia_nominal x rotor_inertia_factor`, sampled
+  exactly like stiffness but from its own stream, **independent** of the
+  stiffness draw: `k` and `J_rotor` come from different physical components
+  and correlating them would hide the `sqrt(k / J_eff)` mode-frequency
+  degeneracy rather than cover it. Give only `rotor_inertia` (a fixed value
+  or one per joint) to keep the historical unsampled behaviour.
 
-Robots are drawn from their own random stream in index order, so a robot
-depends only on the dataset seed and its index: raising `robots` adds robots
-without changing existing ones, and `run_identification_simulation.py --tier
-e03` reproduces the dataset's `e03`. Rigid and elastic bags interleave in the
-file (see below).
+Every dataset build prints a per-joint, per-parameter coverage report
+(declared vs. realized log span) and warns below 80 % coverage; it is also
+written into the manifest as `sampling_coverage`.
+
+Robots are drawn from their own random stream in index order when
+`sampling: iid`, so a robot depends only on the dataset seed and its index:
+raising `robots` adds robots without changing existing ones, and
+`run_identification_simulation.py --tier e03` reproduces the dataset's `e03`.
+`stratified` sampling does not have this property — it is defined by the
+whole batch, so changing `robots` redefines every robot; pass
+`--manifest <dataset>.manifest.json` alongside `--tier` to fail loudly rather
+than silently reproducing the wrong robot when the two disagree. Rigid and
+elastic bags interleave in the file (see below).
 
 ### Why the link inertia matters
 
@@ -265,7 +305,7 @@ A friction sample would only become a real condition if the controller were
 given a *different* friction model from the plant, which is a deliberate
 model-mismatch experiment rather than a dataset axis.
 
-### What the payload-free wrist can teach
+### What the payload-free wrist can teach, and why the dataset now fits one
 
 The learning target is the link-side torque. With no tool fitted, the link
 past the A7 transmission is the bare flange (`M_77 = 3e-4 kg m^2`), so its
@@ -274,6 +314,34 @@ link-side torque is essentially zero: measured RMS per joint is about
 joints is 4-7 Nm of friction and rotor inertia. The distal channels therefore
 carry almost no signal, and per-channel normalization will amplify their
 noise. Only a payload or tool changes this; larger accelerations do not.
+
+There is a second, deeper reason to fit one. The link-side map `(q, dq, ddq)
+-> ft` is *literally the URDF's own* `rnea`, identical for every sampled
+robot regardless of stiffness -- only `stiffness`, `damping` and
+`rotor_inertia` differ, and none of them appear on the right-hand side of
+that equation. Randomizing the transmission therefore changes *which states
+get visited* (a covariate shift) but not the function relating them to `ft`.
+A payload changes `M(q)`, `C(q, dq)` and `g(q)` themselves, so the link-side
+dynamics genuinely differ robot to robot -- which stiffness alone does not
+give a link-side-only model.
+
+`payload.enabled: true` in the YAML fits a randomized uniform-box tool at the
+flange (mass, offset and size ranges configurable), injected directly into
+the URDF (see `src/elastic_sim/payload.py`) so every consumer of the asset --
+Pinocchio, both simulators, the collision checker -- sees the same robot by
+construction; MuJoCo-only `body_overrides` would de-tune the controller
+instead. Which target a given model family actually needs depends on what it
+consumes:
+
+| Map | Inputs | Target | Depends on stiffness? |
+|---|---|---|---|
+| A | `q, dq, ddq` (link) | `ft` | No -- see above |
+| B | `q, dq, ddq, tau` | `ft` | Yes, via `tau - ft` |
+| C | `q_motor, dq_motor, tau` | `defl = q_motor - q_link` | Yes, directly |
+
+Map C (the `defl0..defl{n-1}` columns) is the cleanest target for
+identifying the transmission parameters themselves: its magnitude is
+`tau / k`, a direct readout of the parameter being randomized.
 
 ## Backend comparison
 
@@ -319,27 +387,92 @@ One row per sample, consumed directly by `dynamic_model_nn`'s `CustomDataset`.
 | `tau0..tau{n-1}` | applied **motor-side** torque [Nm] — model input |
 | `ft0..ft{n-1}` | **link-side** torque [Nm] — training target |
 | `q_motor*`, `dq_motor*`, `q_link*`, `dq_link*` | ingested, available to elastic models |
+| `defl0..defl{n-1}` | `q_motor - q_link` [rad] — Map C target, direct readout of `tau / k` |
+| `split` | `"train"`, `"val"` or `"test"`, one label per bag (see below) |
+| `payload_mass`, `payload_offset_x/y/z`, `payload_size` | the fitted tool, constant within a bag, `NaN` on the rigid tier |
 | `tier`, `backend`, `experiment`, `viscous__<joint>`, `coulomb__<joint>`, `stiffness__<joint>`, `damping__<joint>`, `damping_ratio__<joint>`, `rotor_inertia__<joint>` | metadata, ignored by the loader; transmission columns are empty on rigid bags |
 
 `ddq` is deliberately **not** emitted: the consumer always recomputes it with a
 Savitzky-Golay filter and ignores the column. That filter requires a uniform
-time step, so every bag is resampled onto a common grid regardless of the step
-its tier needed.
+time step *within* a bag (not across bags — see the excitation regime
+randomization below), so every bag is resampled onto a common grid regardless
+of the step its tier needed, and `generate()` asserts every bag's `t` column
+is uniform to `1e-12` before writing anything.
 
 In the rigid tier `tau` and `ft` are identical, because a rigid chain has no
 transmission compliance. That tier is meant for validating the pipeline against
 the analytic model, not for training.
 
-Bags are written with trajectory varying slowest and backend fastest.
-`dynamic_model_nn` splits train/test as a *contiguous half* of the file, so a
-dataset ordered by tier would put whole tiers on one side of that split.
+Bags are written with trajectory varying slowest and backend fastest, so
+consecutive bags differ by condition rather than by regime; that ordering is
+independent of `split`, which is assigned explicitly per bag (see below) and
+does not depend on file position.
+
+### Splits
+
+`dataset.split` in the YAML (`SplitPolicy` in `src/elastic_sim/dataset.py`)
+declares how tiers are assigned to `train` / `val` / `test`, written into the
+`split` column and into the manifest's top-level `split` block:
+
+- `contiguous` (default) assigns every bag `"train"` — the historical
+  behaviour, where a consumer splitting a contiguous half of the file puts
+  every robot in both halves and can only measure generalization to a new
+  *trajectory*, not a new *transmission*.
+- `holdout_robots` reserves whole robots for `val`/`test`, chosen as the
+  softest and stiffest strata by mean log stiffness rather than the last *N*
+  by index, so the held-out set is a measured extrapolation margin. This is
+  the only split that can show whether a model generalizes to an unseen
+  stiffness, which is the entire point of randomizing it.
+
+`declared_split_loaders` in `dynamic_model_nn/dataset.py` honours the `split`
+column when present and falls back to the historical contiguous 50/50 split
+otherwise, so old CSVs load unchanged.
 
 ### Consumer requirement
 
-`dynamic_model_nn` originally accepted a target of only three or six channels
-while its models emit one per joint, so a 7-DoF arm failed in the loss. Its
-`dataset.py` now accepts a general `ft0..ft{dof-1}` block, checked before the
-fixed six-channel form so a 7-channel target is not silently truncated.
+`dynamic_model_nn`'s `dataset.py` accepts a general `ft0..ft{dof-1}` block in
+`CustomDataset._load_dataframe`, checked before the fixed six-channel wrench
+form so a 7-channel per-joint target is not silently truncated to six (the
+six-channel branch stays reachable, and correct, for genuine 6-channel wrench
+datasets where `dof == 6`). Every generated dataset also gets a
+`<dataset>.contract.json` sidecar next to the CSV, stating `n_dof`, the input
+and target column ranges, the target semantics and which consumer branch it
+requires — read it before wiring up a new training script.
+
+### Normalization erases magnitude — read this before training
+
+`CustomDataset._normalize`'s optional per-bag mode (`stats_by_bag`) subtracts
+each bag's own mean and divides by its own standard deviation. Applied to the
+target, this removes each bag's *scale* — exactly the axis that differs
+between a soft and a stiff sampled robot — so a model sees the same
+normalized shape regardless of which robot generated it. It also amplifies
+any channel whose true RMS is near zero (see "What the payload-free wrist can
+teach" above) to unit-variance noise. **Use global normalization for the
+target**; per-bag normalization for the *inputs* only, if at all.
+
+## Generation cost and storage
+
+The rollout is Python- and RNEA-bound, not physics-bound (`R3_06`), so three
+knobs pay for themselves once the robot count rises past ~25:
+
+- `simulation.control_decimation: N` evaluates the controller every `N`
+  physics steps and holds the torque between updates (zero-order hold, as a
+  real drive does). The physics step is set by the transmission mode
+  (~640 Hz-16 kHz), not the controller's ~4 Hz closed-loop bandwidth, so this
+  recovers most of that gap as speed with no change to what is recorded.
+  Left at `1` by default; raising it needs the feedback-ratio and
+  rigid-vs-Pinocchio-residual checks re-verified at the chosen value.
+- `--jobs N` on `generate_identification_dataset.py` parallelizes the bag
+  loop with a process pool (forced to 1 under `--visualize`). Bags are fully
+  independent and their RNG streams are keyed on `(seed, index)`, not on
+  execution order, so `--jobs 4` produces a bit-identical dataset to
+  `--jobs 1`.
+- `dataset.output` ending in `.parquet` instead of `.csv` writes typed,
+  compressed, float32 columns (~10x smaller); `dataset.metadata_columns:
+  sidecar` moves the ~42 per-bag-constant metadata columns to a
+  `<dataset>.bag_metadata.json` keyed by bag instead of repeating them on
+  every row (~40% smaller). Both default to the historical inline-CSV
+  behaviour.
 
 ## Verification
 

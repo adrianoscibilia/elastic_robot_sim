@@ -297,9 +297,20 @@ def run_mujoco_torque(
     disable_contacts: bool = True,
     visualize: bool = False,
     realtime_scale: float = 1.0,
+    control_decimation: int = 1,
 ) -> dict[str, Any]:
-    """Integrate ``asset`` under an injected joint torque in MuJoCo."""
+    """Integrate ``asset`` under an injected joint torque in MuJoCo.
+
+    ``control_decimation`` evaluates the controller every ``N`` physics steps
+    and holds the applied torque between updates (zero-order hold, as a real
+    drive does).  The recorded label is still the applied torque, not the
+    command, so this changes *what physical drive* is being simulated, not
+    the identification-correctness property that makes the label exact.
+    """
     import mujoco
+
+    if control_decimation < 1:
+        raise ValueError("control_decimation must be >= 1")
 
     from .generic_mujoco_runner import _build_model, _joint_addresses
 
@@ -312,11 +323,14 @@ def run_mujoco_torque(
         disable_mujoco_contacts(model)
     data = mujoco.MjData(model)
     active = _joint_addresses(model, mujoco, tuple(asset.joint_names))
+    # Resolved once: two integer index arrays used for fancy indexing instead
+    # of a Python-level dict/tuple lookup and list comprehension every step.
+    qpos_idx = np.asarray([qpos for qpos, _ in active], dtype=int)
+    dof_idx = np.asarray([dof for _, dof in active], dtype=int)
 
     q0, dq0, _ = trajectory(0.0)
-    for index, (qpos, dof) in enumerate(active):
-        data.qpos[qpos] = q0[index]
-        data.qvel[dof] = dq0[index]
+    data.qpos[qpos_idx] = q0
+    data.qvel[dof_idx] = dq0
     mujoco.mj_forward(model, data)
 
     grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
@@ -324,24 +338,28 @@ def run_mujoco_torque(
     viewer = _open_viewer("mujoco", asset, trajectory, model, data) if visualize else None
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
+    command = solver_torque = None
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
-        q = np.asarray([data.qpos[qpos] for qpos, _ in active], dtype=float)
-        dq = np.asarray([data.qvel[dof] for _, dof in active], dtype=float)
+        q = data.qpos[qpos_idx].copy()
+        dq = data.qvel[dof_idx].copy()
         if not (np.isfinite(q).all() and np.isfinite(dq).all()):
             raise RuntimeError(f"MuJoCo torque rollout became non-finite at t={sample_time:.6f}s")
-        command = controller(float(sample_time), q, dq)
+        if index % control_decimation == 0:
+            command = controller(float(sample_time), q, dq)
+            # Friction is modelled explicitly rather than by the importer, so
+            # it is subtracted here: the recorded label stays the full joint
+            # torque.  Held with the rest of the command under decimation, as
+            # a real drive's friction compensation updates at its own control
+            # rate rather than the physics rate.
+            solver_torque = command.total - friction.torque(dq)
         data.qfrc_applied[:] = 0.0
-        # Friction is modelled explicitly rather than by the importer, so it
-        # is subtracted here: the recorded label stays the full joint torque.
-        solver_torque = command.total - friction.torque(dq)
-        for joint_index, (_, dof) in enumerate(active):
-            data.qfrc_applied[dof] = solver_torque[joint_index]
+        data.qfrc_applied[dof_idx] = solver_torque
         mujoco.mj_forward(model, data)
         q_rows.append(q)
         dq_rows.append(dq)
-        ddq_rows.append(np.asarray([data.qacc[dof] for _, dof in active], dtype=float))
+        ddq_rows.append(data.qacc[dof_idx].copy())
         tau_rows.append(command.total)
         ff_rows.append(command.feedforward)
         fb_rows.append(command.feedback)
@@ -402,6 +420,7 @@ def run_newton_torque(
     realtime_scale: float = 1.0,
     solver_order: tuple[str, ...] = ("SolverFeatherstone", "SolverMuJoCo", "SolverSemiImplicit"),
     capture_graph: bool = True,
+    control_decimation: int = 1,
 ) -> dict[str, Any]:
     """Integrate ``asset`` under an injected joint torque in Newton.
 
@@ -412,6 +431,8 @@ def run_newton_torque(
     """
     from .generic_newton_runner import _as_numpy, _build_rigid_model, _new_solver
 
+    if control_decimation < 1:
+        raise ValueError("control_decimation must be >= 1")
     if tuple(trajectory.joint_names) != tuple(asset.joint_names):
         raise ValueError("Trajectory joint_names must match asset active_joints exactly")
     friction = FrictionModel.from_asset(asset) if friction is None else friction
@@ -432,12 +453,15 @@ def run_newton_torque(
     needs_ik = not isinstance(solver, direct) if direct else True
 
     names = tuple(asset.joint_names)
+    # Resolved once: integer index arrays used for fancy indexing instead of
+    # a per-step, per-joint dict lookup.
+    q_idx = np.asarray([built.q_index[name] for name in names], dtype=int)
+    qd_idx = np.asarray([built.qd_index[name] for name in names], dtype=int)
     q0, dq0, _ = trajectory(0.0)
     initial_q = _as_numpy(state_in.joint_q).reshape(-1)
     initial_dq = _as_numpy(state_in.joint_qd).reshape(-1)
-    for index, name in enumerate(names):
-        initial_q[built.q_index[name]] = q0[index]
-        initial_dq[built.qd_index[name]] = dq0[index]
+    initial_q[q_idx] = q0
+    initial_dq[qd_idx] = dq0
     state_in.joint_q.assign(initial_q.astype("float32"))
     state_in.joint_qd.assign(initial_dq.astype("float32"))
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -448,16 +472,18 @@ def run_newton_torque(
     viewer = _open_viewer("newton", asset, trajectory, model) if visualize else None
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
+    command = None
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
         state_q = _as_numpy(state_in.joint_q).reshape(-1)
         state_dq = _as_numpy(state_in.joint_qd).reshape(-1)
-        q = np.asarray([state_q[built.q_index[name]] for name in names], dtype=float)
-        dq = np.asarray([state_dq[built.qd_index[name]] for name in names], dtype=float)
+        q = state_q[q_idx].astype(float)
+        dq = state_dq[qd_idx].astype(float)
         if not (np.isfinite(q).all() and np.isfinite(dq).all()):
             raise RuntimeError(f"Newton torque rollout became non-finite at t={sample_time:.6f}s")
-        command = controller(float(sample_time), q, dq)
+        if index % control_decimation == 0:
+            command = controller(float(sample_time), q, dq)
         q_rows.append(q)
         dq_rows.append(dq)
         tau_rows.append(command.total)
@@ -467,8 +493,7 @@ def run_newton_torque(
             break
         solver_torque = command.total - friction.torque(dq)
         torque_buffer.fill(0.0)
-        for joint_index, name in enumerate(names):
-            torque_buffer[built.qd_index[name]] = solver_torque[joint_index]
+        torque_buffer[qd_idx] = solver_torque
         control.joint_f.assign(torque_buffer)
         state_in.clear_forces()
         if not disable_contacts:
@@ -717,6 +742,7 @@ def run_mujoco_elastic_torque(
     disable_contacts: bool = True,
     visualize: bool = False,
     realtime_scale: float = 1.0,
+    control_decimation: int = 1,
 ) -> dict[str, Any]:
     """Torque-driven rollout of a series-elastic chain in MuJoCo.
 
@@ -724,8 +750,15 @@ def run_mujoco_elastic_torque(
     is MuJoCo's own zero-reference joint stiffness on the elastic joint.
     Feedback is taken from the *motor* side because motor-side control of a
     flexible joint is collocated and therefore stable for soft transmissions.
+
+    ``control_decimation`` evaluates the controller every ``N`` physics steps
+    and holds the applied torque between updates (zero-order hold); see
+    ``run_mujoco_torque`` for why this does not affect label correctness.
     """
     import mujoco
+
+    if control_decimation < 1:
+        raise ValueError("control_decimation must be >= 1")
 
     from .generic_mujoco_runner import _build_model, _elastic_addresses
 
@@ -749,10 +782,16 @@ def run_mujoco_elastic_torque(
     data = mujoco.MjData(model)
     mujoco.mj_setConst(model, data)
 
+    # Resolved once: integer index arrays used for fancy indexing instead of
+    # a Python-level dict-of-dicts lookup and list comprehension every step.
+    motor_qpos_idx = np.asarray([addresses[n]["motor_qpos"] for n in names], dtype=int)
+    motor_dof_idx = np.asarray([addresses[n]["motor_dof"] for n in names], dtype=int)
+    elastic_qpos_idx = np.asarray([addresses[n]["elastic_qpos"] for n in names], dtype=int)
+    elastic_dof_idx = np.asarray([addresses[n]["elastic_dof"] for n in names], dtype=int)
+
     q0, dq0, _ = trajectory(0.0)
-    for index, name in enumerate(names):
-        data.qpos[addresses[name]["motor_qpos"]] = q0[index]
-        data.qvel[addresses[name]["motor_dof"]] = dq0[index]
+    data.qpos[motor_qpos_idx] = q0
+    data.qvel[motor_dof_idx] = dq0
     mujoco.mj_forward(model, data)
 
     grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
@@ -761,22 +800,26 @@ def run_mujoco_elastic_torque(
     viewer = _open_viewer("mujoco", asset, trajectory, model, data) if visualize else None
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
+    command = solver_torque = None
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
-        motor_q = np.asarray([data.qpos[addresses[n]["motor_qpos"]] for n in names])
-        motor_dq = np.asarray([data.qvel[addresses[n]["motor_dof"]] for n in names])
-        elastic_q = np.asarray([data.qpos[addresses[n]["elastic_qpos"]] for n in names])
-        elastic_dq = np.asarray([data.qvel[addresses[n]["elastic_dof"]] for n in names])
+        motor_q = data.qpos[motor_qpos_idx].copy()
+        motor_dq = data.qvel[motor_dof_idx].copy()
+        elastic_q = data.qpos[elastic_qpos_idx].copy()
+        elastic_dq = data.qvel[elastic_dof_idx].copy()
         link_q, link_dq = motor_q + elastic_q, motor_dq + elastic_dq
         if not (np.isfinite(link_q).all() and np.isfinite(link_dq).all()):
             raise RuntimeError(f"MuJoCo elastic rollout became non-finite at t={sample_time:.6f}s")
+        # tau_spring is measured from the true, continuous state every step
+        # regardless of decimation -- it is the recorded label, not a control
+        # signal, so it must never be held.
         tau_spring = -(transmission.stiffness * elastic_q + transmission.damping * elastic_dq)
-        command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
+        if index % control_decimation == 0:
+            command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
+            solver_torque = command.total - friction.torque(motor_dq)
         data.qfrc_applied[:] = 0.0
-        solver_torque = command.total - friction.torque(motor_dq)
-        for joint_index, name in enumerate(names):
-            data.qfrc_applied[addresses[name]["motor_dof"]] = solver_torque[joint_index]
+        data.qfrc_applied[motor_dof_idx] = solver_torque
         mujoco.mj_forward(model, data)
         rows["q"].append(link_q)
         rows["dq"].append(link_dq)
@@ -786,8 +829,7 @@ def run_mujoco_elastic_torque(
         rows["ff"].append(command.feedforward)
         rows["fb"].append(command.feedback)
         rows["tau_link"].append(tau_spring)
-        rows["ddq"].append(np.asarray([data.qacc[addresses[n]["motor_dof"]] + data.qacc[addresses[n]["elastic_dof"]]
-                                       for n in names]))
+        rows["ddq"].append(data.qacc[motor_dof_idx] + data.qacc[elastic_dof_idx])
         if pacer.should_render(index):
             viewer.render(float(sample_time), link_q)
             pacer.pace()
@@ -822,6 +864,7 @@ def run_newton_elastic_torque(
     realtime_scale: float = 1.0,
     solver_order: tuple[str, ...] = ("SolverMuJoCo", "SolverFeatherstone", "SolverSemiImplicit"),
     capture_graph: bool = True,
+    control_decimation: int = 1,
 ) -> dict[str, Any]:
     """Torque-driven rollout of a series-elastic chain in Newton.
 
@@ -839,6 +882,8 @@ def run_newton_elastic_torque(
         ElasticTransmissionParams, _as_numpy, _new_solver, build_elastic_model,
     )
 
+    if control_decimation < 1:
+        raise ValueError("control_decimation must be >= 1")
     if tuple(trajectory.joint_names) != tuple(asset.joint_names):
         raise ValueError("Trajectory joint_names must match asset active_joints exactly")
     if check_step:
@@ -882,15 +927,20 @@ def run_newton_elastic_torque(
                                    getattr(newton.solvers, "SolverFeatherstone", None)) if cls is not None)
     needs_ik = not isinstance(solver, direct) if direct else True
 
+    # Resolved once: integer index arrays used for fancy indexing instead of
+    # a per-step, per-joint dict-of-namedtuples lookup.
+    motor_q_idx = np.asarray([built.dof_index[n].motor_q for n in names], dtype=int)
+    motor_qd_idx = np.asarray([built.dof_index[n].motor_qd for n in names], dtype=int)
+    elastic_q_idx = np.asarray([built.dof_index[n].elastic_q for n in names], dtype=int)
+    elastic_qd_idx = np.asarray([built.dof_index[n].elastic_qd for n in names], dtype=int)
+
     q0, dq0, _ = trajectory(0.0)
     initial_q = _as_numpy(state_in.joint_q).reshape(-1)
     initial_dq = _as_numpy(state_in.joint_qd).reshape(-1)
-    for index, name in enumerate(names):
-        mapping = built.dof_index[name]
-        initial_q[mapping.motor_q] = q0[index]
-        initial_q[mapping.elastic_q] = 0.0
-        initial_dq[mapping.motor_qd] = dq0[index]
-        initial_dq[mapping.elastic_qd] = 0.0
+    initial_q[motor_q_idx] = q0
+    initial_q[elastic_q_idx] = 0.0
+    initial_dq[motor_qd_idx] = dq0
+    initial_dq[elastic_qd_idx] = 0.0
     state_in.joint_q.assign(initial_q.astype("float32"))
     state_in.joint_qd.assign(initial_dq.astype("float32"))
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -901,20 +951,28 @@ def run_newton_elastic_torque(
     viewer = _open_viewer("newton", asset, trajectory, model) if visualize else None
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
+    command = None
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
         state_q = _as_numpy(state_in.joint_q).reshape(-1)
         state_dq = _as_numpy(state_in.joint_qd).reshape(-1)
-        motor_q = np.asarray([state_q[built.dof_index[n].motor_q] for n in names])
-        motor_dq = np.asarray([state_dq[built.dof_index[n].motor_qd] for n in names])
-        elastic_q = np.asarray([state_q[built.dof_index[n].elastic_q] for n in names])
-        elastic_dq = np.asarray([state_dq[built.dof_index[n].elastic_qd] for n in names])
+        # No explicit dtype cast here, matching the original list-comprehension
+        # + np.asarray(...) (no dtype=) construction: it inferred float32 from
+        # state_q/state_dq's own dtype, and a cast to float64 here would be a
+        # silent precision change relative to that.
+        motor_q = state_q[motor_q_idx]
+        motor_dq = state_dq[motor_qd_idx]
+        elastic_q = state_q[elastic_q_idx]
+        elastic_dq = state_dq[elastic_qd_idx]
         link_q, link_dq = motor_q + elastic_q, motor_dq + elastic_dq
         if not (np.isfinite(link_q).all() and np.isfinite(link_dq).all()):
             raise RuntimeError(f"Newton elastic rollout became non-finite at t={sample_time:.6f}s")
+        # tau_spring is measured every step regardless of decimation -- see
+        # run_mujoco_elastic_torque.
         tau_spring = -(transmission.stiffness * elastic_q + transmission.damping * elastic_dq)
-        command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
+        if index % control_decimation == 0:
+            command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
         rows["q"].append(link_q)
         rows["dq"].append(link_dq)
         rows["qm"].append(motor_q)
@@ -927,8 +985,7 @@ def run_newton_elastic_torque(
             break
         solver_torque = command.total - friction.torque(motor_dq)
         buffer.fill(0.0)
-        for joint_index, name in enumerate(names):
-            buffer[built.dof_index[name].motor_qd] = solver_torque[joint_index]
+        buffer[motor_qd_idx] = solver_torque
         control.joint_f.assign(buffer)
         state_in.clear_forces()
         if not disable_contacts:
