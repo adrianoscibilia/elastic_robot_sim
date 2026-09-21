@@ -142,6 +142,65 @@ def evaluate_series(
     return q, dq, ddq
 
 
+class _AnalyticEvaluator:
+    """Precomputed ``t -> (q, dq, ddq)`` for one Fourier series.
+
+    Matches ``evaluate_series`` exactly at a single time point; used by
+    ``MaterializedTrajectory.__call__`` so a rollout samples the analytic
+    signal at its own physics time step instead of interpolating the
+    trajectory's (typically much coarser) recorded grid (R3_12 Sec 2.1).
+
+    A plain class holding numpy arrays, not a closure: ``generate()``'s
+    ``--jobs N`` path sends each bag's ``MaterializedTrajectory`` (analytic
+    evaluator included) across a process-pool boundary, which requires
+    pickling it -- a closure over local variables is not picklable, this is.
+    """
+
+    def __init__(self, a: np.ndarray, b: np.ndarray, offset: np.ndarray, omega: float, indices: np.ndarray):
+        harmonics = np.asarray(indices, dtype=float)
+        scaled = harmonics * omega
+        self._scaled = scaled
+        self._a_over_scaled = (a / scaled).T
+        self._b_over_scaled = (b / scaled).T
+        self._a_t = a.T
+        self._b_t = b.T
+        self._a_scaled_t = (a * scaled).T
+        self._b_scaled_t = (b * scaled).T
+        self._offset = np.asarray(offset, dtype=float)
+
+    def __call__(self, t: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        phase = self._scaled * float(t)
+        sin, cos = np.sin(phase), np.cos(phase)
+        q = sin @ self._a_over_scaled - cos @ self._b_over_scaled + self._offset
+        dq = cos @ self._a_t + sin @ self._b_t
+        ddq = -(sin @ self._a_scaled_t) + cos @ self._b_scaled_t
+        return q, dq, ddq
+
+
+def _make_analytic_evaluator(a: np.ndarray, b: np.ndarray, offset: np.ndarray, omega: float, indices: np.ndarray):
+    return _AnalyticEvaluator(a, b, offset, omega, indices)
+
+
+def log_spaced_probe_harmonics(
+    f_min: float, f_max: float, n_lines: int, base_frequency: float
+) -> tuple[int, ...]:
+    """Harmonic indices for a log-spaced modal probe from ``f_min`` to ``f_max`` Hz.
+
+    A sparse, widely-spaced comb cannot satisfy its own acceptance test: a
+    linear system only responds at the excitation frequencies, so the
+    deflection peak lands on the nearest *line*, not the true mode, and
+    ``zeta`` only changes the response within about the half-power bandwidth
+    ``2*zeta*f`` of the mode (~10 Hz at zeta=0.05, f=100 Hz) -- with lines
+    much further apart than that, most robots' damping stays unobservable
+    even with the probe on (``R3_10 Sec 4.3``). Log spacing keeps adjacent
+    -line spacing proportionally tight across the whole band with a modest
+    line count, and matches how transmission modes are actually distributed
+    (`sqrt(k/J)`, roughly log-uniform in ``k``).
+    """
+    indices = np.unique(np.round(np.logspace(np.log10(f_min), np.log10(f_max), n_lines) / base_frequency).astype(int))
+    return tuple(int(i) for i in indices)
+
+
 def joint_bounds(asset: AssetSpec, config: FourierExcitationConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(safe_lower, safe_upper, velocity_limit)`` for the active joints."""
     joints = asset.resolve_active_joints()
@@ -211,12 +270,22 @@ def _fit_to_limits(
 
     With ``probe_count == 0`` (the default) this is a single-budget scaling,
     bit-identical to before the modal probe existed.  With ``probe_count >
-    0``, the last ``probe_count`` columns of ``a``/``b`` are the probe: the
-    main harmonics are scaled against ``(1 - probe_acceleration_fraction)``
-    of the acceleration budget, then the probe is scaled against whatever
-    position/velocity/acceleration budget the main harmonics left (R3_02
-    Sec 2.4) -- so the probe never itself violates a limit, even though it
-    rides on top of an already-large-amplitude main trajectory.
+    0``, the last ``probe_count`` columns of ``a``/``b`` are the probe.
+
+    The probe is scaled **first**, against its own acceleration budget alone
+    (position and velocity unconstrained): at the probe's high frequencies,
+    acceleration is `(2 pi f)^2` times the position amplitude, so its
+    position/velocity footprint is negligible (micro-radians at 40+ Hz) and
+    reserving it costs the main trajectory nothing measurable.  The main
+    harmonics are then scaled against the *remaining* position, velocity and
+    ``(1 - probe_acceleration_fraction)`` of the acceleration budget.
+
+    Scaling the main harmonics first and giving the probe only what was
+    "left over" (the original approach) is backwards: on any joint where
+    position or velocity is the binding limit for the main trajectory --
+    true for most of the proximal joints at the shipped settings -- the
+    leftover budget is exactly zero and the probe's scale collapses to zero
+    with it, silently defeating the whole point of R3_02 (see R3_10 Sec 2.1).
     """
     half_span = 0.5 * (safe_upper - safe_lower)
     n_joints = a.shape[0]
@@ -227,16 +296,26 @@ def _fit_to_limits(
     else:
         main_indices = None if indices is None else indices[:n_main]
         probe_indices = None if indices is None else indices[n_main:]
-        a_main, b_main = _scale_block(
-            a[:, :n_main], b[:, :n_main], omega, time, main_indices, half_span, velocity_limit,
-            np.full(n_joints, (1.0 - probe_acceleration_fraction) * max_acceleration),
-        )
-        q_main, dq_main, _ = evaluate_series(a_main, b_main, np.zeros(a_main.shape[0]), omega, time, indices=main_indices)
-        remaining_half_span = np.maximum(half_span - 0.5 * (q_main.max(axis=0) - q_main.min(axis=0)), 0.0)
-        remaining_velocity = np.maximum(velocity_limit - np.abs(dq_main).max(axis=0), 0.0)
+        unconstrained = np.full(n_joints, np.inf)
+        # The probe's top line can be tens of Hz; scaling and budget-checking
+        # it against the ~2 ms output grid (< 3 samples/period near 190 Hz)
+        # can miss the true continuous peak entirely (R3_12 Sec 2.1). Use a
+        # much finer grid for the probe block's own scaling and for measuring
+        # how much position/velocity headroom it leaves the main harmonics.
+        fine_step = min(float(time[1] - time[0]), 1.0e-4)
+        fine_time = np.arange(time[0], time[-1] + 0.5 * fine_step, fine_step)
         a_probe, b_probe = _scale_block(
-            a[:, n_main:], b[:, n_main:], omega, time, probe_indices, remaining_half_span, remaining_velocity,
+            a[:, n_main:], b[:, n_main:], omega, fine_time, probe_indices, unconstrained, unconstrained,
             np.full(n_joints, probe_acceleration_fraction * max_acceleration),
+        )
+        q_probe, dq_probe, _ = evaluate_series(
+            a_probe, b_probe, np.zeros(a_probe.shape[0]), omega, fine_time, indices=probe_indices
+        )
+        remaining_half_span = np.maximum(half_span - 0.5 * (q_probe.max(axis=0) - q_probe.min(axis=0)), 0.0)
+        remaining_velocity = np.maximum(velocity_limit - np.abs(dq_probe).max(axis=0), 0.0)
+        a_main, b_main = _scale_block(
+            a[:, :n_main], b[:, :n_main], omega, time, main_indices, remaining_half_span, remaining_velocity,
+            np.full(n_joints, (1.0 - probe_acceleration_fraction) * max_acceleration),
         )
         a = np.concatenate([a_main, a_probe], axis=1)
         b = np.concatenate([b_main, b_probe], axis=1)
@@ -388,6 +467,7 @@ def optimize_excitation(
         acceleration=best["ddq"],
         joint_names=tuple(asset.joint_names),
         metadata=metadata,
+        analytic=_make_analytic_evaluator(best["a"], best["b"], best["offset"], omega, indices),
     )
 
 
@@ -407,8 +487,11 @@ def trajectory_from_metadata(
     probe_harmonics = tuple(metadata.get("probe_harmonics", ()) or ())
     indices = np.concatenate([np.arange(1, n_harmonics + 1), np.asarray(probe_harmonics, dtype=int)]) \
         if a.shape[1] != n_harmonics else None
-    q, dq, ddq = evaluate_series(a, b, offset, 2.0 * np.pi * base_frequency, time, indices=indices)
+    omega = 2.0 * np.pi * base_frequency
+    q, dq, ddq = evaluate_series(a, b, offset, omega, time, indices=indices)
+    eval_indices = indices if indices is not None else np.arange(1, n_harmonics + 1)
     return MaterializedTrajectory(
         time=time, position=q, velocity=dq, acceleration=ddq,
         joint_names=tuple(asset.joint_names), metadata=dict(metadata),
+        analytic=_make_analytic_evaluator(a, b, offset, omega, eval_indices),
     )

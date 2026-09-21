@@ -38,10 +38,10 @@ from elastic_sim import excitation as exc
 from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.dataset import (
-    DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, regime_excitation, rollout_frame,
-    run_condition, trajectory_seed,
+    DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, payload_for, resolve_bag, rollout_frame,
+    run_condition, sample_all_payloads,
 )
-from elastic_sim.kinematics import PortableKinematics
+from elastic_sim.payload import Payload, payload_asset
 from elastic_sim.torque_runners import link_inertia_envelope
 
 
@@ -126,26 +126,72 @@ def main() -> None:
     if not matches:
         parser.error(f"unknown tier {tier_name!r}; config has {[t.name for t in config.tiers]}")
     tier = matches[0]
-    # Same rule as the dataset, so --tier eNN --trajectory k reproduces that
-    # robot's k-th trajectory, seed and (if excitation.regime is enabled)
-    # dynamic regime.
-    seed = trajectory_seed(config, tier, args.trajectory) if args.seed is None else args.seed
-    excitation = regime_excitation(config.excitation, config.regime, config.seed, seed)
-    if args.base_frequency is not None or args.max_acceleration is not None:
-        excitation = replace(
-            excitation,
-            base_frequency=args.base_frequency or excitation.base_frequency,
-            max_acceleration=args.max_acceleration or excitation.max_acceleration,
-        )
-    candidates = args.candidates or config.candidates
+
+    # Same rule as generate(): a tier's payload is only known in advance (and
+    # so only scoreable against payload-fitted collision geometry) when every
+    # tier gets its own trajectory; a shared trajectory (trajectories_per_
+    # robot: false) is payload-free by construction.  Previously this script
+    # always used the bare asset and never passed a payload to run_condition
+    # at all -- for the shipped config (trajectories_per_robot: true,
+    # payload.enabled), that reproduced the wrong trajectory for any robot
+    # whose payload changed a collision rejection, and always ran a
+    # payload-free rollout regardless (R3_14 Sec 1.1).
+    elastic_tiers = [t for t in config.tiers if not t.is_rigid]
+    payload_by_tier, payload_by_key = sample_all_payloads(config, elastic_tiers)
+    payload = (
+        payload_for(config, payload_by_tier, payload_by_key, tier, args.trajectory)
+        if config.trajectories_per_robot else Payload()
+    )
 
     print(f"asset      : {asset.name} ({len(asset.joint_names)} joints)")
     print(f"config     : {_resolve(args.config)}")
-    kinematics = PortableKinematics(asset)
-    trajectory = exc.optimize_excitation(
-        asset, excitation, seed=seed, n_candidates=candidates, kinematics=kinematics
-    )
-    _report_trajectory(asset, trajectory, kinematics)
+    if payload is not None and not payload.is_empty:
+        print(f"payload    : {payload.as_dict()}")
+
+    if args.seed is not None or args.base_frequency is not None or args.max_acceleration is not None:
+        # Ad-hoc overrides: --seed replaces the derived trajectory seed
+        # outright and --base-frequency/--max-acceleration replace the
+        # regime's derived excitation, so this path cannot go through
+        # resolve_bag (which always derives both from the config) and
+        # reproduces nothing by design -- it is for poking at one-off
+        # variations, not for --tier/--trajectory reproduction.
+        from elastic_sim.dataset import regime_excitation, sample_control_gains, trajectory_seed
+        from elastic_sim.kinematics import PortableKinematics
+
+        seed = trajectory_seed(config, tier, args.trajectory) if args.seed is None else args.seed
+        excitation = regime_excitation(config.excitation, config.regime, config.seed, seed)
+        if args.base_frequency is not None or args.max_acceleration is not None:
+            excitation = replace(
+                excitation,
+                base_frequency=args.base_frequency or excitation.base_frequency,
+                max_acceleration=args.max_acceleration or excitation.max_acceleration,
+            )
+        candidates = args.candidates or config.candidates
+        with payload_asset(asset, payload) as asset_p:
+            kinematics = PortableKinematics(asset_p)
+            trajectory = exc.optimize_excitation(
+                asset, excitation, seed=seed, n_candidates=candidates, kinematics=kinematics
+            )
+        natural_frequency, damping_ratio = sample_control_gains(
+            config.control_gains, config.control_frequency, config.control_damping_ratio, config.seed, seed,
+        )
+        with payload_asset(asset, payload) as asset_p:
+            report_kinematics = PortableKinematics(asset_p)
+            _report_trajectory(asset, trajectory, report_kinematics)
+    else:
+        from elastic_sim.kinematics import PortableKinematics
+
+        bag_config = replace(config, candidates=args.candidates or config.candidates)
+        resolved = resolve_bag(bag_config, asset, tier, args.trajectory, payload)
+        trajectory = resolved.trajectory
+        natural_frequency, damping_ratio = resolved.natural_frequency, resolved.damping_ratio
+        # PortableKinematics is re-derived here (not reused from resolve_bag,
+        # which tears its own down before returning) purely to report the
+        # collision margin below; cheap relative to the trajectory search.
+        with payload_asset(asset, payload) as asset_p:
+            report_kinematics = PortableKinematics(asset_p)
+        _report_trajectory(asset, trajectory, report_kinematics)
+
     if args.save_trajectory:
         trajectory.save(args.save_trajectory)
         print(f"  saved trajectory to {args.save_trajectory}")
@@ -160,13 +206,19 @@ def main() -> None:
         realtime_scale=args.realtime_scale if args.realtime_scale is not None else config.realtime_scale,
         control_frequency=args.control_frequency or config.control_frequency,
     )
+    if args.control_frequency is not None:
+        natural_frequency = args.control_frequency
     friction = idn.FrictionModel.from_asset(asset)
     print(f"\ntier {tier.name!r} on {backend}" + (" with viewer" if run_config.visualize else ""))
+    if config.control_gains.enabled:
+        print(f"  control gains: natural_frequency={natural_frequency:.2f} rad/s  damping_ratio={damping_ratio:.3f}")
     link_inertia = None
     if not tier.is_rigid:
-        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
+        with payload_asset(asset, payload) as asset_p:
+            link_inertia = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples)
         _report_transmission(tier.transmission(len(asset.joint_names), link_inertia), run_config)
-    result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia)
+    result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia,
+                           payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio)
     _report_rollout(asset, result, friction)
 
     if not args.output:

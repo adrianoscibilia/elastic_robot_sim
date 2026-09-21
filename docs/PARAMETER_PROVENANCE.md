@@ -33,15 +33,15 @@ admissible range? Criterion (i) is defended by Anchor 2 below; criterion
 | Joint | Parameter | Nominal | Factor | Class | Source | Notes |
 |---|---|---|---|---|---|---|
 | A1 | stiffness | 2.4e4 Nm/rad | 2.0 | P | Disney Research, *Toward Torque Control of a KUKA LBR IIWA for pHRI*, iiwa base joint, 18500 Nm/rad | nominal set above the single published point to centre the interval over A1-A2 |
-| A2 | stiffness | 2.4e4 Nm/rad | 2.0 | P | Disney Research (as A1) -- same joint family, base-side pair | A1/A2 share a stiffness class on this arm |
-| A3 | stiffness | 1.6e4 Nm/rad | 2.0 | C | Interpolated between the A1/A2 (P) and A5 (C) anchors for a mid-arm joint of this size class | no direct published point for A3 specifically |
+| A2 | stiffness | 2.4e4 Nm/rad | 2.0 | C | Disney Research (as A1) -- same robot, adjacent joint, not a direct A2 measurement | downgraded from P: the anchor is A1's, not A2's (R3_10 Sec 3.4) |
+| A3 | stiffness | 1.6e4 Nm/rad | 2.0 | C | Interpolated between the A1/A2 (P/C) and A5 (C) anchors for a mid-arm joint of this size class | no direct published point for A3 specifically |
 | A4 | stiffness | 1.6e4 Nm/rad | 2.0 | C | As A3 | |
 | A5 | stiffness | 9.0e3 Nm/rad | 2.0 | C | Iskandar et al., IROS 2020, *Joint-Level Control of the DLR Lightweight Robot SARA*, joint 5, 9000 Nm/rad | SARA is one size class down; treated as a class anchor, not a model anchor |
 | A6 | stiffness | 5.5e3 Nm/rad | 2.0 | E | Tapered below A5 for a smaller wrist-class gearbox; no anchor at this size for either robot | |
 | A7 | stiffness | 5.5e3 Nm/rad | 2.0 | E | As A6 | |
-| A1 | rotor_inertia | 1.0 kg m^2 | 2.0 | P | Disney Research, iiwa base joint, controlled motor inertia Jc = 1.03 kg m^2 | |
-| A2 | rotor_inertia | 1.0 kg m^2 | 2.0 | P | Disney Research (as A1) | |
-| A3 | rotor_inertia | 0.5 kg m^2 | 2.0 | C | Interpolated between A1/A2 (P) and A5 (C) | |
+| A1 | rotor_inertia | 1.0 kg m^2 | 2.0 | C | Disney Research, iiwa base joint, controlled motor inertia Jc = 1.03 kg m^2 | downgraded from P: Jc is the *controlled* (closed-loop apparent) motor inertia under that paper's torque controller, which may include inertia shaping -- not confirmed here to equal the physical reflected rotor inertia this field means; upgrade to P only after checking the paper's definition of Jc (R3_10 Sec 3.4) |
+| A2 | rotor_inertia | 1.0 kg m^2 | 2.0 | C | Disney Research (as A1) | same downgrade as A1, plus A2 is a different joint from the anchor |
+| A3 | rotor_inertia | 0.5 kg m^2 | 2.0 | C | Interpolated between A1/A2 (C) and A5 (C) | |
 | A4 | rotor_inertia | 0.5 kg m^2 | 2.0 | C | As A3 | |
 | A5 | rotor_inertia | 0.25 kg m^2 | 2.0 | C | Iskandar et al., SARA J5, motor inertia 0.339 kg m^2 | tapered toward the wrist |
 | A6 | rotor_inertia | 0.15 kg m^2 | 2.0 | E | Tapered below A5 | |
@@ -150,6 +150,7 @@ carry the iiwa nominal across.
 | iiwa k, all joints | Static deflection, `k = tau/delta`, 5 torque levels | 1 day | | not started |
 | iiwa first resonance | Tap test / stop-response FFT | 0.5 day | | not started |
 | UR10 first resonance | Step + motor-current FFT | 0.5 day | | not started |
+| Disney Jc definition | Re-read the paper's controller section to confirm whether Jc = 1.03 kg m^2 is the physical reflected rotor inertia or a closed-loop apparent value including inertia shaping; determines whether A1/A2 rotor_inertia can go back to P | 0.5 hr | | not started |
 
 ## Sources
 

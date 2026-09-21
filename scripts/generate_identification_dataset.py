@@ -33,7 +33,6 @@ sys.path.insert(0, os.fspath(_REPO / "src"))
 
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.dataset import DEFAULT_CONFIG, build_tiers, generate, load_config, write_dataset
-from elastic_sim.excitation import FourierExcitationConfig
 
 
 def _load_asset(reference: str):
@@ -48,7 +47,7 @@ def _resolve(path: str) -> Path:
     return candidate if candidate.is_absolute() else _REPO / candidate
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML defaults (see config/identification/)")
     parser.add_argument("--asset", default=None)
@@ -75,8 +74,21 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=1,
                         help="Parallel worker processes for the bag loop (forced to 1 under --visualize)")
     parser.add_argument("--quiet", action="store_true")
-    args = parser.parse_args()
+    return parser
 
+
+def resolve_config(args: argparse.Namespace, parser: argparse.ArgumentParser):
+    """Turn parsed CLI args plus the YAML defaults into one ``DatasetConfig``.
+
+    Factored out of ``main`` so a test can assert
+    ``resolve_config(no_overrides).excitation == load_config(DEFAULT_CONFIG).excitation``
+    without running any simulation -- the regression class this guards
+    against (a field silently dropped by a from-scratch
+    ``FourierExcitationConfig(...)`` reconstruction instead of
+    ``dataclasses.replace``) is exactly the kind of bug that class of test
+    catches and the old, inline version of this code could not be tested for
+    at all.
+    """
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
     if args.visualize and args.jobs > 1:
@@ -97,16 +109,32 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    excitation = config.excitation
     sample_step = args.sample_step or config.sample_time_step
-    excitation = FourierExcitationConfig(
-        n_harmonics=args.harmonics or excitation.n_harmonics,
-        base_frequency=args.base_frequency or excitation.base_frequency,
-        n_periods=args.periods or excitation.n_periods,
+    if args.max_acceleration is not None and config.regime.enabled:
+        parser.error(
+            "--max-acceleration is silently overridden per-trajectory by excitation.regime "
+            "(enabled in this config); edit the YAML's regime.max_acceleration range instead, "
+            "or run with a config that has regime.enabled: false"
+        )
+    if args.control_frequency is not None and config.control_gains.enabled:
+        parser.error(
+            "--control-frequency is silently overridden per-trajectory by simulation.control_gains "
+            "(enabled in this config); edit the YAML's control_gains.natural_frequency range instead, "
+            "or run with a config that has control_gains.enabled: false"
+        )
+    # dataclasses.replace, not a from-scratch FourierExcitationConfig(...):
+    # reconstructing field-by-field silently drops any field not named here
+    # (centre_jitter, probe_harmonics, probe_acceleration_fraction all fell
+    # back to their dataclass defaults this way -- 0.0, (), 0.2 -- so every
+    # dataset built from this script had centre_jitter=0 and no probe
+    # regardless of what the YAML said).
+    excitation = replace(
+        config.excitation,
+        n_harmonics=args.harmonics or config.excitation.n_harmonics,
+        base_frequency=args.base_frequency or config.excitation.base_frequency,
+        n_periods=args.periods or config.excitation.n_periods,
         time_step=sample_step,
-        limit_margin=excitation.limit_margin,
-        max_acceleration=args.max_acceleration or excitation.max_acceleration,
-        velocity_fraction=excitation.velocity_fraction,
+        max_acceleration=args.max_acceleration or config.excitation.max_acceleration,
     )
     config = replace(
         config,
@@ -131,6 +159,13 @@ def main() -> None:
     )
     if config.n_trajectories < 1 or config.n_friction_samples < 1:
         parser.error("trajectories and friction-samples must be positive")
+    return config
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    config = resolve_config(args, parser)
 
     asset = _load_asset(config.asset)
     asset.resolve_active_joints()

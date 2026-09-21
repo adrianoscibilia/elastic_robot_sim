@@ -173,6 +173,84 @@ condition number of the base-parameter regressor and checked for collision.
 On this asset the optimized result conditions the regressor about 1.9x better
 than the existing random point-to-point generator (≈145 against ≈277).
 
+### The modal probe
+
+The main harmonics excite the rigid-body dynamics but leave essentially no
+energy above ~0.5 Hz, so a sampled robot's transmission mode (tens to
+hundreds of Hz) never gets excited and its damping ratio has no signature in
+the data at all — only the static deflection `tau / k` is visible. A small
+extra comb of high-frequency harmonics, `excitation.probe_harmonics`, fixes
+this: 40 log-spaced lines from 8-190 Hz by default
+(`log_spaced_probe_harmonics(8.0, 190.0, 40, 0.1)`), given
+`excitation.probe_acceleration_fraction` (default 0.2) of the acceleration
+budget, scaled *before* the main harmonics so it is never crowded out by
+whichever limit binds the main trajectory (position or velocity, on most
+proximal joints). Conditioning is still scored on the main harmonics only —
+the probe would alias the regressor's stride-10 sampling and is not part of
+what the rigid-body regressor needs to be well conditioned.
+
+The probe band starts at 8 Hz, not the structural mode's own open-loop
+frequency, because of the closed-loop finding below: on a heavy joint the
+*observable* resonance sits well below the open-loop
+`sqrt(k / J_eff)` prediction, and a probe that only reached down to 30 Hz (an
+earlier version of this feature) missed it.
+
+A trajectory's samples are evaluated **analytically** from its Fourier
+coefficients (`MaterializedTrajectory.analytic`), not interpolated from the
+recorded grid: linearly interpolating a signal that has real content above
+~100 Hz on a 2 ms grid attenuates it (`sinc²`, ~40% down at 190 Hz) and
+folds an image back in near `500 - f` Hz, which for this asset's fastest
+mode (A7, ~600-900 Hz open-loop) landed on top of it. `optimize_excitation`
+and `trajectory_from_metadata` both populate the analytic evaluator; only a
+trajectory loaded from a plain saved JSON (no coefficients) falls back to
+interpolation.
+
+### The closed-loop finding: what a rollout actually shows is not the open-loop mode
+
+`ComputedTorqueController`/`SeaMotorController` compute `tau = rnea(q, dq,
+ddq_ref + kd·e_dot + kp·e) + friction(dq)`. Because `rnea` is affine in its
+acceleration argument, this is exactly `tau = h(q, dq) + M(q)(ddq_ref + kd·e_dot
++ kp·e) + friction(dq)`: the feedback term contributes an *extra* motor-side
+stiffness/damping of `(M_ii + J_rotor) kp` / `(M_ii + J_rotor) kd`, on top of
+the transmission's own `(k, d)`. On a heavy joint (A1-A2 on this arm) that
+motor-side damper is roughly ten times the transmission's own at the shipped
+gains, and it dominates what the deflection channel actually shows: the
+*observable* resonance is a closed-loop quantity, shifted well below the
+open-loop `sqrt(k / J_eff)` `TransmissionSpec.natural_frequency()` predicts,
+and — because `M_ii` varies with the arm's configuration along the
+trajectory — is not even a single fixed frequency.
+`TransmissionSpec.closed_loop_mode_frequency` models this (the deflection's
+frequency-response peak under a linearized single-joint model, evaluated at
+a given link inertia); it is close enough to a direct simulation to use as a
+diagnostic, but it ignores cross-joint coupling, gravity and the true `M(q)`
+trajectory, so nothing in this pipeline asserts against it directly —
+`tests/test_identification_dataset.py`'s mode/ζ tests use it only to choose
+*where to look*, and assert a contrast (probe on vs. off), not a match to
+its point prediction.
+
+One practical consequence: **ζ (transmission damping ratio) is only weakly
+observable on heavy joints, by construction, no matter what the probe does**
+— the motor loop's own damping swamps it. `damping_ratio` sampling is left
+un-stratified for exactly this reason (see below). This is demonstrated, not
+just asserted: with the shipped probe, ζ is clearly observable on at least
+one mid-weight joint (A3 on this arm, >8x RMS contrast on/off) and provably
+unobservable without the probe (<1e-3 relative difference); it stays weak on
+the two heaviest joints (A1/A2) as this finding predicts, and came out
+genuinely ambiguous on one further joint (A4) under two different
+measurement methodologies — not confidently either way, and left as such
+rather than tuned toward a conclusion.
+
+`simulation.control_gains` (disabled by default at the dataclass level,
+enabled in the shipped YAML) randomizes `natural_frequency`/`damping_ratio`
+**per trajectory** instead of using one fixed gain for the whole dataset,
+recorded per bag as `control_natural_frequency`/`control_damping_ratio`.
+Without it, every bag shares the exact same closed-loop behaviour above, so
+a model trained on the dataset implicitly bakes in one specific control
+loop; varying it is what makes that dependency visible in the data instead
+of a hidden confound. `run_identification_simulation.py` derives the same
+per-trajectory draw as `generate()`, so `--tier eNN --trajectory k`
+reproduces it, unless `--control-frequency` explicitly overrides it.
+
 ## Tiers and sampled robots
 
 A tier is a model-fidelity level. The **rigid** tier uses the URDF's own
@@ -222,9 +300,13 @@ Configured in the `transmission` block of the YAML:
   ~0.4–0.7 at the historical 6 i.i.d. robots.
 - **Damping ratio** — one interval, sampled uniformly per joint (default
   0.05–0.2, the lightly damped range of a geared joint). Left un-stratified
-  deliberately: it is unobservable in the data until the excitation modal
-  probe is enabled (see "Excitation trajectories" below), so widening its
-  coverage would only add label noise.
+  deliberately: it is unobservable in the data at all without the excitation
+  modal probe (see "The modal probe" below), and even with the probe on it
+  is only clearly observable on some joints — the motor control loop's own
+  damping dominates the transmission's on the heaviest ones, a closed-loop
+  effect explained under "The closed-loop finding" below — so widening its
+  coverage would add label noise on the joints where it cannot be identified
+  from this data regardless.
 - **Damping coefficient** — never configured. It is derived as
   `d = 2 ζ sqrt(k J_eff)`.
 - **Rotor inertia** — `rotor_inertia_nominal x rotor_inertia_factor`, sampled
@@ -305,6 +387,13 @@ A friction sample would only become a real condition if the controller were
 given a *different* friction model from the plant, which is a deliberate
 model-mismatch experiment rather than a dataset axis.
 
+This cancellation is exact regardless of `control_decimation`: holding the
+whole solver torque (command and the friction subtraction together) constant
+across a decimation window is what keeps the cancellation exact and the
+rollout numerically stable (see `torque_runners.run_mujoco_torque`'s comment
+at the decimation gate) — the plant never physically experiences friction
+either way, decimated or not.
+
 ### What the payload-free wrist can teach, and why the dataset now fits one
 
 The learning target is the link-side torque. With no tool fitted, the link
@@ -342,6 +431,22 @@ consumes:
 Map C (the `defl0..defl{n-1}` columns) is the cleanest target for
 identifying the transmission parameters themselves: its magnitude is
 `tau / k`, a direct readout of the parameter being randomized.
+
+A payload adds real geometry, so a trajectory validated collision-free
+against the bare asset is not necessarily collision-free once one is
+fitted. With `dataset.trajectories_per_robot: true` (the shipped default),
+each robot's payload is known before its trajectory is searched, so
+candidates are scored against *payload-fitted* collision geometry directly
+— a collision just rejects a candidate, the same as any other infeasible
+one. `resolve_bag` (`src/elastic_sim/dataset.py`) is the single place this
+derivation happens: `generate()` and `run_identification_simulation.py`
+both call it, so `--tier eNN --trajectory k` reproduces the exact same
+payload-fitted trajectory *and* runs its rollout with that payload, not the
+bare asset. With `trajectories_per_robot: false` (one trajectory shared
+across every tier), no single payload applies during the search, so that
+path stays payload-free and a post-hoc check re-draws an alternative
+payload — rather than aborting the whole build — if the shared trajectory
+and a bag's drawn payload turn out to collide.
 
 ## Backend comparison
 
@@ -390,7 +495,17 @@ One row per sample, consumed directly by `dynamic_model_nn`'s `CustomDataset`.
 | `defl0..defl{n-1}` | `q_motor - q_link` [rad] — Map C target, direct readout of `tau / k` |
 | `split` | `"train"`, `"val"` or `"test"`, one label per bag (see below) |
 | `payload_mass`, `payload_offset_x/y/z`, `payload_size` | the fitted tool, constant within a bag, `NaN` on the rigid tier |
+| `exc_base_frequency`, `exc_max_acceleration`, `exc_velocity_fraction`, `exc_probe_top_hz` | this bag's realized excitation regime (see "Per-trajectory regime randomization" below); constant within a bag |
+| `control_natural_frequency`, `control_damping_ratio` | this bag's realized closed-loop gain (see "The closed-loop finding" above); constant within a bag, equal to `simulation.control_frequency`/`control_damping_ratio` unless `simulation.control_gains.enabled` |
 | `tier`, `backend`, `experiment`, `viscous__<joint>`, `coulomb__<joint>`, `stiffness__<joint>`, `damping__<joint>`, `damping_ratio__<joint>`, `rotor_inertia__<joint>` | metadata, ignored by the loader; transmission columns are empty on rigid bags |
+
+Per bag, the manifest's `records` entries additionally carry
+`trajectory_digest` and `trajectory_signal_digest` (a hash of the
+trajectory's time/position/velocity/acceleration samples only, excluding
+diagnostic fields like the regressor condition number that agree only to
+basis precision even for an identical trajectory — use this one for
+reproducibility checks, not `trajectory_digest`), `condition_number` and
+`peak_torque_ratio` (warned above 0.8 of the joint's effort limit).
 
 `ddq` is deliberately **not** emitted: the consumer always recomputes it with a
 Savitzky-Golay filter and ignores the column. That filter requires a uniform
@@ -432,12 +547,15 @@ otherwise, so old CSVs load unchanged.
 
 `dynamic_model_nn`'s `dataset.py` accepts a general `ft0..ft{dof-1}` block in
 `CustomDataset._load_dataframe`, checked before the fixed six-channel wrench
-form so a 7-channel per-joint target is not silently truncated to six (the
-six-channel branch stays reachable, and correct, for genuine 6-channel wrench
-datasets where `dof == 6`). Every generated dataset also gets a
-`<dataset>.contract.json` sidecar next to the CSV, stating `n_dof`, the input
-and target column ranges, the target semantics and which consumer branch it
-requires — read it before wiring up a new training script.
+form so a 7-channel per-joint target is not silently truncated to six. At
+`dof == 6` the column names `ft0..ft5` are ambiguous on their own — a
+genuinely 6-DoF arm's per-joint torque and a legacy end-effector wrench use
+identical names for different quantities — so `CustomDataset` reads the
+`<dataset>.contract.json` sidecar (every generated dataset gets one next to
+the CSV, stating `n_dof`, the input and target column ranges and the target
+semantics) and trusts its `target_columns` over the `dof == 6`-means-wrench
+guess when the sidecar is present; a CSV with no sidecar keeps that
+historical guess. Read the sidecar before wiring up a new training script.
 
 ### Normalization erases magnitude — read this before training
 

@@ -303,24 +303,120 @@ def test_probe_respects_limits_and_endpoint_rest(asset):
     assert (q >= lower - 1e-9).all() and (q <= upper + 1e-9).all()
 
 
+def test_probe_reaches_its_acceleration_budget_on_every_joint():
+    """Regression guard for R3_10 Sec 2.1.
+
+    The probe used to be scaled *after* the main harmonics, against whatever
+    position/velocity budget the main trajectory left -- exactly zero on any
+    joint where position or velocity was the binding limit, which silently
+    defeated the probe on the proximal joints it exists for.  Scaling the
+    probe first, against its own acceleration budget alone, fixes this: every
+    joint must now reach (approximately) its full share of the acceleration
+    budget regardless of how tightly the main trajectory is constrained.
+    """
+    from elastic_sim.assets import AssetRegistry
+
+    asset = AssetRegistry.for_repository(_REPO).load(ASSET)
+    asset.resolve_active_joints()
+    n_main = 5
+    probe = (400, 700, 1000, 1300, 1600)
+    for max_acceleration, velocity_fraction in ((4.0, 0.75), (1.0, 0.3), (8.0, 0.9)):
+        config = exc.FourierExcitationConfig(
+            n_harmonics=n_main, base_frequency=0.1, time_step=0.002,
+            max_acceleration=max_acceleration, velocity_fraction=velocity_fraction,
+            probe_harmonics=probe, probe_acceleration_fraction=0.2,
+        )
+        time = np.arange(0.0, config.duration + 0.5 * config.time_step, config.time_step)
+        # The probe's own budget is now checked internally on a fine grid,
+        # not the (typically 2 ms) output grid: at 400+ Hz, a 2 ms grid has
+        # under 3 samples per period, so its discretely-sampled peak
+        # understates the true continuous one and this test must measure the
+        # same way _fit_to_limits does or it fails on a probe that is
+        # actually fine (R3_12 Sec 2.1).
+        fine_step = min(float(time[1] - time[0]), 1.0e-4)
+        fine_time = np.arange(time[0], time[-1] + 0.5 * fine_step, fine_step)
+        omega = 2.0 * np.pi * config.base_frequency
+        budget = config.probe_acceleration_fraction * max_acceleration
+        rng = np.random.default_rng(0)
+        for _ in range(20):
+            a, b, offset = exc.sample_candidate(asset, config, rng, time)
+            _, _, ddq_probe = exc.evaluate_series(
+                a[:, n_main:], b[:, n_main:], np.zeros(len(asset.joint_names)), omega, fine_time,
+                indices=config.harmonic_indices[n_main:],
+            )
+            assert (np.abs(ddq_probe).max(axis=0) >= 0.9 * budget).all(), (
+                f"max_acceleration={max_acceleration} velocity_fraction={velocity_fraction}"
+            )
+
+
 @pytest.mark.slow
-def test_probe_excites_the_transmission_mode(asset):
+def test_probe_measurably_excites_the_deflection_near_the_predicted_mode(asset):
     """Run the same robot twice, probe off and probe on, and FFT the deflection.
 
     Probe OFF is the state documented in R3_00 F3: no energy above ~0.5 Hz,
-    so nothing at the 50-170 Hz modes.  Probe ON must put a peak there.
+    so nothing at the 8-190 Hz modes.  Probe ON must put real, measurably
+    larger energy in a window around each joint's predicted mode.
+
+    This shows the probe *reaches* the deflection channel near where a mode
+    is expected -- it does not *locate* the resonance to line-spacing
+    precision, which is a different (and stronger) claim an earlier version
+    of this test made by asserting the peak landed within one probe-line
+    spacing of ``TransmissionSpec.natural_frequency()`` (the open-loop
+    two-mass prediction). R3_12 Sec 1 found that prediction is not what a
+    rollout actually shows, because ``SeaMotorController``'s own feedback
+    adds a motor-side stiffness/damping of roughly ``(M_ii + J_rotor) * kp``
+    / ``(M_ii + J_rotor) * kd`` that shifts the *observable* resonance
+    depending on ``M_ii(q(t))`` along the trajectory -- on the heaviest
+    joints (A1-A3) that can pull it far from the open-loop number.
+    ``TransmissionSpec.closed_loop_mode_frequency`` models this and, fixed to
+    return the deflection frequency-response peak rather than a pole
+    frequency (R3_14 Sec 1.4), matches a direct simulation to within ~1 Hz
+    on a reference one-joint case -- but it is still a single-joint
+    linearization (no cross-joint coupling, gravity, or the true ``M(q)``
+    trajectory), so it stays a diagnostic here, not the acceptance bound:
+    the open-loop prediction is what windows the search below, and the
+    assertion is the *contrast* (peak in-band magnitude on vs. off) within
+    that window, not a match to either model's point prediction.
     """
     pytest.importorskip("mujoco")
     from elastic_sim.dataset import Tier
+    from elastic_sim.excitation import log_spaced_probe_harmonics
+    from elastic_sim.torque_runners import link_inertia_envelope
 
+    probe = log_spaced_probe_harmonics(8.0, 190.0, 40, 0.1)
+    # A uniform rotor-only transmission (no link_inertia) gives every joint
+    # the *same* predicted mode regardless of its real link inertia, which
+    # varies by four orders of magnitude across this arm (A1's ~1.85 kg m^2
+    # down to A7's ~3e-4 kg m^2); the true two-mass mode is set by
+    # whichever side is lighter (see TransmissionSpec's docstring), so a
+    # rotor-only prediction is only right by coincidence.  Build the same
+    # way production does, from the asset's real link inertia.
+    link_inertia = link_inertia_envelope(asset, n_samples=200)
     transmission = Tier("e00", stiffness=(2.4e4,) * 7, damping_ratio=(0.1,) * 7).transmission(
-        len(asset.joint_names)
+        len(asset.joint_names), link_inertia
     )
+    modes = transmission.natural_frequency()
+    median_link_inertia, _floor_link_inertia = link_inertia
+    # Only joints whose open-loop-predicted mode falls inside this probe's
+    # 8-190 Hz comb can be checked against it at all (A7's mode is far
+    # above it regardless of the closed loop, per the module docstring).
+    # Also exclude the heaviest joints (A1/A2 on this arm, M_ii median >= 1.0
+    # kg m^2): SeaMotorController's own feedback dominates the transmission's
+    # dynamics there (R3_12 Sec 1), which both shifts the resonance and can
+    # suppress the amount by which the probe's energy actually stands out
+    # against the main trajectory's own broadband content on that joint
+    # (checked: A2's off-probe baseline in this band is already about 2/3 of
+    # its on-probe peak, so no fixed contrast threshold both means something
+    # and passes there) -- the same reasoning the ζ test below uses to scope
+    # its own assertion to the joints where the transmission's own dynamics
+    # are not swamped.
+    in_band = [j for j in range(len(modes)) if 8.0 <= modes[j] <= 190.0 and median_link_inertia[j] < 1.0]
+    assert in_band, "fixture problem: no joint's predicted mode falls inside the probe band"
     spectra = {}
-    for probe in ((), (400, 700, 1000, 1300, 1600)):
+    for label, probe_harmonics in (("off", ()), ("on", probe)):
         config = exc.FourierExcitationConfig(
             n_harmonics=5, base_frequency=0.1, time_step=0.002, max_acceleration=4.0,
-            probe_harmonics=probe, probe_acceleration_fraction=0.2 if probe else 0.0,
+            probe_harmonics=probe_harmonics, probe_acceleration_fraction=0.2 if probe_harmonics else 0.0,
         )
         trajectory = exc.optimize_excitation(asset, config, seed=3, n_candidates=6)
         friction = idn.FrictionModel.from_asset(asset)
@@ -329,17 +425,132 @@ def test_probe_excites_the_transmission_mode(asset):
                                            friction=friction, check_step=False)
         deflection = np.asarray(result["q_motor"]) - np.asarray(result["q_link"])
         freq = np.fft.rfftfreq(len(deflection), d=result["time"][1] - result["time"][0])
-        spectra[probe] = (freq, np.abs(np.fft.rfft(deflection, axis=0)))
+        spectra[label] = (freq, np.abs(np.fft.rfft(deflection, axis=0)))
 
-    freq, off = spectra[()]
+    freq, off = spectra["off"]
     assert off[freq > 1.0].max() / off[freq <= 1.0].max() < 1e-2, "probe-off baseline"
 
-    freq, on = spectra[(400, 700, 1000, 1300, 1600)]
-    modes = transmission.natural_frequency()
-    for joint in range(6):  # A7's ~640-900 Hz mode is above this test's grid
-        band = freq > 1.0
-        peak = freq[band][np.argmax(on[band, joint])]
-        assert abs(peak - modes[joint]) / modes[joint] < 0.10, f"joint A{joint + 1}"
+    freq, on = spectra["on"]
+    # Below the probe band, main-harmonic energy leaks into low-order
+    # intermodulation products from the arm's own nonlinear (Coriolis and
+    # gravity) coupling -- e.g. a real peak near 1.1 Hz with a 0.1-0.5 Hz
+    # main comb.  The arm's own dynamics also carry real, unrelated broadband
+    # deflection energy spread across the *whole* 5-190 Hz band (checked: on
+    # A4 the off-probe max anywhere in that band is already ~70% of the
+    # on-probe one), which swamps a whole-band peak contrast; a window around
+    # each joint's own predicted mode isolates the probe's actual local
+    # contribution instead (checked: same joint's ratio goes from ~1.4x
+    # whole-band to ~4-5x windowed).
+    for joint in in_band:
+        band = (freq > max(5.0, modes[joint] - 20.0)) & (freq <= modes[joint] + 20.0)
+        on_peak = float(on[band, joint].max())
+        off_peak = float(off[band, joint].max())
+        assert on_peak / max(off_peak, 1e-12) > 3.0, (
+            f"joint A{joint + 1}: probe did not measurably excite its predicted "
+            f"{modes[joint]:.0f} Hz +/-20 Hz window (on={on_peak:.3g}, off={off_peak:.3g})"
+        )
+
+
+@pytest.mark.slow
+def test_damping_ratio_becomes_observable_on_light_joints_with_the_probe(asset):
+    """Per-joint, contrast form of the F3 acceptance test (R3_12 Sec 1).
+
+    Two robots identical but for zeta must produce different link-side
+    torque once the probe puts energy near their shared mode.  Aggregating
+    over every joint (the original form of this test) is dominated by the
+    heaviest ones (A2 carries ~31 Nm of the RMS on this arm), where
+    ``SeaMotorController``'s own feedback contributes a motor-side damper
+    roughly proportional to ``M_ii`` and swamps the transmission's -- zeta is
+    weakly observable there *by construction*, independent of the probe
+    (R3_12 Sec 1 consequence 3), so an aggregate bound either passes for the
+    wrong reason or fails on a joint the probe was never going to fix.
+    Restrict the assertion to joints both light enough that the
+    transmission's own damping is not swamped (``M_ii`` median ``< 0.6``
+    kg m^2) *and* whose mode this probe's 8-190 Hz band can actually reach:
+    the lightest joints on this arm (A5-A7, ``M_ii`` a few 1e-2 kg m^2 or
+    less) are barely touched by the closed loop but their mode sits at
+    250 Hz or above, outside this probe's reach entirely, so they would fail
+    for a different reason than zeta being unobservable and are excluded the
+    same way the mode test above excludes them.  ``0.6`` (not the ``1.0`` the
+    mode test above uses) also excludes A4 specifically: its contrast came
+    out noisy and methodology-dependent under both a time-domain whole-
+    trajectory RMS diff and a frequency-domain one windowed around its
+    predicted mode (0.8x-1.4x either way, inconsistent in sign), unlike every
+    other candidate joint, which was robust under both -- left out rather
+    than tuned around until one methodology happened to pass it.  Assert the
+    *contrast* (on/off ratio) rather than an absolute bound, so the pass/fail
+    is about the probe, not about picking exactly the right threshold.
+    """
+    pytest.importorskip("mujoco")
+    from elastic_sim.dataset import Tier
+    from elastic_sim.excitation import log_spaced_probe_harmonics
+    from elastic_sim.torque_runners import link_inertia_envelope
+
+    probe = log_spaced_probe_harmonics(8.0, 190.0, 40, 0.1)
+    link_inertia = link_inertia_envelope(asset, n_samples=200)
+    median, _floor = link_inertia
+    n = len(asset.joint_names)
+    reference_modes = Tier("e00", stiffness=(2.4e4,) * n, damping_ratio=(0.1,) * n).transmission(
+        n, link_inertia
+    ).natural_frequency()
+    light_joints = [j for j in range(len(median)) if median[j] < 0.6 and 8.0 <= reference_modes[j] <= 190.0]
+    assert light_joints, "fixture problem: no joint is both light enough and inside the probe band"
+
+    k = (2.4e4,) * n
+    # Built with the asset's real link_inertia, exactly as production does
+    # (R3_12 Sec 1's explicit ask) -- a rotor-only transmission does not
+    # change this test's contrast, but keeps every fixture in this file
+    # consistent with what generate() actually builds.
+    transmission_a = Tier("e_soft", stiffness=k, damping_ratio=(0.05,) * n).transmission(n, link_inertia)
+    transmission_b = Tier("e_stiff_damping", stiffness=k, damping_ratio=(0.20,) * n).transmission(n, link_inertia)
+    friction = idn.FrictionModel.from_asset(asset)
+
+    def _tau_link(probe_harmonics, transmission):
+        config = exc.FourierExcitationConfig(
+            n_harmonics=5, base_frequency=0.1, time_step=0.002, max_acceleration=4.0,
+            probe_harmonics=probe_harmonics, probe_acceleration_fraction=0.2 if probe_harmonics else 0.0,
+        )
+        trajectory = exc.optimize_excitation(asset, config, seed=3, n_candidates=6)
+        controller = SeaMotorController(asset, trajectory, transmission, friction=friction, natural_frequency=25.0)
+        result = run_mujoco_elastic_torque(asset, trajectory, controller, transmission, time_step=5e-5,
+                                           friction=friction, check_step=False)
+        return np.asarray(result["tau_link"])
+
+    def _per_joint_rms_diff(probe_harmonics):
+        ft_a = _tau_link(probe_harmonics, transmission_a)
+        ft_b = _tau_link(probe_harmonics, transmission_b)
+        length = min(len(ft_a), len(ft_b))
+        return np.sqrt(np.mean((ft_a[:length] - ft_b[:length]) ** 2, axis=0))
+
+    diff_off = _per_joint_rms_diff(())
+    diff_on = _per_joint_rms_diff(probe)
+    ratio = diff_on / np.maximum(diff_off, 1e-12)
+    for joint in light_joints:
+        assert ratio[joint] > 5.0, (
+            f"joint A{joint + 1}: probe on/off zeta-sensitivity ratio only {ratio[joint]:.2f} "
+            f"(diff_off={diff_off[joint]:.3g}, diff_on={diff_on[joint]:.3g})"
+        )
+
+
+@pytest.mark.slow
+def test_probe_does_not_spoil_the_regressor_condition(asset, model):
+    """Conditioning is scored on the main harmonics, so it must barely move
+    when the probe is added (R3_02 Sec 2.6)."""
+    from elastic_sim.excitation import log_spaced_probe_harmonics
+
+    pin, pin_model, pin_data = model
+    probe = log_spaced_probe_harmonics(30.0, 190.0, 30, 0.1)
+    off = exc.optimize_excitation(
+        asset, exc.FourierExcitationConfig(n_harmonics=5, base_frequency=0.1, time_step=0.002, max_acceleration=4.0),
+        seed=3, n_candidates=6,
+    )
+    on = exc.optimize_excitation(
+        asset, exc.FourierExcitationConfig(n_harmonics=5, base_frequency=0.1, time_step=0.002, max_acceleration=4.0,
+                                           probe_harmonics=probe, probe_acceleration_fraction=0.2),
+        seed=3, n_candidates=6,
+    )
+    ratio = on.metadata["condition_number"] / off.metadata["condition_number"]
+    assert abs(ratio - 1.0) < 0.10
 
 
 def test_regime_randomization_spreads_the_dynamic_regime(asset):
@@ -352,6 +563,89 @@ def test_regime_randomization_spreads_the_dynamic_regime(asset):
                 for seed in range(20)]
     assert np.std(peaks) / np.mean(peaks) > 0.30
     assert np.std(off_peaks) == 0.0
+
+
+@pytest.mark.slow
+def test_single_rollout_script_reproduces_the_dataset_trajectory(small_config, asset):
+    """The most likely regression in this feature: two derivations of the
+    same seed disagreeing (this is exactly what R3_10 Sec 2.2 found --
+    generate_identification_dataset.py silently dropped probe_harmonics and
+    centre_jitter, so its trajectories differed from run_identification_
+    simulation.py's for the same --tier/--trajectory)."""
+    from elastic_sim.dataset import generate, resolve_bag
+    from elastic_sim.payload import Payload
+
+    frame, manifest, _ = generate(small_config, asset, verbose=False)
+    record = next(r for r in manifest["records"] if r["stiffness"] is not None)
+    tier = next(t for t in small_config.tiers if t.name == record["tier"])
+
+    # Exactly what run_identification_simulation.py derives for
+    # --tier <tier.name> --trajectory <record['trajectory']>.  small_config
+    # has trajectories_per_robot: false, so this bag is payload-free by
+    # construction (see test_single_rollout_script_reproduces_a_payload_
+    # fitted_trajectory below for the trajectories_per_robot: true case).
+    resolved = resolve_bag(small_config, asset, tier, record["trajectory"], Payload())
+    # signal_digest, not digest: digest() also hashes metadata, including
+    # condition_number, which only agrees with the recorded run to basis
+    # precision even for the identical trajectory (R3_12 Sec 2.3) -- the
+    # regression this test guards against is the *trajectory* differing, not
+    # a float in a diagnostic field.
+    assert resolved.trajectory.signal_digest() == record["trajectory_signal_digest"]
+
+
+@pytest.mark.slow
+def test_single_rollout_script_reproduces_a_payload_fitted_trajectory(asset):
+    """R3_14 Sec 1.1: with ``trajectories_per_robot: true`` and a payload
+    enabled (the shipped config's shape), a robot's trajectory is scored
+    against *payload-fitted* collision geometry (R3_12 Sec 2.2) and its
+    rollout must run *with* that payload -- before ``resolve_bag`` existed,
+    ``run_identification_simulation.py`` always used the bare asset and
+    never applied a payload at all, so ``--tier eNN --trajectory k`` neither
+    reproduced the trajectory nor the rollout for any payload-bearing robot.
+    ``resolve_bag`` is the single place both ``generate()`` and the debug
+    script derive a bag from now; this locks in that a standalone call
+    reproduces a generated bag's trajectory, payload and gains exactly.
+    """
+    from dataclasses import replace
+
+    from elastic_sim.dataset import (
+        DEFAULT_CONFIG, ControlGainSampling, PayloadSampling, SplitPolicy, build_tiers, generate,
+        load_config, payload_for, resolve_bag, sample_all_payloads,
+    )
+
+    config = load_config(os.path.join(_REPO, DEFAULT_CONFIG))
+    transmission = replace(config.transmission, robots=6)
+    tiers = build_tiers(True, transmission, config.seed)
+    payload_config = replace(
+        config,
+        backends=("mujoco",), transmission=transmission, tiers=tiers,
+        n_trajectories=1, trajectories_per_robot=True, n_friction_samples=1,
+        excitation=exc.FourierExcitationConfig(
+            n_harmonics=3, base_frequency=0.5, time_step=0.002, max_acceleration=2.0,
+        ),
+        candidates=4,
+        payload=PayloadSampling(
+            enabled=True, mass=(1.0, 6.0), offset_x=(-0.08, 0.08), offset_y=(-0.08, 0.08),
+            offset_z=(0.055, 0.235), size=(0.05, 0.25), per="robot",
+        ),
+        control_gains=ControlGainSampling(enabled=True, natural_frequency=(15.0, 40.0), damping_ratio=(0.7, 1.3)),
+        split=SplitPolicy(mode="holdout_robots", test_robots=2, val_robots=0),
+    )
+
+    frame, manifest, _ = generate(payload_config, asset, verbose=False)
+    record = next(r for r in manifest["records"] if r["payload"] is not None)
+    tier = next(t for t in payload_config.tiers if t.name == record["tier"])
+
+    elastic_tiers = [t for t in payload_config.tiers if not t.is_rigid]
+    payload_by_tier, payload_by_key = sample_all_payloads(payload_config, elastic_tiers)
+    payload = payload_for(payload_config, payload_by_tier, payload_by_key, tier, record["trajectory"])
+    resolved = resolve_bag(payload_config, asset, tier, record["trajectory"], payload)
+
+    assert resolved.trajectory.signal_digest() == record["trajectory_signal_digest"]
+    assert payload is not None and not payload.is_empty
+    assert payload.as_dict() == record["payload"]
+    assert resolved.natural_frequency == pytest.approx(record["control_natural_frequency"])
+    assert resolved.damping_ratio == pytest.approx(record["control_damping_ratio"])
 
 
 # ---------------------------------------------------------------------------
@@ -572,11 +866,20 @@ def test_payload_reaches_pinocchio_and_mujoco_identically(asset):
     mujoco = pytest.importorskip("mujoco")
     from elastic_sim.generic_mujoco_runner import _build_model
     from elastic_sim.payload import Payload, payload_asset
+    from elastic_sim.torque_runners import neutralize_mujoco_passive
 
     payload = Payload(mass=5.0, offset=(0.0, 0.0, 0.10), size=0.15)
     with payload_asset(asset, payload) as asset_p:
         pin, pin_model, pin_data = idn.build_model(asset_p)
         model, _ = _build_model(asset_p, mujoco, 0.002)
+        # Every runner elsewhere in the codebase zeroes MuJoCo's
+        # URDF-imported passive damping/frictionloss so friction is only
+        # ever applied through the explicit ``FrictionModel``; without it,
+        # ``mj_inverse`` folds in a native -viscous*dq term that bare
+        # ``idn.inverse_dynamics`` (no ``friction=``) never sees, producing a
+        # spurious few-Nm "disagreement" that has nothing to do with the
+        # payload (reproduces identically with no payload at all).
+        neutralize_mujoco_passive(model)
         rng = np.random.default_rng(0)
         n = pin_model.nq
         for _ in range(5):
@@ -605,6 +908,138 @@ def test_feedback_stays_small_with_a_payload(asset, short_trajectory):
         result = run_mujoco_torque(asset_p, short_trajectory, controller, time_step=5e-4, friction=friction)
     ratio = np.mean(np.abs(result["tau_feedback"])) / np.mean(np.abs(result["tau_feedforward"]))
     assert ratio < 0.05
+
+
+@pytest.mark.slow
+def test_payload_gives_the_distal_channels_signal(asset, short_trajectory):
+    """Payload-free: ft4, ft5, ft6 RMS ~ [0.2, 0.2, 0.0] Nm (R3_00 F2).
+    With a payload fitted, all three must carry real signal, and peak |tau|
+    must stay under the effort limit (R3_10 Sec 3.3)."""
+    pytest.importorskip("mujoco")
+    from elastic_sim.dataset import Tier
+    from elastic_sim.payload import Payload, payload_asset
+
+    friction = idn.FrictionModel.from_asset(asset)
+    n = len(asset.joint_names)
+    transmission = Tier("e00", stiffness=(2.4e4,) * n, damping_ratio=(0.1,) * n).transmission(n)
+
+    def _rollout(payload):
+        with payload_asset(asset, payload) as asset_p:
+            controller = SeaMotorController(asset_p, short_trajectory, transmission, friction=friction,
+                                            natural_frequency=25.0)
+            return run_mujoco_elastic_torque(asset_p, short_trajectory, controller, transmission,
+                                             time_step=5e-5, friction=friction, check_step=False)
+
+    bare = _rollout(Payload())
+    ft_bare = np.sqrt(np.mean(np.asarray(bare["tau_link"]) ** 2, axis=0))
+
+    # A purely axial offset (0, 0, z) lies on the last joint's own rotation
+    # axis (and, at some poses, A5's too -- A5 and A7 are collinear on this
+    # arm at A6 = 0): a mass on a joint's own axis has no gravity moment
+    # about that axis, so it cannot show up on that channel no matter how
+    # heavy it is. That is a property of the offset direction, not of the
+    # payload/simulation code (R3_12 Sec 2.4) -- use a radial offset so the
+    # payload actually loads every distal joint.
+    payload = Payload(mass=5.0, offset=(0.12, 0.10, 0.10), size=0.15)
+    loaded = _rollout(payload)
+    ft_loaded = np.sqrt(np.mean(np.asarray(loaded["tau_link"]) ** 2, axis=0))
+    assert (ft_loaded[4:7] > 0.5).all(), f"distal channels still weak: {ft_loaded[4:7]}"
+
+    effort_limits = np.asarray([j.effort or np.inf for j in asset.resolve_active_joints()])
+    peak_ratio = np.max(np.abs(np.asarray(loaded["tau_motor"])) / effort_limits[None, :])
+    assert peak_ratio < 0.8, f"peak |tau|/effort = {peak_ratio:.2f}"
+
+
+@pytest.mark.slow
+def test_payload_relaxes_rather_than_tightens_the_integration_step(asset):
+    """Raising J_link at the wrist lowers the A7 mode; assert, do not assume."""
+    pytest.importorskip("mujoco")
+    from elastic_sim.dataset import DatasetConfig, elastic_time_step
+    from elastic_sim.payload import Payload, payload_asset
+    from elastic_sim.torque_runners import TransmissionSpec, link_inertia_envelope
+
+    config = DatasetConfig()
+    n = len(asset.joint_names)
+    bare_envelope = link_inertia_envelope(asset, n_samples=64)
+    bare_transmission = TransmissionSpec.from_damping_ratio(
+        np.full(n, 2.4e4), np.full(n, 0.1), np.full(n, 1.0), *bare_envelope
+    )
+    bare_step = elastic_time_step(bare_transmission, config)
+
+    payload = Payload(mass=5.0, offset=(0.0, 0.0, 0.10), size=0.15)
+    with payload_asset(asset, payload) as asset_p:
+        loaded_envelope = link_inertia_envelope(asset_p, n_samples=64)
+    loaded_transmission = TransmissionSpec.from_damping_ratio(
+        np.full(n, 2.4e4), np.full(n, 0.1), np.full(n, 1.0), *loaded_envelope
+    )
+    loaded_step = elastic_time_step(loaded_transmission, config)
+    assert loaded_step >= bare_step, f"payload should relax (not tighten) the step: bare={bare_step:.2e} loaded={loaded_step:.2e}"
+
+
+@pytest.mark.slow
+def test_a7_output_resampling_does_not_alias(asset):
+    """A conclusive version of the check R3_13 Sec 2.7 left inconclusive.
+
+    Comparing peak *locations* (what R3_13 did) cannot detect aliasing.
+    R3_14 Sec 1.5's actual measurement: with a light payload (A7's mode
+    stays at 200-700 Hz -- the residual-risk case a heavier payload, whose
+    mode drops toward or into the probe band, does not have), build the
+    2 ms output two ways from the same full-rate elastic rollout -- today's
+    point-sampling (``np.interp``, no anti-aliasing) and a version low-pass
+    filtered at 200 Hz (just under the 250 Hz output Nyquist) before
+    resampling -- and take the RMS difference relative to the filtered
+    signal's own RMS. That difference *is* the aliased content. Below ~1%
+    closes the item without touching ``rollout_frame``.
+    """
+    pytest.importorskip("mujoco")
+    from scipy import signal as sps
+
+    from elastic_sim.dataset import Tier
+    from elastic_sim.excitation import log_spaced_probe_harmonics
+    from elastic_sim.payload import Payload, payload_asset
+    from elastic_sim.torque_runners import link_inertia_envelope
+
+    probe = log_spaced_probe_harmonics(8.0, 190.0, 40, 0.1)
+    # 1 kg close to the flange: light enough that A7's closed-loop mode
+    # stays well above the 250 Hz output Nyquist (checked: ~300 Hz here),
+    # the case R3_14 Sec 1.5 flags as the actual residual risk.
+    payload = Payload(mass=1.0, offset=(0.02, 0.02, 0.06), size=0.05)
+    with payload_asset(asset, payload) as asset_p:
+        link_inertia = link_inertia_envelope(asset_p, n_samples=200)
+        transmission = Tier("e00", stiffness=(5.5e3,) * 7, damping_ratio=(0.1,) * 7).transmission(
+            len(asset.joint_names), link_inertia
+        )
+        mode = transmission.closed_loop_mode_frequency(
+            link_inertia[0], natural_frequency=25.0, damping_ratio=1.0
+        )[6]
+        assert mode > 250.0, f"fixture problem: A7's predicted mode {mode:.0f} Hz is not above the output Nyquist"
+        friction = idn.FrictionModel.from_asset(asset)
+        config = exc.FourierExcitationConfig(
+            n_harmonics=5, base_frequency=0.1, time_step=0.002, max_acceleration=4.0,
+            probe_harmonics=probe, probe_acceleration_fraction=0.2,
+        )
+        trajectory = exc.optimize_excitation(asset_p, config, seed=3, n_candidates=6)
+        controller = SeaMotorController(asset_p, trajectory, transmission, friction=friction, natural_frequency=25.0)
+        result = run_mujoco_elastic_torque(asset_p, trajectory, controller, transmission, time_step=5e-5,
+                                           friction=friction, check_step=False)
+
+    time_full = np.asarray(result["time"])
+    fs_full = 1.0 / (time_full[1] - time_full[0])
+    target_step = 0.002
+    grid = np.arange(time_full[0], time_full[-1] + 0.5 * target_step, target_step)
+    sos = sps.butter(8, 200.0 / (fs_full / 2.0), btype="low", output="sos")
+
+    channels = {
+        "defl6": np.asarray(result["q_motor"])[:, 6] - np.asarray(result["q_link"])[:, 6],
+        "ft6": np.asarray(result["tau_link"])[:, 6],
+    }
+    for name, signal in channels.items():
+        point_sampled = np.interp(grid, time_full, signal)
+        anti_aliased = np.interp(grid, time_full, sps.sosfiltfilt(sos, signal))
+        rms_reference = float(np.sqrt(np.mean(anti_aliased ** 2)))
+        rms_diff = float(np.sqrt(np.mean((point_sampled - anti_aliased) ** 2)))
+        ratio = rms_diff / max(rms_reference, 1e-12)
+        assert ratio < 0.01, f"{name}: aliased content is {ratio:.2%} of RMS (threshold 1%)"
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +1117,24 @@ def test_split_policy_rejects_more_holdout_robots_than_exist():
         assign_splits(tiers, SplitPolicy(mode="holdout_robots", test_robots=4))
 
 
+def test_split_policy_rejects_holding_out_every_elastic_robot():
+    """Regression guard for R3_10 Sec 3.1: --robots 6 with the shipped
+    test_robots=4/val_robots=2 used to yield zero training robots silently."""
+    from elastic_sim.dataset import SplitPolicy, Tier, assign_splits
+
+    tiers = (Tier("rigid"),) + tuple(Tier(f"e{i:02d}", stiffness=(1.0e4 * (i + 1),)) for i in range(6))
+    with pytest.raises(ValueError, match="zero elastic robots"):
+        assign_splits(tiers, SplitPolicy(mode="holdout_robots", test_robots=4, val_robots=2))
+
+
+def test_split_policy_holdout_trajectories_is_not_a_silent_no_op():
+    from elastic_sim.dataset import SplitPolicy, Tier, assign_splits
+
+    tiers = (Tier("rigid"),)
+    with pytest.raises(NotImplementedError):
+        assign_splits(tiers, SplitPolicy(mode="holdout_trajectories"))
+
+
 @pytest.fixture
 def small_config(asset):
     from dataclasses import replace
@@ -709,6 +1162,18 @@ def small_config(asset):
     )
 
 
+def test_payload_effort_stays_under_the_warning_threshold(small_config, asset):
+    """The shipped payload range (0-6 kg) must not push any bag's peak
+    |tau|/effort past the 0.8 warning threshold `generate()` prints for
+    (R3_12 Sec 2.7): recorded and warned is not the same as verified."""
+    pytest.importorskip("mujoco")
+    from elastic_sim.dataset import generate
+
+    _, manifest, _ = generate(small_config, asset, verbose=False)
+    offenders = {r["bag"]: r["peak_torque_ratio"] for r in manifest["records"] if r["peak_torque_ratio"] >= 0.8}
+    assert not offenders, f"bags over the 0.8 effort-ratio threshold: {offenders}"
+
+
 def test_holdout_robots_do_not_leak_between_splits(small_config, asset):
     pytest.importorskip("mujoco")
     from elastic_sim.dataset import generate
@@ -718,6 +1183,50 @@ def test_holdout_robots_do_not_leak_between_splits(small_config, asset):
     test = set(frame.loc[frame["split"] == "test", "tier"])
     assert train and test and not (train & test)
     assert set(manifest["split"]["test"]) == test
+
+
+def test_rotor_inertia_varies_across_robots_without_shrinking_the_step(small_config, asset):
+    """R3_08 Sec A3: rotor_inertia__<joint> must differ across sampled robots
+    (before this round every row carried the same fixed 0.1 kg m^2), and
+    randomizing it must not shrink the integration step by more than 10% on
+    average relative to that fixed-0.1 baseline -- A7's mode (set by the
+    wrist's own light link inertia, not the rotor) is what actually bounds
+    the step, so the rotor-inertia change should be close to step-neutral."""
+    pytest.importorskip("mujoco")
+    from dataclasses import replace
+
+    from elastic_sim.dataset import Tier, elastic_time_step
+    from elastic_sim.torque_runners import link_inertia_envelope
+
+    link_inertia = link_inertia_envelope(asset, n_samples=64)
+    n = len(asset.joint_names)
+    elastic_tiers = [tier for tier in small_config.tiers if not tier.is_rigid]
+
+    sampled_steps, sampled_rotors = [], []
+    for tier in elastic_tiers:
+        spec = tier.transmission(n, link_inertia)
+        sampled_rotors.append(spec.rotor_inertia)
+        sampled_steps.append(elastic_time_step(spec, small_config))
+    sampled_rotors = np.asarray(sampled_rotors)
+    assert np.std(sampled_rotors, axis=0).max() > 0.0, "rotor inertia must be sampled, not fixed"
+
+    fixed_rotor_steps = [
+        elastic_time_step(replace(tier, rotor_inertia=(0.1,)).transmission(n, link_inertia), small_config)
+        for tier in elastic_tiers
+    ]
+    assert np.mean(sampled_steps) > 0.9 * np.mean(fixed_rotor_steps)
+
+
+def test_manifest_reports_sampling_coverage(small_config, asset):
+    """R3_08 Sec A4: the coverage report must be present in the manifest and
+    name a valid sampling method."""
+    pytest.importorskip("mujoco")
+    from elastic_sim.dataset import generate
+
+    _, manifest, _ = generate(small_config, asset, verbose=False)
+    coverage = manifest["sampling_coverage"]["stiffness"]
+    assert len(coverage["coverage_fraction"]) == len(asset.joint_names)
+    assert coverage["method"] in ("iid", "stratified", "sobol")
 
 
 def test_every_bag_has_a_uniform_time_step(small_config, asset):
@@ -764,6 +1273,7 @@ def test_parquet_round_trips_a_synthetic_frame(tmp_path):
     roundtrip = pd.read_parquet(path)
     assert len(roundtrip) == len(frame)
     assert roundtrip["q0"].dtype == np.float32
+    assert roundtrip["t"].dtype == np.float64, "t must stay float64 (R3_10 Sec 3.5): SG filter/step checks depend on it"
 
 
 def test_metadata_columns_sidecar_moves_constants_off_the_main_file(tmp_path):
@@ -809,22 +1319,36 @@ def test_index_array_hoisting_is_bit_identical(asset, short_trajectory):
 
 
 @pytest.mark.slow
-def test_control_decimation_preserves_the_analytic_residual(asset, model, short_trajectory):
-    """Rigid tier vs Pinocchio inverse dynamics stays tiny at decimation 8."""
+def test_control_decimation_stays_stable_with_a_bounded_residual(asset, model, short_trajectory):
+    """Holding the whole solver torque (command AND friction subtraction) constant
+    across a decimation window keeps the rollout numerically stable, at the cost
+    of a small, decimation-dependent residual against Pinocchio inverse dynamics.
+
+    ``ComputedTorqueController.total`` already embeds friction compensation at
+    the (q, dq) it was evaluated at; refreshing only the friction subtraction
+    on later, un-decimated steps (tried and reverted -- see
+    ``run_mujoco_torque``'s comment at the decimation gate) uncancels that
+    embedded term into a disturbance with the friction model's full slope
+    while the command that would counter it stays frozen, which measurably
+    diverges (qacc into the 1e11 range) on this asset's low-inertia wrist
+    joint at decimation as low as 2.
+    """
     pytest.importorskip("mujoco")
     pin, pin_model, pin_data = model
     friction = idn.FrictionModel.from_asset(asset)
-    controller = ComputedTorqueController(asset, short_trajectory, friction=friction, natural_frequency=25.0)
-    result = run_mujoco_torque(asset, short_trajectory, controller, time_step=5e-4, friction=friction,
-                               control_decimation=8)
-    q, dq, ddq = result["q_link"], result["dq_link"], result["ddq_link"]
-    stride = slice(None, None, 20)
-    predicted = np.asarray([
-        idn.inverse_dynamics(pin, pin_model, pin_data, q[i], dq[i], ddq[i], friction=friction)
-        for i in range(0, len(q), 20)
-    ])
-    residual = result["tau_motor"][stride] - predicted
-    assert np.sqrt(np.mean(residual**2)) < 1e-5
+    for decimation, bound in ((1, 1e-5), (4, 1e-5), (8, 0.02)):
+        controller = ComputedTorqueController(asset, short_trajectory, friction=friction, natural_frequency=25.0)
+        result = run_mujoco_torque(asset, short_trajectory, controller, time_step=5e-4, friction=friction,
+                                   control_decimation=decimation)
+        q, dq, ddq = result["q_link"], result["dq_link"], result["ddq_link"]
+        assert np.max(np.abs(ddq)) < 100.0, f"decimation={decimation} rollout is unstable"
+        stride = slice(None, None, 20)
+        predicted = np.asarray([
+            idn.inverse_dynamics(pin, pin_model, pin_data, q[i], dq[i], ddq[i], friction=friction)
+            for i in range(0, len(q), 20)
+        ])
+        residual = result["tau_motor"][stride] - predicted
+        assert np.sqrt(np.mean(residual**2)) < bound, f"decimation={decimation}"
 
 
 @pytest.mark.slow
@@ -854,6 +1378,38 @@ def test_default_config_loads_and_is_shared_by_both_scripts():
     assert len(config.transmission.stiffness_nominal) == 7, "one stiffness nominal per iiwa joint"
     assert [tier.is_rigid for tier in config.tiers].count(True) == int(config.rigid_reference)
     assert sum(not tier.is_rigid for tier in config.tiers) == config.transmission.robots
+
+
+def test_generate_dataset_cli_does_not_drop_probe_or_jitter():
+    """Regression guard for R3_10 Sec 2.2: a from-scratch FourierExcitationConfig(...)
+    reconstruction in the CLI silently dropped centre_jitter/probe_harmonics/
+    probe_acceleration_fraction back to their dataclass defaults on every run,
+    regardless of what the YAML said."""
+    import importlib
+
+    from elastic_sim.dataset import DEFAULT_CONFIG, load_config
+
+    sys.path.insert(0, os.path.join(_REPO, "scripts"))
+    gid = importlib.import_module("generate_identification_dataset")
+    parser = gid.build_parser()
+    config = gid.resolve_config(parser.parse_args([]), parser)
+    default_excitation = load_config(os.path.join(_REPO, DEFAULT_CONFIG)).excitation
+    assert config.excitation.probe_harmonics == default_excitation.probe_harmonics
+    assert config.excitation.probe_acceleration_fraction == default_excitation.probe_acceleration_fraction
+    assert config.excitation.centre_jitter == default_excitation.centre_jitter
+
+
+def test_generate_dataset_cli_errors_on_max_acceleration_with_regime_enabled():
+    """--max-acceleration would otherwise be silently overwritten per-trajectory
+    by excitation.regime once regime.enabled is true (the shipped default)."""
+    import importlib
+
+    sys.path.insert(0, os.path.join(_REPO, "scripts"))
+    gid = importlib.import_module("generate_identification_dataset")
+    parser = gid.build_parser()
+    args = parser.parse_args(["--max-acceleration", "3.0"])
+    with pytest.raises(SystemExit):
+        gid.resolve_config(args, parser)
 
 
 def test_config_rejects_unknown_keys(tmp_path):
@@ -894,6 +1450,29 @@ def test_config_rejects_the_old_tier_ladder(tmp_path):
     path.write_text("asset: x\ntiers:\n  rigid: true\n  stiffness: [1.0e4]\n", encoding="utf-8")
     with pytest.raises(ValueError, match="transmission"):
         load_config(path)
+
+
+def test_config_rejects_control_decimation_without_explicit_opt_in(tmp_path):
+    """R3_12 Sec 2.5: no automatic stability guard exists yet for
+    control_decimation > 1 (see torque_runners's decimation-gate comment and
+    R3_11 Sec 1 for why it can silently diverge), so it must not be one YAML
+    edit away."""
+    from elastic_sim.dataset import load_config
+
+    path = tmp_path / "decimated.yaml"
+    path.write_text(
+        "asset: x\nrigid_reference: true\nsimulation:\n  control_decimation: 8\n", encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="allow_control_decimation"):
+        load_config(path)
+
+    path2 = tmp_path / "decimated_opted_in.yaml"
+    path2.write_text(
+        "asset: x\nrigid_reference: true\n"
+        "simulation:\n  control_decimation: 8\n  allow_control_decimation: true\n",
+        encoding="utf-8",
+    )
+    assert load_config(path2).control_decimation == 8
 
 
 def test_config_can_select_rigid_only(tmp_path):

@@ -23,7 +23,18 @@ from .assets import AssetSpec
 
 @dataclass(frozen=True)
 class Payload:
-    """A uniform box rigidly attached to the last link."""
+    """A uniform box rigidly attached to the last link.
+
+    ``offset`` is in the frame of the last *active* joint's child link (see
+    ``_last_link_name``) -- not necessarily a URDF's dedicated flange/ee
+    frame, if it has one, since that frame is reached through a fixed joint
+    this module deliberately does not walk (not every asset has one). If a
+    caller's URDF has a fixed end-effector joint offset from that link (the
+    KUKA iiwa assets in this repo do: +0.035 m along z from ``iiwa_link_7``
+    to ``iiwa_link_ee``), fold it into ``offset`` explicitly -- see the
+    ``payload.offset_z`` comment in
+    ``config/identification/kuka_lbr_iiwa_14_r820_table.yaml``.
+    """
 
     mass: float = 0.0
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -78,7 +89,21 @@ def payload_asset(asset: AssetSpec, payload: Payload | None):
         '<inertial><origin rpy="0 0 0" xyz="0 0 0"/>'
         f'<mass value="{payload.mass:.9g}"/>'
         f'<inertia ixx="{ixx:.9g}" ixy="0" ixz="0" iyy="{iyy:.9g}" iyz="0" izz="{izz:.9g}"/>'
-        "</inertial></link>"
+        "</inertial>"
+        # A box matching the inertia's own geometry, so a fitted payload is
+        # visible to the collision checker (R3_10 Sec 3.2): the original
+        # design left this out and validated trajectories payload-free
+        # entirely, which is fine for conditioning (a property of the state
+        # trajectory, not the inertias -- R3_01 Sec 2.6) but not for
+        # collision, where an unmodelled 5-25 cm box can pass straight
+        # through the table or the arm.
+        '<visual><origin rpy="0 0 0" xyz="0 0 0"/>'
+        f'<geometry><box size="{payload.size:.9g} {payload.size:.9g} {payload.size:.9g}"/></geometry>'
+        "</visual>"
+        '<collision><origin rpy="0 0 0" xyz="0 0 0"/>'
+        f'<geometry><box size="{payload.size:.9g} {payload.size:.9g} {payload.size:.9g}"/></geometry>'
+        "</collision>"
+        "</link>"
         '<joint name="identification_payload_joint" type="fixed">'
         f'<parent link="{parent}"/><child link="identification_payload"/>'
         f'<origin rpy="0 0 0" xyz="{x:.9g} {y:.9g} {z:.9g}"/>'

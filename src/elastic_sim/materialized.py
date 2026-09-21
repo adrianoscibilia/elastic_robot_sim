@@ -34,6 +34,16 @@ class MaterializedTrajectory:
     joint_names: tuple[str, ...]
     acceleration: np.ndarray | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Optional closed-form evaluator, ``t -> (q, dq, ddq)``, used by
+    # ``__call__`` in place of linearly interpolating the recorded samples.
+    # A Fourier-series excitation is analytic; interpolating its own samples
+    # on the (typically 2 ms) output grid attenuates and aliases harmonics
+    # that are well inside a Nyquist margin of the true analytic signal but
+    # not of the interpolated one (R3_12 Sec 2.1) -- a probe line at 190 Hz
+    # sampled every 2 ms is attenuated by ~sinc^2(190*0.002) = 0.61 and has
+    # an image at 500-190=310 Hz. Not compared/hashed/serialized: it is
+    # derived and reconstructible from metadata, not always picklable.
+    analytic: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         names = tuple(self.joint_names)
@@ -66,8 +76,14 @@ class MaterializedTrajectory:
         return float(self.time[-1] - self.time[0])
 
     def __call__(self, time_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Interpolate ``(position, velocity, acceleration)`` at ``time_s``."""
+        """Evaluate ``(position, velocity, acceleration)`` at ``time_s``.
+
+        Uses the analytic evaluator when one was given (see ``analytic``);
+        otherwise linearly interpolates the recorded samples.
+        """
         t = float(np.clip(time_s, self.time[0], self.time[-1]))
+        if self.analytic is not None:
+            return self.analytic(t)
         q = np.asarray([np.interp(t, self.time, self.position[:, i]) for i in range(self.n_dof)])
         dq = np.asarray([np.interp(t, self.time, self.velocity[:, i]) for i in range(self.n_dof)])
         if self.acceleration is None:
@@ -124,4 +140,23 @@ class MaterializedTrajectory:
 
     def digest(self) -> str:
         payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def signal_digest(self) -> str:
+        """Digest of the trajectory's samples only, excluding ``metadata``.
+
+        ``digest()`` hashes ``metadata`` too, which can include float
+        diagnostics (e.g. a regressor condition number) that agree only to
+        the precision of whatever basis produced them; two runs whose basis
+        differs by a seeded-vs-unseeded random draw upstream can therefore
+        report different ``digest()``s for the *same* trajectory (R3_12 Sec
+        2.3). Use this for reproducibility checks instead.
+        """
+        payload = json.dumps({
+            "joint_names": list(self.joint_names),
+            "time": self.time.tolist(),
+            "position": self.position.tolist(),
+            "velocity": self.velocity.tolist(),
+            "acceleration": None if self.acceleration is None else self.acceleration.tolist(),
+        }, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(payload).hexdigest()

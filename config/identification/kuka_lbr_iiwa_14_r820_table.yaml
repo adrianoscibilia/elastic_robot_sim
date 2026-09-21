@@ -44,11 +44,20 @@ transmission:
   # full per-joint coverage; raise it (0.3-0.5) if correlated arms matter
   # more than range coverage for a given use of the dataset.
   stiffness_common_fraction: 0.0
-  stiffness_provenance: [P, P, C, C, C, E, E]
+  # A2 is C, not P: the Disney Research anchor is a *base-joint* (A1)
+  # measurement; citing it for A2 is "same robot, different joint" (C), not
+  # a direct measurement of A2 itself (R3_10 Sec 3.4).
+  stiffness_provenance: [P, C, C, C, C, E, E]
   damping_ratio: [0.05, 0.2]  # sampled per joint; unobservable until the excitation probe (below) is enabled
   rotor_inertia_nominal: [1.0, 1.0, 0.5, 0.5, 0.25, 0.15, 0.15]  # reflected [kg m^2], as armature
   rotor_inertia_factor: [0.5, 2.0]
-  rotor_inertia_provenance: [P, P, C, C, C, E, E]
+  # A1 and A2 are C, not P: the Disney anchor (Jc = 1.03 kg m^2) is the
+  # *controlled* motor inertia under that paper's torque controller, which
+  # may include inertia shaping -- not confirmed here to be the physical
+  # reflected rotor inertia this field means, and A2 is a different joint
+  # again regardless (R3_10 Sec 3.4).  Upgrade to P only after checking the
+  # paper's definition of Jc against docs/PARAMETER_PROVENANCE.md.
+  rotor_inertia_provenance: [C, C, C, C, C, E, E]
   inertia_samples: 512        # configurations used for the link-inertia envelope
 
 # Randomized tool/payload rigidly attached to the flange.  Without one the
@@ -61,11 +70,17 @@ transmission:
 payload:
   enabled: true
   mass: [0.0, 6.0]             # kg, sampled uniformly; 0 keeps the bare-flange case
-  # Offset of the payload centre of mass from the flange frame, in the flange
-  # frame [m].  Sampled uniformly and independently per axis.
+  # Offset of the payload centre of mass, in the frame of the last active
+  # joint's child link (iiwa_link_7 on this asset) -- not the true flange
+  # face (iiwa_link_ee), which sits a further +0.035 m along z from that
+  # link's origin on this URDF (payload.py injects on the last *active*
+  # joint's child by design, not on a fixed ee frame that may not exist on
+  # every asset; see R3_01 Sec 2.3).  offset_z is shifted by that 0.035 m so
+  # the payload still sits 0.02-0.20 m past the *physical* flange, matching
+  # the original intent.  Sampled uniformly and independently per axis.
   offset_x: [-0.08, 0.08]
   offset_y: [-0.08, 0.08]
-  offset_z: [0.02, 0.20]
+  offset_z: [0.055, 0.235]      # 0.035 (iiwa_link_7 -> iiwa_link_ee) + [0.02, 0.20] past the flange
   size: [0.05, 0.25]           # m, cube edge; the payload is a uniform box
   # Draw one payload per robot (a robot ships with a tool) or one per
   # trajectory (the same robot is used with many tools).
@@ -107,10 +122,32 @@ excitation:
   # transmission resonances (50-170 Hz on A1-A6), without which the sampled
   # damping ratios leave no signature in the data at all and the stiffness is
   # only visible as the static deflection tau/k (R3_02 F3).  Indices are
-  # multiples of base_frequency; 400 -> 40 Hz at base_frequency 0.1.  Keep the
+  # multiples of base_frequency; 300 -> 30 Hz at base_frequency 0.1.  Keep the
   # top index below 0.4 / sample_time_step (2000 here) to avoid aliasing the
   # output grid.
-  probe_harmonics: [400, 700, 1000, 1300, 1600]
+  #
+  # 40 lines, log-spaced 8-190 Hz -- exactly
+  # elastic_sim.excitation.log_spaced_probe_harmonics(8.0, 190.0, 40, 0.1).
+  # A sparse 5-line comb 30 Hz apart (the round's first draft) cannot satisfy
+  # its own acceptance test: a linear system only responds at the excitation
+  # frequencies, so the deflection peak lands on the nearest *line*, not the
+  # mode, and zeta only changes the response within about the half-power
+  # bandwidth 2*zeta*f of the mode (~10 Hz at zeta=0.05, f=100 Hz) -- with
+  # lines 30 Hz apart most robots' zeta stayed unobservable even with the
+  # probe on (R3_10 Sec 4.3).  Adjacent-line spacing here is <= ~7 Hz over
+  # the whole band, comfortably inside that bandwidth.  Lowered from a 30 Hz
+  # floor to 8 Hz: SeaMotorController's own feedback loop adds a motor-side
+  # damper roughly proportional to (M_ii + J_r), so on a heavy joint (A1-A3)
+  # the *observable* (closed-loop) resonance sits well below the *open-loop*
+  # two-mass TransmissionSpec.natural_frequency() prediction -- as low as
+  # ~10-35 Hz at the median link inertia on this arm -- and a probe starting
+  # at 30 Hz missed it entirely (R3_12 Sec 1).
+  probe_harmonics: [
+    80, 87, 94, 102, 111, 120, 130, 141, 153, 166,
+    180, 195, 212, 230, 249, 271, 293, 318, 345, 374,
+    406, 440, 478, 518, 562, 609, 661, 717, 778, 843,
+    915, 992, 1076, 1167, 1266, 1373, 1489, 1615, 1752, 1900,
+  ]
   probe_acceleration_fraction: 0.2
   # Per-trajectory regime randomization.  Without it every trajectory is
   # amplitude-maximized against the same caps, so the acceleration and
@@ -155,8 +192,21 @@ dataset:
     val_robots: 2
 
 simulation:
-  control_frequency: 25.0     # closed-loop bandwidth [rad/s]
+  control_frequency: 25.0     # closed-loop bandwidth [rad/s]; used as-is unless control_gains below is enabled
   control_damping_ratio: 1.0
+  # Randomized per-trajectory closed-loop gain.  ComputedTorqueController/
+  # SeaMotorController's own feedback adds a motor-side damper roughly
+  # proportional to (M_ii + J_rotor); on a heavy joint (A1-A3) that can
+  # dominate the transmission's own damping by an order of magnitude, so a
+  # fixed gain bakes one specific closed-loop behaviour into every bag and
+  # zeta is only weakly observable there no matter what the probe does
+  # (R3_12 Sec 1).  Varying the gain makes that dependency visible in the
+  # data instead of a hidden confound; recorded per bag as
+  # control_natural_frequency/control_damping_ratio.
+  control_gains:
+    enabled: true
+    natural_frequency: [15.0, 40.0]   # rad/s
+    damping_ratio: [0.7, 1.3]
   rigid_time_step: 5.0e-4
   max_time_step: 5.0e-4       # elastic robots use less, set by their fastest mode
   sample_time_step: 0.002     # uniform output grid [s]

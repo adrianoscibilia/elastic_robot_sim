@@ -13,12 +13,13 @@ both and the joint's inertia, so the config never states a damping value.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import warnings
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -321,9 +322,19 @@ class SplitPolicy:
 
     ``contiguous`` reproduces the historical behaviour: no ``split`` label is
     assigned here at all, and a consumer that splits a contiguous half of the
-    file puts every robot in both halves.  ``holdout_robots`` reserves whole
-    robots, which is the only split that measures generalization to an
-    unseen transmission -- the reason the transmission is randomized at all.
+    file puts every robot in both halves. ``holdout_robots`` reserves whole
+    robots, ranked by their *mean* log stiffness across joints, for
+    combination generalization -- with independent per-joint sampling
+    (``stiffness_common_fraction: 0``, the shipped default), the mean
+    concentrates near nominal, so held-out robots are extreme only on
+    average, not on every joint. It is still a real improvement over the
+    contiguous split (no robot appears in both halves), but it is not a
+    per-joint extrapolation margin; for that, draw train and test from
+    disjoint ``stiffness_factor`` ranges instead (see
+    ``scripts/run_range_sensitivity.py``'s S2/S3 variants, which do exactly
+    this) (``R3_10 Sec 3.1``). ``holdout_trajectories`` is accepted for
+    forward compatibility but not implemented yet -- ``assign_splits`` raises
+    rather than silently no-op it.
     """
 
     mode: str = "contiguous"
@@ -344,11 +355,15 @@ def assign_splits(tiers: tuple[Tier, ...], policy: SplitPolicy) -> dict[str, str
     """Map each tier name to ``"train" | "val" | "test"``.
 
     ``holdout_robots`` reserves the softest and stiffest strata (by mean log
-    stiffness) for test and the next-most-extreme for validation, so the held
-    -out set is a measured extrapolation margin rather than another
-    interpolation sample.  The rigid tier has no stiffness to hold out and is
-    always ``train``.
+    stiffness) for test and the next-most-extreme for validation -- see
+    ``SplitPolicy``'s docstring for what this does and does not measure. The
+    rigid tier has no stiffness to hold out and is always ``train``.
     """
+    if policy.mode == "holdout_trajectories":
+        raise NotImplementedError(
+            "split.mode 'holdout_trajectories' is accepted for forward compatibility but not "
+            "implemented; use 'contiguous' or 'holdout_robots'"
+        )
     labels = {tier.name: "train" for tier in tiers}
     if policy.mode != "holdout_robots":
         return labels
@@ -357,6 +372,11 @@ def assign_splits(tiers: tuple[Tier, ...], policy: SplitPolicy) -> dict[str, str
         raise ValueError(
             f"split.test_robots + split.val_robots ({policy.test_robots + policy.val_robots}) "
             f"exceeds the number of elastic robots ({len(elastic)})"
+        )
+    if policy.test_robots + policy.val_robots == len(elastic) and elastic:
+        raise ValueError(
+            f"split.test_robots + split.val_robots ({policy.test_robots + policy.val_robots}) leaves zero "
+            f"elastic robots for training out of {len(elastic)}; lower test_robots/val_robots or raise robots"
         )
     ranked = sorted(elastic, key=lambda tier: float(np.mean(np.log(tier.stiffness))))
     n_test = policy.test_robots
@@ -460,6 +480,34 @@ class RegimeSampling:
                 raise ValueError(f"regime.{name} must satisfy 0 < min <= max")
 
 
+@dataclass(frozen=True)
+class ControlGainSampling:
+    """Randomized closed-loop feedback gains, one draw per trajectory.
+
+    ``ComputedTorqueController``/``SeaMotorController`` linearize to an
+    *extra* motor-side stiffness/damping of ``(M_ii + J_rotor) * kp`` /
+    ``(M_ii + J_rotor) * kd`` on top of whatever the plant itself has, so a
+    fixed gain bakes one specific closed-loop behaviour into every bag -- on
+    a heavy joint that motor-side damper can dominate the transmission's own
+    damping by an order of magnitude (``R3_12`` Sec 1), which a model trained
+    on a single fixed gain would never see varied.  Left disabled at the
+    dataclass level -- a caller that builds a ``DatasetConfig`` directly
+    (most tests) keeps today's single fixed gain unless it opts in; the
+    shipped YAML enables it explicitly, the same pattern ``payload``/
+    ``regime`` already use.
+    """
+
+    enabled: bool = False
+    natural_frequency: tuple[float, float] = (25.0, 25.0)
+    damping_ratio: tuple[float, float] = (1.0, 1.0)
+
+    def __post_init__(self) -> None:
+        for name in ("natural_frequency", "damping_ratio"):
+            low, high = getattr(self, name)
+            if low <= 0.0 or high < low:
+                raise ValueError(f"control_gains.{name} must satisfy 0 < min <= max")
+
+
 DEFAULT_CONFIG_DIR = "config/identification"
 DEFAULT_CONFIG = "config/identification/kuka_lbr_iiwa_14_r820_table.yaml"
 
@@ -487,6 +535,7 @@ class DatasetConfig:
     payload: PayloadSampling = field(default_factory=PayloadSampling)
     excitation: FourierExcitationConfig = field(default_factory=FourierExcitationConfig)
     regime: RegimeSampling = field(default_factory=RegimeSampling)
+    control_gains: ControlGainSampling = field(default_factory=ControlGainSampling)
     candidates: int = 48
     control_frequency: float = 25.0
     control_damping_ratio: float = 1.0
@@ -595,6 +644,20 @@ def load_config(path: str | Path) -> DatasetConfig:
         tiers = build_tiers(rigid_reference, sampling, seed)
     except ValueError as exc:
         raise ValueError(f"{source}: {exc}") from exc
+    control_decimation = int(sim_cfg.get("control_decimation", 1))
+    if control_decimation > 1 and not bool(sim_cfg.get("allow_control_decimation", False)):
+        # A decimated command still cancels friction exactly (the applied
+        # torque is held whole, subtraction included, for the window -- see
+        # torque_runners.run_mujoco_torque's comment), but the residual
+        # between the recorded label and rnea(achieved state) grows with
+        # decimation and there is no guard yet relating it to a joint's
+        # friction slope and inertia (R3_11 Sec 1, R3_12 Sec 2.5): a silently
+        # unsafe value should not be one YAML edit away.
+        raise ValueError(
+            f"{source}: simulation.control_decimation={control_decimation} requires "
+            "simulation.allow_control_decimation: true (no automatic stability guard exists yet; "
+            "verify the residual stays acceptable for this asset before enabling it, see R3_12 Sec 1/2.5)"
+        )
     return DatasetConfig(
         asset=str(raw.get("asset", "kuka_lbr_iiwa_14_r820_table")),
         backends=tuple(raw.get("backends", ["mujoco"])),
@@ -628,6 +691,19 @@ def load_config(path: str | Path) -> DatasetConfig:
             ),
             velocity_fraction=tuple(
                 float(v) for v in (exc_cfg.get("regime", {}) or {}).get("velocity_fraction", [1.0, 1.0])
+            ),
+        ),
+        control_gains=ControlGainSampling(
+            enabled=bool((sim_cfg.get("control_gains", {}) or {}).get("enabled", False)),
+            natural_frequency=tuple(
+                float(v) for v in (sim_cfg.get("control_gains", {}) or {}).get(
+                    "natural_frequency", [sim_cfg.get("control_frequency", 25.0)] * 2
+                )
+            ),
+            damping_ratio=tuple(
+                float(v) for v in (sim_cfg.get("control_gains", {}) or {}).get(
+                    "damping_ratio", [sim_cfg.get("control_damping_ratio", 1.0)] * 2
+                )
             ),
         ),
         candidates=int(exc_cfg.get("candidates", 48)),
@@ -676,6 +752,30 @@ def regime_excitation(
     return replace(base, max_acceleration=max_acceleration, velocity_fraction=velocity_fraction)
 
 
+def sample_control_gains(
+    sampling: ControlGainSampling, base_frequency: float, base_damping_ratio: float,
+    dataset_seed: int, trajectory_seed_value: int,
+) -> tuple[float, float]:
+    """Derive one trajectory's ``(natural_frequency, damping_ratio)``.
+
+    Stream ``(seed, 6, trajectory_seed)``, independent of every other stream
+    (robots ``(seed, 1)``, payload ``(seed, 2)``, regime ``(seed, 3)``,
+    rotor inertia ``(seed, 4)``, payload re-draws ``(seed, 5)``): enabling
+    this does not perturb any of them.  ``generate()`` and
+    ``run_identification_simulation.py`` must call this the same way so
+    ``--tier eNN --trajectory k`` reproduces the dataset's gains exactly,
+    same requirement as ``regime_excitation``.
+    """
+    if not sampling.enabled:
+        return base_frequency, base_damping_ratio
+    rng = np.random.default_rng((int(dataset_seed), 6, int(trajectory_seed_value)))
+    natural_frequency = float(np.exp(
+        rng.uniform(np.log(sampling.natural_frequency[0]), np.log(sampling.natural_frequency[1]))
+    ))
+    damping_ratio = float(rng.uniform(sampling.damping_ratio[0], sampling.damping_ratio[1]))
+    return natural_frequency, damping_ratio
+
+
 def sample_friction(base: FrictionModel, rng: np.random.Generator, scale_range: tuple[float, float]) -> FrictionModel:
     """Scale each joint's viscous and Coulomb coefficient log-uniformly."""
     low, high = np.log(scale_range[0]), np.log(scale_range[1])
@@ -698,6 +798,8 @@ def run_condition(
     *,
     link_inertia: LinkInertia | None = None,
     payload: Payload | None = None,
+    natural_frequency: float | None = None,
+    damping_ratio: float | None = None,
 ) -> dict[str, Any]:
     """Execute one trajectory under one condition and return the rollout.
 
@@ -712,7 +814,14 @@ def run_condition(
     inertias a payload changes; only the required torque does, which is
     checked separately) -- do not "fix" this without re-reading
     ``R3_01 Sec 2.6``.
+
+    ``natural_frequency``/``damping_ratio`` default to
+    ``config.control_frequency``/``config.control_damping_ratio`` when not
+    given; pass the per-trajectory draw from ``sample_control_gains`` to use
+    a randomized closed-loop gain instead (``config.control_gains``).
     """
+    natural_frequency = config.control_frequency if natural_frequency is None else natural_frequency
+    damping_ratio = config.control_damping_ratio if damping_ratio is None else damping_ratio
     n_dof = len(asset.joint_names)
     view = {"visualize": config.visualize, "realtime_scale": config.realtime_scale}
     probe_top_hz = float(trajectory.metadata.get("probe_top_hz", 0.0))
@@ -733,13 +842,14 @@ def run_condition(
             _check_control_rate(config.rigid_time_step)
             controller = ComputedTorqueController(
                 asset_p, trajectory, friction=friction,
-                natural_frequency=config.control_frequency,
-                damping_ratio=config.control_damping_ratio,
+                natural_frequency=natural_frequency,
+                damping_ratio=damping_ratio,
             )
             runner = run_mujoco_torque if backend == "mujoco" else run_newton_torque
             result = runner(asset_p, trajectory, controller, time_step=config.rigid_time_step,
                             friction=friction, control_decimation=config.control_decimation, **view)
-            result.update(transmission=None, time_step=config.rigid_time_step, payload=payload)
+            result.update(transmission=None, time_step=config.rigid_time_step, payload=payload,
+                         natural_frequency=natural_frequency, damping_ratio=damping_ratio)
             return result
         if link_inertia is None:
             link_inertia = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples)
@@ -748,13 +858,14 @@ def run_condition(
         _check_control_rate(time_step)
         controller = SeaMotorController(
             asset_p, trajectory, transmission, friction=friction,
-            natural_frequency=config.control_frequency,
-            damping_ratio=config.control_damping_ratio,
+            natural_frequency=natural_frequency,
+            damping_ratio=damping_ratio,
         )
         runner = run_mujoco_elastic_torque if backend == "mujoco" else run_newton_elastic_torque
         result = runner(asset_p, trajectory, controller, transmission, time_step=time_step,
                         friction=friction, control_decimation=config.control_decimation, **view)
-        result.update(transmission=transmission, time_step=time_step, payload=payload)
+        result.update(transmission=transmission, time_step=time_step, payload=payload,
+                     natural_frequency=natural_frequency, damping_ratio=damping_ratio)
         return result
 
 
@@ -930,6 +1041,8 @@ def rollout_frame(
     frame["exc_max_acceleration"] = exc_metadata.get("max_acceleration")
     frame["exc_velocity_fraction"] = exc_metadata.get("velocity_fraction")
     frame["exc_probe_top_hz"] = exc_metadata.get("probe_top_hz", 0.0)
+    frame["control_natural_frequency"] = result.get("natural_frequency")
+    frame["control_damping_ratio"] = result.get("damping_ratio")
     return frame
 
 
@@ -944,11 +1057,22 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     call order -- so worker order never affects the result.
     """
     (asset, trajectory, tier, backend, friction, config, link_inertia, payload,
-     split, bag, bag_index, traj_index, friction_index) = args
+     split, bag, bag_index, traj_index, friction_index, control_gains) = args
+    natural_frequency, damping_ratio = control_gains
     result = run_condition(asset, trajectory, tier, backend, friction, config,
-                           link_inertia=link_inertia, payload=payload)
+                           link_inertia=link_inertia, payload=payload,
+                           natural_frequency=natural_frequency, damping_ratio=damping_ratio)
     frame = rollout_frame(asset, trajectory, result, bag=bag, tier=tier, backend=backend,
                           friction=friction, resample_step=config.sample_time_step, split=split)
+    # Effort limits come from the bare asset's URDF <limit effort=...> tags,
+    # unaffected by payload injection (a payload changes link inertia, not
+    # the motor's rated torque) -- a payload heavy/offset enough, combined
+    # with a high regime acceleration, is the most likely way a bag becomes
+    # physically meaningless without anything else catching it (R3_10 Sec 3.3).
+    effort_limits = np.asarray(
+        [joint.effort if joint.effort else np.inf for joint in asset.resolve_active_joints()]
+    )
+    peak_torque_ratio = float(np.max(np.abs(np.asarray(result["tau_motor"])) / effort_limits[None, :]))
     record = {
         "bag": bag, "bag_index": bag_index, "trajectory": traj_index, "tier": tier.name, "split": split,
         **describe_transmission(result["transmission"], result["time_step"]),
@@ -957,19 +1081,122 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
         "solver": result.get("solver"), "wall_time": float(result.get("wall_time", 0.0)),
         "samples": int(len(result["time"])),
         "trajectory_digest": trajectory.digest(),
+        "trajectory_signal_digest": trajectory.signal_digest(),
         "condition_number": float(trajectory.metadata["condition_number"]),
         "exc_base_frequency": float(trajectory.metadata["base_frequency"]),
         "exc_max_acceleration": float(trajectory.metadata["max_acceleration"]),
         "exc_velocity_fraction": float(trajectory.metadata["velocity_fraction"]),
         "exc_probe_top_hz": float(trajectory.metadata.get("probe_top_hz", 0.0)),
+        "control_natural_frequency": float(natural_frequency),
+        "control_damping_ratio": float(damping_ratio),
         "viscous": friction.viscous.tolist(), "coulomb": friction.coulomb.tolist(),
         "tracking_rms": float(np.sqrt(np.mean((np.asarray(result["q_link"]) - np.asarray(result["q_ref"])) ** 2))),
         "max_deflection": float(np.abs(np.asarray(result["q_motor"]) - np.asarray(result["q_link"])).max()),
         "feedback_ratio": float(
             np.mean(np.abs(result["tau_feedback"])) / max(np.mean(np.abs(result["tau_feedforward"])), 1e-12)
         ),
+        "peak_torque_ratio": peak_torque_ratio,
     }
     return frame, record
+
+
+def sample_all_payloads(
+    config: DatasetConfig, elastic_tiers: Sequence[Tier],
+) -> tuple[dict[str, Payload], dict[tuple[str, int], Payload]]:
+    """Draw every elastic tier's payload(s), in one deterministic batch.
+
+    ``per: "robot"`` draws one payload per tier (a robot ships with a tool);
+    ``"trajectory"`` draws one per ``(tier, index)`` pair, the same
+    ``(index, tier)`` nesting order every caller must use for a draw to
+    reproduce.  ``elastic_tiers`` must be built the same way by every caller
+    (``[t for t in config.tiers if not t.is_rigid]``): the ``"trajectory"``
+    stream is a single sequential draw over the whole batch, so it is only
+    reproducible in isolation for ``per: "robot"`` (see ``resolve_bag``).
+    """
+    payload_by_tier: dict[str, Payload] = {}
+    payload_by_key: dict[tuple[str, int], Payload] = {}
+    if config.payload.per == "robot":
+        drawn = sample_payloads(config.payload, config.seed, len(elastic_tiers))
+        payload_by_tier = {tier.name: p for tier, p in zip(elastic_tiers, drawn)}
+    else:
+        drawn = sample_payloads(config.payload, config.seed, config.n_trajectories * len(elastic_tiers))
+        drawn_iter = iter(drawn)
+        for traj_index in range(config.n_trajectories):
+            for tier in elastic_tiers:
+                payload_by_key[(tier.name, traj_index)] = next(drawn_iter)
+    return payload_by_tier, payload_by_key
+
+
+def payload_for(
+    config: DatasetConfig, payload_by_tier: Mapping[str, Payload], payload_by_key: Mapping[tuple[str, int], Payload],
+    tier: Tier, traj_index: int,
+) -> Payload | None:
+    if tier.is_rigid:
+        return Payload()
+    return payload_by_tier[tier.name] if config.payload.per == "robot" else payload_by_key[(tier.name, traj_index)]
+
+
+@dataclass(frozen=True)
+class ResolvedBag:
+    """One ``(tier, trajectory index)`` bag's payload-aware trajectory and gains."""
+
+    payload: Payload | None
+    excitation: FourierExcitationConfig
+    natural_frequency: float
+    damping_ratio: float
+    trajectory: MaterializedTrajectory
+
+
+def resolve_bag(
+    config: DatasetConfig, asset: AssetSpec, tier: Tier, index: int, payload: Payload | None,
+    *, kinematics_for: Callable[[Payload | None], PortableKinematics] | None = None,
+) -> ResolvedBag:
+    """Derive one bag's trajectory, excitation and control gains.
+
+    The single source of truth for what a dataset bag actually is:
+    ``generate()`` and ``run_identification_simulation.py`` both call this
+    the same way, so ``--tier eNN --trajectory k`` reproduces the dataset's
+    trajectory exactly -- scored against the *same payload-fitted* collision
+    geometry, not the bare asset, whenever ``payload`` is non-empty (R3_14
+    Sec 1.1: before this helper existed, the debug script always optimized
+    against bare kinematics and ran the rollout with no payload at all,
+    while ``generate()`` scores every trajectory against payload-fitted
+    geometry whenever ``trajectories_per_robot`` is set, the shipped
+    default -- silently reproducing the wrong trajectory, and a payload-free
+    rollout, for every robot whose payload changed a collision rejection).
+
+    ``payload`` is the caller's responsibility to resolve first (via
+    ``sample_all_payloads``/``payload_for``, or ``Payload()`` when this bag
+    is deliberately payload-free, e.g. a shared trajectory under
+    ``trajectories_per_robot: false``) -- this function does not re-derive
+    it, so it never disagrees with whatever the manifest says that bag's
+    payload was. ``kinematics_for`` defaults to a fresh, uncached
+    ``PortableKinematics`` per call, torn down before returning;
+    ``generate()`` passes its cached, longer-lived version so a "per: robot"
+    dataset does not rebuild the same payload-fitted kinematics once per
+    trajectory.
+    """
+    traj_seed = trajectory_seed(config, tier, index)
+    excitation = regime_excitation(config.excitation, config.regime, config.seed, traj_seed)
+    natural_frequency, damping_ratio = sample_control_gains(
+        config.control_gains, config.control_frequency, config.control_damping_ratio, config.seed, traj_seed,
+    )
+
+    stack = contextlib.ExitStack()
+    try:
+        if kinematics_for is not None:
+            kinematics = kinematics_for(payload)
+        else:
+            asset_p = stack.enter_context(payload_asset(asset, payload))
+            kinematics = PortableKinematics(asset_p)
+        trajectory = optimize_excitation(
+            asset, excitation, seed=traj_seed, n_candidates=config.candidates, kinematics=kinematics,
+        )
+    finally:
+        stack.close()
+
+    return ResolvedBag(payload=payload, excitation=excitation, natural_frequency=natural_frequency,
+                       damping_ratio=damping_ratio, trajectory=trajectory)
 
 
 def generate(
@@ -989,49 +1216,18 @@ def generate(
     # or one per (tier, trajectory) pair ("trajectory" -- the same robot used
     # with many tools).  The rigid tier always gets an empty payload, so the
     # rigid reference keeps validating against the unmodified URDF.
-    payload_by_tier: dict[str, Payload] = {}
-    payload_by_key: dict[tuple[str, int], Payload] = {}
-    if config.payload.per == "robot":
-        drawn = sample_payloads(config.payload, config.seed, len(elastic_tiers))
-        payload_by_tier = {tier.name: p for tier, p in zip(elastic_tiers, drawn)}
-    else:
-        drawn = sample_payloads(config.payload, config.seed, config.n_trajectories * len(elastic_tiers))
-        drawn_iter = iter(drawn)
-        for traj_index in range(config.n_trajectories):
-            for tier in elastic_tiers:
-                payload_by_key[(tier.name, traj_index)] = next(drawn_iter)
+    payload_by_tier, payload_by_key = sample_all_payloads(config, elastic_tiers)
 
     def _payload_for(tier: Tier, traj_index: int) -> Payload | None:
-        if tier.is_rigid:
-            return Payload()
-        return payload_by_tier[tier.name] if config.payload.per == "robot" else payload_by_key[(tier.name, traj_index)]
+        return payload_for(config, payload_by_tier, payload_by_key, tier, traj_index)
 
     link_inertia = None
-    robots: list[dict[str, Any]] = []
-    if elastic_tiers:
-        # Nominal (payload-free) numbers, for the manifest's "robots" summary
-        # and the verbose print -- the ground truth per bag is the payload
-        # columns rollout_frame writes, which do vary with the payload.
-        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
-        if verbose:
-            print(f"link inertia M_ii [kg m^2]: median {np.array2string(link_inertia[0], precision=4)}")
-            print(f"                            floor  {np.array2string(link_inertia[1], precision=4)}")
-        for tier in elastic_tiers:
-            transmission = tier.transmission(n_dof, link_inertia)
-            entry = {"name": tier.name, **describe_transmission(transmission, elastic_time_step(transmission, config))}
-            if config.payload.per == "robot":
-                payload = payload_by_tier[tier.name]
-                entry["payload"] = None if payload.is_empty else payload.as_dict()
-            robots.append(entry)
-            if verbose:
-                print(f"robot {tier.name}: k [Nm/rad] {np.array2string(transmission.stiffness, precision=0, floatmode='fixed')}"
-                      f"\n           zeta {np.array2string(transmission.damping_ratio, precision=3)}"
-                      f" | top mode {transmission.natural_frequency().max():.0f} Hz"
-                      f" | step {robots[-1]['time_step']:.1e} s")
-
-    # link_inertia_envelope is asset-*and*-payload dependent, unlike the
-    # nominal one above; cache it keyed on the payload so a "per: robot"
-    # dataset does at most robots + 1 CRBA sweeps instead of one per bag.
+    # link_inertia_envelope is asset-*and*-payload dependent; cache it keyed
+    # on the payload so a "per: robot" dataset does at most robots + 1 CRBA
+    # sweeps instead of one per bag, and so the manifest's "robots" summary
+    # below can report the *actual* payload-fitted damping/step per robot
+    # instead of a payload-free number that would silently disagree with
+    # that same robot's per-bag records (R3_10 task table, row C4).
     envelope_cache: dict[tuple, LinkInertia] = {}
 
     def _envelope_for(payload: Payload | None) -> LinkInertia:
@@ -1041,38 +1237,130 @@ def generate(
                 envelope_cache[key] = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples)
         return envelope_cache[key]
 
+    robots: list[dict[str, Any]] = []
+    if elastic_tiers:
+        # per: "robot" has one stable payload per tier, so its summary can be
+        # fully consistent with that tier's per-bag records; per:
+        # "trajectory" does not (a robot's payload varies bag to bag), so
+        # its summary stays nominal/payload-free, exactly as documented in
+        # the per-bag payload_* columns being the ground truth there.
+        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
+        if verbose:
+            print(f"link inertia M_ii [kg m^2]: median {np.array2string(link_inertia[0], precision=4)}")
+            print(f"                            floor  {np.array2string(link_inertia[1], precision=4)}")
+        for tier in elastic_tiers:
+            tier_payload = payload_by_tier.get(tier.name) if config.payload.per == "robot" else None
+            tier_link_inertia = _envelope_for(tier_payload) if tier_payload is not None else link_inertia
+            transmission = tier.transmission(n_dof, tier_link_inertia)
+            entry = {"name": tier.name, **describe_transmission(transmission, elastic_time_step(transmission, config))}
+            if tier_payload is not None:
+                entry["payload"] = None if tier_payload.is_empty else tier_payload.as_dict()
+            robots.append(entry)
+            if verbose:
+                print(f"robot {tier.name}: k [Nm/rad] {np.array2string(transmission.stiffness, precision=0, floatmode='fixed')}"
+                      f"\n           zeta {np.array2string(transmission.damping_ratio, precision=3)}"
+                      f" | top mode {transmission.natural_frequency().max():.0f} Hz"
+                      f" | step {robots[-1]['time_step']:.1e} s")
+
     # Contacts are disabled during a rollout, so a trajectory that collides
     # would be simulated straight through the geometry: validate here, where
     # the trajectory is chosen, rather than trusting it afterwards.
     kinematics = PortableKinematics(asset)
+    # A payload adds real geometry (a box, 5-25 cm on a side) that the bare
+    # asset never saw; a trajectory validated collision-free against the bare
+    # asset is not necessarily collision-free once one is fitted (R3_10 Sec
+    # 3.2).  Cached by payload key, same bound as the link-inertia envelope
+    # cache.  Each injected payload URDF is a temp file that ``payload_asset``
+    # deletes when its ``with`` block exits; ``PortableKinematics`` re-parses
+    # that path lazily (e.g. ``.joint_names``), so a cache entry built from a
+    # closed ``with`` block would point at a file that no longer exists --
+    # keep every unique payload's temp URDF alive for the duration of
+    # ``generate()`` via an ExitStack, closed in the ``finally`` below.
+    kinematics_cache: dict[tuple, PortableKinematics] = {(): kinematics}
+    kinematics_stack = contextlib.ExitStack()
+
+    def _kinematics_for(payload: Payload | None) -> PortableKinematics:
+        key = () if payload is None or payload.is_empty else (payload.mass, payload.offset, payload.size)
+        if key not in kinematics_cache:
+            asset_p = kinematics_stack.enter_context(payload_asset(asset, payload))
+            kinematics_cache[key] = PortableKinematics(asset_p)
+        return kinematics_cache[key]
+
     trajectories: dict[tuple[str, int], MaterializedTrajectory] = {}
-    for tier in (config.tiers if config.trajectories_per_robot else config.tiers[:1]):
-        key = tier.name if config.trajectories_per_robot else ""
-        for index in range(config.n_trajectories):
-            traj_seed = trajectory_seed(config, tier, index)
-            excitation = regime_excitation(config.excitation, config.regime, config.seed, traj_seed)
-            trajectories[(key, index)] = optimize_excitation(
-                asset, excitation, seed=traj_seed,
-                n_candidates=config.candidates, kinematics=kinematics,
-            )
-            if verbose:
-                metadata = trajectories[(key, index)].metadata
-                label = f"trajectory {index}" + (f" for {tier.name}" if config.trajectories_per_robot else "")
-                print(f"{label}: condition={metadata['condition_number']:.0f}"
-                      f" ({metadata['collision_rejections']} candidates rejected for collision)")
+    control_gains: dict[tuple[str, int], tuple[float, float]] = {}
+    try:
+        for tier in (config.tiers if config.trajectories_per_robot else config.tiers[:1]):
+            key = tier.name if config.trajectories_per_robot else ""
+            for index in range(config.n_trajectories):
+                # When every tier gets its own trajectory, that tier's payload
+                # (whether drawn "per: robot" -- constant across its
+                # trajectories -- or "per: trajectory" -- one per (tier,
+                # index)) is already known here: score candidates against the
+                # *payload-fitted* geometry directly, so a collision just
+                # rejects a candidate inside optimize_excitation instead of
+                # aborting the whole build after the fact (R3_12 Sec 2.2).
+                # With a single trajectory shared across every tier
+                # (``trajectories_per_robot: false``), no one payload applies,
+                # so this stays payload-free and the post-hoc check below is
+                # the only guard.
+                payload = _payload_for(tier, index) if config.trajectories_per_robot else Payload()
+                resolved = resolve_bag(config, asset, tier, index, payload, kinematics_for=_kinematics_for)
+                trajectories[(key, index)] = resolved.trajectory
+                control_gains[(key, index)] = (resolved.natural_frequency, resolved.damping_ratio)
+                if verbose:
+                    metadata = resolved.trajectory.metadata
+                    label = f"trajectory {index}" + (f" for {tier.name}" if config.trajectories_per_robot else "")
+                    print(f"{label}: condition={metadata['condition_number']:.0f}"
+                          f" ({metadata['collision_rejections']} candidates rejected for collision)")
 
-    split_labels = assign_splits(config.tiers, config.split)
+        split_labels = assign_splits(config.tiers, config.split)
 
-    work: list[tuple] = []
-    for bag_index, (traj_index, tier, friction_index, backend) in enumerate(iter_conditions(config)):
-        trajectory = trajectories[(tier.name if config.trajectories_per_robot else "", traj_index)]
-        friction = frictions[friction_index]
-        bag = f"t{traj_index}_{tier.name}_f{friction_index}_{backend}"
-        split = split_labels[tier.name]
-        payload = _payload_for(tier, traj_index)
-        link_inertia_for_bag = _envelope_for(payload) if not tier.is_rigid else None
-        work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, payload,
-                    split, bag, bag_index, traj_index, friction_index))
+        # Post-hoc safety net for the case the loop above could not already
+        # guarantee: a shared (``trajectories_per_robot: false``) trajectory
+        # combined with a payload, which was necessarily scored payload-free
+        # above.  A single bad payload draw should not abort a 60-bag build,
+        # so re-draw a handful of alternative payloads for that (tier,
+        # trajectory) before giving up.
+        validated: dict[tuple[str, int], bool] = {}
+        redraw_rng = np.random.default_rng((config.seed, 5))
+
+        def _collision_free(trajectory: MaterializedTrajectory, payload: Payload) -> bool:
+            margin = float(asset.metadata.get("collision", {}).get("margin", 0.0))
+            max_joint_step = float(asset.metadata.get("collision", {}).get("max_joint_step", 0.05))
+            report = _kinematics_for(payload).validate_path(trajectory.position, margin=margin, max_joint_step=max_joint_step)
+            return report.valid
+
+        work: list[tuple] = []
+        for bag_index, (traj_index, tier, friction_index, backend) in enumerate(iter_conditions(config)):
+            trajectory = trajectories[(tier.name if config.trajectories_per_robot else "", traj_index)]
+            friction = frictions[friction_index]
+            bag = f"t{traj_index}_{tier.name}_f{friction_index}_{backend}"
+            split = split_labels[tier.name]
+            payload = _payload_for(tier, traj_index)
+            key = (tier.name, traj_index)
+            if not config.trajectories_per_robot and payload is not None and not payload.is_empty and key not in validated:
+                if not _collision_free(trajectory, payload):
+                    for attempt in range(5):
+                        candidate = sample_payloads(config.payload, int(redraw_rng.integers(0, 2**31 - 1)), 1)[0]
+                        if _collision_free(trajectory, candidate):
+                            payload = candidate
+                            if config.payload.per == "robot":
+                                payload_by_tier[tier.name] = candidate
+                            else:
+                                payload_by_key[key] = candidate
+                            break
+                    else:
+                        raise ValueError(
+                            f"tier {tier.name!r} trajectory {traj_index}: no payload in 6 draws (1 original + 5 "
+                            f"retries) leaves this shared trajectory collision-free; this pairing is not usable"
+                        )
+                validated[key] = True
+            link_inertia_for_bag = _envelope_for(payload) if not tier.is_rigid else None
+            gains = control_gains[(tier.name if config.trajectories_per_robot else "", traj_index)]
+            work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, payload,
+                        split, bag, bag_index, traj_index, friction_index, gains))
+    finally:
+        kinematics_stack.close()
 
     frames: list[pd.DataFrame] = []
     records: list[dict[str, Any]] = []
@@ -1089,6 +1377,9 @@ def generate(
         if verbose:
             print(f"  [{record['bag_index'] + 1}] {record['bag']:30s} {record['wall_time']:6.1f}s "
                   f"trk={record['tracking_rms']:.2e} defl={record['max_deflection']:.2e}")
+            if record["peak_torque_ratio"] > 0.8:
+                print(f"    warning: bag {record['bag']!r} peak |tau| is "
+                      f"{record['peak_torque_ratio']:.0%} of the effort limit on its worst joint")
 
     frame = pd.concat(frames, ignore_index=True)
     # ``dynamic_model_nn`` differentiates with a Savitzky-Golay filter that
@@ -1192,7 +1483,12 @@ def write_dataset(
 
     suffix = csv_path.suffix.lower()
     if suffix == ".parquet":
-        float_cols = frame.select_dtypes(include="float64").columns
+        # Keep "t" at float64: it is what the uniform-time-step assertion
+        # above and the consumer's Savitzky-Golay filter depend on, and
+        # float32's ~1e-6 s spacing at 10 s degrades further on longer
+        # trajectories (R3_10 Sec 3.5) -- everything else is a signal or
+        # metadata value the consumer casts to float32 on load anyway.
+        float_cols = frame.select_dtypes(include="float64").columns.drop("t", errors="ignore")
         frame.astype({col: "float32" for col in float_cols}).to_parquet(csv_path, index=False)
     elif suffix == ".csv":
         frame.to_csv(csv_path, index=False, float_format="%.7g")
@@ -1207,6 +1503,11 @@ def write_dataset(
         "n_dof": n_dof,
         "input_columns": [f"q0..q{n_dof - 1}", f"dq0..dq{n_dof - 1}", f"tau0..tau{n_dof - 1}"],
         "target_columns": [f"ft0..ft{n_dof - 1}"],
+        # Machine-readable target kind, keyed on directly by the consumer at
+        # dof == 6 (where "ft0..ft5" is ambiguous between this and a legacy
+        # wrench) instead of pattern-matching target_columns' string form
+        # (R3_14 Sec 2).
+        "target_kind": "per_joint_torque",
         "target_semantics": "link-side joint torque [Nm]",
         "requires_consumer": "dynamic_model_nn dataset.py with the general ft0..ft{dof-1} branch",
         "split": manifest.get("split"),

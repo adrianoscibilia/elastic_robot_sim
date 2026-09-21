@@ -338,7 +338,7 @@ def run_mujoco_torque(
     viewer = _open_viewer("mujoco", asset, trajectory, model, data) if visualize else None
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
-    command = solver_torque = None
+    command = None
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
@@ -347,12 +347,27 @@ def run_mujoco_torque(
         if not (np.isfinite(q).all() and np.isfinite(dq).all()):
             raise RuntimeError(f"MuJoCo torque rollout became non-finite at t={sample_time:.6f}s")
         if index % control_decimation == 0:
+            # ``command.total`` already embeds friction compensation at
+            # *this* (q, dq): ``ComputedTorqueController`` computes it as
+            # ``rnea(q, dq, commanded_ddq, friction=...)``, so subtracting
+            # ``friction.torque(dq)`` here with the *same* dq exactly
+            # cancels that embedded term, leaving a smooth rnea-only torque
+            # applied to the physics.  Recomputing this subtraction with a
+            # *fresher* dq on later, un-decimated steps looked more exact on
+            # paper, but it uncancels that embedded term into a live
+            # disturbance with the friction model's full slope
+            # (viscous + coulomb/epsilon, ~100 Nm/(rad/s) here) while the
+            # command that would counter it stays frozen for the rest of the
+            # window -- confirmed empirically to blow the rollout up
+            # (qacc -> 1e11) at control_decimation as low as 2 on this
+            # asset's low-inertia wrist joint.  Holding the whole solver
+            # torque constant for the window (recomputed only here) is the
+            # numerically stable choice; it costs a small, bounded residual
+            # between the recorded label and rnea(achieved state) that grows
+            # with decimation (~1.5e-8 Nm through decimation 4, ~0.016 Nm at
+            # decimation 8 on a 2 rad/s^2 trajectory) instead of an unbounded
+            # one.
             command = controller(float(sample_time), q, dq)
-            # Friction is modelled explicitly rather than by the importer, so
-            # it is subtracted here: the recorded label stays the full joint
-            # torque.  Held with the rest of the command under decimation, as
-            # a real drive's friction compensation updates at its own control
-            # rate rather than the physics rate.
             solver_torque = command.total - friction.torque(dq)
         data.qfrc_applied[:] = 0.0
         data.qfrc_applied[dof_idx] = solver_torque
@@ -483,7 +498,12 @@ def run_newton_torque(
         if not (np.isfinite(q).all() and np.isfinite(dq).all()):
             raise RuntimeError(f"Newton torque rollout became non-finite at t={sample_time:.6f}s")
         if index % control_decimation == 0:
+            # See run_mujoco_torque: hold the friction subtraction with the
+            # same (stale) command, not the current dq, or the embedded
+            # friction-cancellation term in ``command.total`` uncancels into
+            # an undamped disturbance and diverges.
             command = controller(float(sample_time), q, dq)
+            solver_torque = command.total - friction.torque(dq)
         q_rows.append(q)
         dq_rows.append(dq)
         tau_rows.append(command.total)
@@ -491,7 +511,6 @@ def run_newton_torque(
         fb_rows.append(command.feedback)
         if index + 1 == len(grid):
             break
-        solver_torque = command.total - friction.torque(dq)
         torque_buffer.fill(0.0)
         torque_buffer[qd_idx] = solver_torque
         control.joint_f.assign(torque_buffer)
@@ -619,6 +638,66 @@ class TransmissionSpec:
             self.rotor_inertia, self.link_inertia_floor
         )
         return np.sqrt(self.stiffness / inertia) / (2.0 * np.pi)
+
+    def closed_loop_mode_frequency(
+        self, link_inertia: np.ndarray, *, natural_frequency: float = 25.0, damping_ratio: float = 1.0,
+        frequency_grid_hz: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Per-joint *observable* resonance in Hz under ``SeaMotorController``'s feedback.
+
+        ``natural_frequency()`` is the right bound for the integration step
+        (open-loop, worst-case), but it is the wrong prediction for what a
+        rollout actually shows: ``SeaMotorController`` commands ``tau_m =
+        rnea(q_m, dq_m, a_cmd) + J_r a_cmd``, ``a_cmd = ddq_ref + kd*(dq_ref -
+        dq_m) + kp*(q_ref - q_m)``. ``rnea`` is affine in its acceleration
+        argument (``rnea(q, dq, ddq) = M(q) ddq + h(q, dq)``), so the
+        feedback contributes an *extra* motor-side stiffness/damping of
+        ``(M_ii + J_r) kp`` / ``(M_ii + J_r) kd``, on top of the
+        transmission's own ``(k, d)`` -- a motor-side damper roughly ten
+        times the transmission's on a heavy joint at the shipped gains
+        (R3_12 Sec 1).
+
+        Returns the frequency where the deflection ``|theta_m - theta_l)|``
+        per unit motor-side torque peaks (a swept frequency-response
+        magnitude, matching what an FFT of a real rollout's deflection
+        channel measures), **not** the least-damped pole's own frequency: an
+        earlier version returned that instead and was off by up to ~30% on
+        mid-weight joints and flatly wrong (0 Hz, "no resonance") on heavy
+        ones, because a heavily damped system's pole frequency and its
+        forced-response peak are different quantities in general -- checked
+        against a direct simulation via ``R3_14 Sec 1.4``'s reference table.
+        This is a diagnostic only; the mode/ζ tests use a windowed on/off
+        *contrast*, not this function's output, as their acceptance
+        criterion, since even this corrected version is a single-joint
+        linearization (no cross-joint coupling, gravity or the true ``M(q)``
+        trajectory) and not tight enough to assert per-joint by itself.
+        """
+        link_inertia = np.broadcast_to(np.asarray(link_inertia, dtype=float), self.stiffness.shape)
+        kp = float(natural_frequency) ** 2
+        kd = 2.0 * float(damping_ratio) * float(natural_frequency)
+        if frequency_grid_hz is None:
+            frequency_grid_hz = np.logspace(0.0, 3.0, 400)
+        omega = 2.0 * np.pi * np.asarray(frequency_grid_hz, dtype=float)
+        identity = np.eye(4)
+        frequencies = np.empty_like(self.stiffness)
+        for i in range(len(self.stiffness)):
+            k, d, j_r, j_l = self.stiffness[i], self.damping[i], self.rotor_inertia[i], link_inertia[i]
+            extra_k = (j_l + j_r) * kp
+            extra_d = (j_l + j_r) * kd
+            # State [theta_m, theta_l, thetadot_m, thetadot_l]; a disturbance
+            # torque u applied at the motor node (b) probes the deflection
+            # (c = theta_m - theta_l) the same way an excitation probe does.
+            a = np.array([
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                [-(k + extra_k) / j_r, k / j_r, -(d + extra_d) / j_r, d / j_r],
+                [k / j_l, -k / j_l, d / j_l, -d / j_l],
+            ])
+            b = np.array([0.0, 0.0, 1.0 / j_r, 0.0])
+            c = np.array([1.0, -1.0, 0.0, 0.0])
+            magnitude = np.array([np.abs(c @ np.linalg.solve(1j * w * identity - a, b)) for w in omega])
+            frequencies[i] = float(frequency_grid_hz[np.argmax(magnitude)])
+        return frequencies
 
     def required_time_step(self, samples_per_period: float = 20.0) -> float:
         return float(1.0 / (samples_per_period * float(np.max(self.natural_frequency()))))
@@ -816,6 +895,10 @@ def run_mujoco_elastic_torque(
         # signal, so it must never be held.
         tau_spring = -(transmission.stiffness * elastic_q + transmission.damping * elastic_dq)
         if index % control_decimation == 0:
+            # See run_mujoco_torque: the friction subtraction must be held
+            # with the same (stale) command, not refreshed every step, or the
+            # embedded friction-cancellation term in ``command.total``
+            # uncancels into an undamped disturbance and diverges.
             command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
             solver_torque = command.total - friction.torque(motor_dq)
         data.qfrc_applied[:] = 0.0
@@ -972,7 +1055,12 @@ def run_newton_elastic_torque(
         # run_mujoco_elastic_torque.
         tau_spring = -(transmission.stiffness * elastic_q + transmission.damping * elastic_dq)
         if index % control_decimation == 0:
+            # See run_mujoco_torque: hold the friction subtraction with the
+            # same (stale) command, not the current motor_dq, or the embedded
+            # friction-cancellation term in ``command.total`` uncancels into
+            # an undamped disturbance and diverges.
             command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
+            solver_torque = command.total - friction.torque(motor_dq)
         rows["q"].append(link_q)
         rows["dq"].append(link_dq)
         rows["qm"].append(motor_q)
@@ -983,7 +1071,6 @@ def run_newton_elastic_torque(
         rows["tau_link"].append(tau_spring)
         if index + 1 == len(grid):
             break
-        solver_torque = command.total - friction.torque(motor_dq)
         buffer.fill(0.0)
         buffer[motor_qd_idx] = solver_torque
         control.joint_f.assign(buffer)

@@ -170,6 +170,17 @@ def base_parameter_basis(
     where a least-squares fit is well posed.
     """
     rng = np.random.default_rng(seed)
+    # ``pin.randomConfiguration`` draws from Pinocchio's own global RNG, not
+    # ``rng``, so the basis depended on how many prior Pinocchio random draws
+    # had happened elsewhere in the process -- different between a call made
+    # inside ``generate()`` and one made fresh afterwards, changing
+    # ``condition_number`` (and so ``digest()``) for a bit-identical
+    # trajectory (R3_12 Sec 2.3). Reset Pinocchio's global RNG to a state
+    # that depends only on ``seed`` immediately before drawing from it,
+    # rather than reimplementing the draw with ``rng.uniform`` over
+    # ``[lower, upper]`` (wrong for a continuous joint, whose Pinocchio
+    # configuration is `(cos, sin)`, not an angle in a box -- R3_14 Sec 2).
+    pin.seed(int(seed))
     rows = []
     for _ in range(int(n_samples)):
         q = pin.randomConfiguration(model)
