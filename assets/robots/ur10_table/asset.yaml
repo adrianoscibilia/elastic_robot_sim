@@ -1,0 +1,42 @@
+asset:
+  name: ur10_table
+  urdf: description/ur10_table.urdf
+  active_joints:
+  - shoulder_pan_joint
+  - shoulder_lift_joint
+  - elbow_joint
+  - wrist_1_joint
+  - wrist_2_joint
+  - wrist_3_joint
+  gravity:
+  - 0.0
+  - 0.0
+  - -9.81
+  self_collisions: true
+  default_configuration:
+  - 0.0
+  - -1.5708
+  - 1.5708
+  - -1.5708
+  - -1.5708
+  - 0.0
+  kinematic_groups:
+    arm:
+      joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+      tip_link: tool0
+  collision:
+    margin: 0.01
+    max_joint_step: 0.05
+  scene:
+    table_height: 0.75
+    table_size:
+    - 1.2
+    - 0.8
+    table_mass: 60.0
+    source_asset: ur10

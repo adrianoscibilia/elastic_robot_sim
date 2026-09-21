@@ -34,6 +34,62 @@ def robot_root_link(root: ET.Element) -> str:
     return str(roots[0])
 
 
+def strip_world_root(root: ET.Element) -> tuple[ET.Element, tuple[str, str]]:
+    """Remove a placeholder root link named ``world`` and its single fixed joint.
+
+    Returns the modified tree and the removed joint's ``(xyz, rpy)`` origin so
+    the caller can fold it into the table mount.  A no-op (returning
+    ``("0 0 0", "0 0 0")``) when there is no link named ``world`` -- most
+    portable URDFs (the iiwa's included) have none.
+
+    A link named ``world`` that *is* present is a placeholder iff **all**
+    hold: it has no ``inertial``/``visual``/``collision`` child; exactly one
+    joint has it as parent; that joint is ``type="fixed"``.  Anything else
+    raises ``ValueError`` naming the violated condition rather than guessing
+    -- a link named ``world`` gets special-cased treatment by MuJoCo's and
+    Newton's URDF importers, so silently keeping or dropping it on an
+    assumption is not safe.
+    """
+    world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+    if not world_links:
+        return root, ("0 0 0", "0 0 0")
+    if len(world_links) > 1:
+        raise ValueError(f"found {len(world_links)} links named 'world', expected at most one")
+    world_link = world_links[0]
+    extra = [child.tag for child in world_link if child.tag in ("inertial", "visual", "collision")]
+    if extra:
+        raise ValueError(f"link 'world' has {extra} children, so it is not a placeholder root")
+    joints_from_world = [
+        joint for joint in root.findall("joint")
+        if (parent := joint.find("parent")) is not None and parent.get("link") == "world"
+    ]
+    if len(joints_from_world) != 1:
+        raise ValueError(f"link 'world' is the parent of {len(joints_from_world)} joint(s), expected exactly 1")
+    joint = joints_from_world[0]
+    if joint.get("type") != "fixed":
+        raise ValueError(f"joint {joint.get('name')!r} out of 'world' has type {joint.get('type')!r}, expected 'fixed'")
+    origin = joint.find("origin")
+    xyz = origin.get("xyz", "0 0 0") if origin is not None else "0 0 0"
+    rpy = origin.get("rpy", "0 0 0") if origin is not None else "0 0 0"
+    root.remove(world_link)
+    root.remove(joint)
+    return root, (xyz, rpy)
+
+
+def _compose_translation_then_transform(translation: tuple[float, float, float], xyz: str, rpy: str) -> tuple[str, str]:
+    """Fold ``T(translation) . T(xyz, rpy)`` into one origin, ``T(translation)`` having identity rotation.
+
+    With the first transform's rotation the identity, the composed rotation
+    is just ``rpy`` unchanged and the composed translation is a plain vector
+    sum (no rotation of ``xyz`` is needed).  A non-identity first rotation
+    would need real rotation-matrix composition; ``compose_table_scene``'s
+    mount is always axis-aligned, so that case does not arise here.
+    """
+    dx, dy, dz = (float(v) for v in xyz.split())
+    tx, ty, tz = translation
+    return f"{tx + dx:.12g} {ty + dy:.12g} {tz + dz:.12g}", rpy
+
+
 def _box_inertia(mass: float, size: tuple[float, float, float]) -> tuple[float, float, float]:
     x, y, z = size
     factor = mass / 12.0
@@ -64,7 +120,11 @@ def compose_table_scene(
         raise ValueError("table_size and table_mass must be positive")
 
     source = ET.parse(asset.urdf_path).getroot()
+    source, removed_origin = strip_world_root(source)
     root_link = robot_root_link(source)
+    mount_xyz, mount_rpy = _compose_translation_then_transform(
+        (0.0, 0.0, table_height), *removed_origin
+    )
     name = scene_name or f"{asset.name}_table"
     scene = ET.Element("robot", {"name": name})
 
@@ -87,7 +147,7 @@ def compose_table_scene(
     mount = ET.SubElement(scene, "joint", {"name": f"{table_link}_to_{root_link}", "type": "fixed"})
     ET.SubElement(mount, "parent", {"link": table_link})
     ET.SubElement(mount, "child", {"link": root_link})
-    ET.SubElement(mount, "origin", {"rpy": "0 0 0", "xyz": f"0 0 {table_height:.12g}"})
+    ET.SubElement(mount, "origin", {"rpy": mount_rpy, "xyz": mount_xyz})
 
     target_dir = Path(output_path).expanduser().resolve().parent
     for element in source:

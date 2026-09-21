@@ -49,6 +49,42 @@ admissible range? Criterion (i) is defended by Anchor 2 below; criterion
 | A1-A7 | damping_ratio | 0.05-0.2 (interval, not nominal x factor) | - | E | Lightly damped geared joint, engineering estimate | **unobservable until the excitation modal probe (R3_02) is enabled**; do not widen without a measurement, since a wider unobservable range only adds label noise |
 | flange | payload mass | 0-6 kg (interval) | - | E | Inside the 14 kg iiwa rating with effort headroom verified at dataset-generation time (`R3_08 Sec C4`) | see `R3_01` |
 
+## ur10
+
+Joint labels are the URDF joint names, not `A1..A6` (`REFACTOR_SPECS/round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md`
+has the full derivation). The upper end of every stiffness interval is the
+gearbox-only datasheet stiffness (`K2`) of the Harmonic Drive size inferred
+from the joint's URDF effort limit (UR does not publish its supplier or
+size); the centre is `K2 / r` with `r = 3` (wider than the iiwa's `r = 2`:
+indirect identification, no torque sensor, stronger nonlinearity/hysteresis
+-- see "Why factor 2" below, which applies with `r = 3` substituted here).
+
+| Joint | Parameter | Nominal | Factor | Class | Source | Notes |
+|---|---|---|---|---|---|---|
+| shoulder_pan | stiffness | 2.6e4 Nm/rad | 3.0 | D | HD SHD/CSD catalogue, size 32, K2 = 7.8e4, ratio >= 100 | upper end = gearbox-only K2; centre = K2/r; gearbox size inferred from the 330 Nm peak (UR size-4 joint), not published by UR |
+| shoulder_lift | stiffness | 2.6e4 | 3.0 | D | as shoulder_pan | |
+| elbow | stiffness | 1.23e4 | 3.0 | D | HD size 25, K2 = 3.7e4 | size inferred from 150 Nm (UR size 3) |
+| wrist_1 | stiffness | 5.7e3 | 3.0 | D | HD size 20, K2 = 1.7e4 | size inferred from 56 Nm (UR size 2; HD-20 repeated peak 57 Nm) |
+| wrist_2 | stiffness | 5.7e3 | 3.0 | D | as wrist_1 | |
+| wrist_3 | stiffness | 5.7e3 | 3.0 | D | as wrist_1 | |
+| shoulder_pan | rotor_inertia | 4.0 kg m^2 | 2.0 | E | power-law extrapolation of Clochiatti et al. 2024 (UR5e) sizes 1 and 3 in rated torque | |
+| shoulder_lift | rotor_inertia | 4.0 kg m^2 | 2.0 | E | as shoulder_pan | |
+| elbow | rotor_inertia | 1.7 kg m^2 | 2.0 | C | Clochiatti et al. 2024, UR5e J1-J3 (size 3), J_m + J_red, N = 100 | same joint size, e-series vs CB3 |
+| wrist_1 | rotor_inertia | 0.5 kg m^2 | 2.0 | E | power-law interpolation, as above | |
+| wrist_2 | rotor_inertia | 0.5 kg m^2 | 2.0 | E | as wrist_1 | |
+| wrist_3 | rotor_inertia | 0.5 kg m^2 | 2.0 | E | as wrist_1 | |
+| shoulder_pan..wrist_3 | damping_ratio | 0.05-0.2 (interval, not nominal x factor) | - | E | as iiwa | same observability caveats; weaker still on pan/lift (heavier motor loop) |
+| flange | payload mass | 0-5 kg (interval) | - | E | 50% of the 10 kg rating (iiwa: 6/14 = 43%); effort compliance asserted at generation time | see `REFACTOR_SPECS/round4_ur10/R4_00_OVERVIEW_AND_PROTOCOL.md Sec 5` decision D1 |
+
+Containment cross-check: the iiwa A1 published value (18500 Nm/rad, Disney
+Research) against its size-32-class gearbox (K2 = 7.8e4) is a ratio of 0.24,
+inside `[1/9, 1]` -- i.e. the same `nominal = K2/r, k in [K2/r^2, K2]` rule
+applied to the iiwa would have contained its only published measurement. The
+UR10 has no torque sensor in series (one fewer series compliance than the
+iiwa), so if anything its ratio should be higher, nearer the nominal, not
+lower. The size inference from the URDF effort limit is the weakest link in
+this chain and is the first thing "Measurements pending" below should close.
+
 ## Why factor 2
 
 Harmonic-drive torsional stiffness is genuinely nonlinear. The manufacturer's
@@ -125,23 +161,24 @@ from the current config, rather than hand-editing numbers here.
 ## Porting to a UR10 (or any second robot)
 
 Do not justify a lower range by asserting "the UR10 is more compliant." Run
-the same anchors; only what the hardware changes, changes.
+the same anchors; only what the hardware changes, changes. The UR10 port is
+done: see the `## ur10` section above for its rows and
+`REFACTOR_SPECS/round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md` Sec 6
+for what "the UR10 is more compliant" does and does not mean (arm-level
+compliance from long, heavy links on the same class of gearbox as the iiwa,
+not a lower joint-level nominal). The two corrections to
+`REFACTOR_SPECS/round3/R3_04_RANGE_JUSTIFICATION_AND_PROVENANCE.md Sec A5`'s
+predictions (proximal-only resonance drop, and the wrist-3 mode making the
+UR10 rollouts *not* cheaper than the iiwa's) are in the same section, Sec 5.
 
-The UR10 has no joint torque sensors and no link-side encoder, so Anchor 2's
-cheap direct measurement (`k = tau/delta` from internal signals) is
-unavailable, and the falsifiable-consequence anchor becomes primary instead
-of confirmatory: measure the first joint resonance (step command, then FFT
-the motor current or motor velocity), compute `J_eff` from the manufacturer's
-URDF inertials (`link_inertia_envelope` already does this for any asset) and
-the motor datasheet reflected through the gear ratio squared, then invert
-`k = (2 pi f)^2 J_eff`. Widen the factor to `r = 3` rather than `r = 2` for
-two documented, checkable reasons: the identification is indirect (`k` is
-estimated jointly with motor friction and the current-to-torque gain, so its
-confidence interval is wider than a directly measured one), and UR-class
-joints exhibit stronger stiffness nonlinearity and hysteresis than a
-torque-sensored LWR joint. `config/identification/ur10_table.yaml` should
-carry its own provenance rows here once that measurement is run -- do not
-carry the iiwa nominal across.
+For a robot with no joint torque sensor and no link-side encoder (the UR10's
+situation), Anchor 2's cheap direct measurement (`k = tau/delta` from
+internal signals) is unavailable, and the falsifiable-consequence anchor
+becomes primary instead of confirmatory: measure the first joint resonance
+(step command, then FFT the motor current or motor velocity), compute
+`J_eff` from the manufacturer's URDF inertials (`link_inertia_envelope`
+already does this for any asset) and the motor datasheet reflected through
+the gear ratio squared, then invert `k = (2 pi f)^2 J_eff`.
 
 ## Measurements pending
 
@@ -149,7 +186,7 @@ carry the iiwa nominal across.
 |---|---|---|---|---|
 | iiwa k, all joints | Static deflection, `k = tau/delta`, 5 torque levels | 1 day | | not started |
 | iiwa first resonance | Tap test / stop-response FFT | 0.5 day | | not started |
-| UR10 first resonance | Step + motor-current FFT | 0.5 day | | not started |
+| UR10 first resonance, per joint | Step + motor-current FFT (would move the `## ur10` stiffness rows from `D` to `M`, the only thing that should) | 0.5 day | | not started |
 | Disney Jc definition | Re-read the paper's controller section to confirm whether Jc = 1.03 kg m^2 is the physical reflected rotor inertia or a closed-loop apparent value including inertia shaping; determines whether A1/A2 rotor_inertia can go back to P | 0.5 hr | | not started |
 
 ## Sources

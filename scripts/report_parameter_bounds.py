@@ -33,11 +33,12 @@ import pandas as pd
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(_REPO / "src"))
 
+from elastic_sim import excitation as exc
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.dataset import DEFAULT_CONFIG, load_config
-from elastic_sim.torque_runners import link_inertia_envelope
+from elastic_sim.torque_runners import control_separation_ratio, link_inertia_envelope, link_inertia_max
 
-_STIFFNESS_ROW = re.compile(r"^\|\s*(A\d+)\s*\|\s*stiffness\s*\|[^|]*\|[^|]*\|\s*([MPCDE])\s*\|\s*([^|]*)\|")
+_STIFFNESS_ROW = re.compile(r"^\|\s*(\S+)\s*\|\s*stiffness\s*\|[^|]*\|[^|]*\|\s*([MPCDE])\s*\|\s*([^|]*)\|")
 
 
 def _load_asset(reference: str):
@@ -87,7 +88,12 @@ def compute_bounds(config, asset) -> pd.DataFrame:
     else:
         rotor = np.broadcast_to(np.asarray(sampling.rotor_inertia, dtype=float), (n,))
 
-    link_median, _link_floor = link_inertia_envelope(asset, n_samples=sampling.inertia_samples)
+    bounds = None
+    if config.excitation.position_window:
+        window_lower, window_upper = exc.effective_position_window(asset, config.excitation)
+        bounds = tuple(zip(window_lower.tolist(), window_upper.tolist()))
+    link_median, _link_floor = link_inertia_envelope(asset, n_samples=sampling.inertia_samples, bounds=bounds)
+    link_max = link_inertia_max(asset, n_samples=sampling.inertia_samples, bounds=bounds)
     j_eff = rotor * link_median / (rotor + link_median)
 
     f_control = config.control_frequency / (2.0 * np.pi)
@@ -95,6 +101,16 @@ def compute_bounds(config, asset) -> pd.DataFrame:
     mode_min = np.sqrt(k_min / j_eff) / (2.0 * np.pi)
     mode_max = np.sqrt(k_max / j_eff) / (2.0 * np.pi)
     required_step_at_kmax = 1.0 / (20.0 * mode_max)
+
+    # Worst-case control/transmission separation ratio (R4_02 Sec 7,
+    # R4_03 Sec 2): softest stiffness, heaviest rotor and link inertia the
+    # prior admits, fastest sampled control gain.
+    rotor_worst = rotor * sampling.rotor_inertia_factor[1] if sampling.rotor_inertia_nominal else rotor
+    j_eff_worst = rotor_worst * link_max / (rotor_worst + link_max)
+    omega_worst = (
+        config.control_gains.natural_frequency[1] if config.control_gains.enabled else config.control_frequency
+    )
+    separation_ratio = control_separation_ratio(k_min, rotor_worst, link_max, omega_worst)
 
     anchors = _published_anchors(names)
     return pd.DataFrame({
@@ -104,12 +120,15 @@ def compute_bounds(config, asset) -> pd.DataFrame:
         "width_decades": np.log10(k_max / k_min),
         "rotor_inertia_kg_m2": rotor,
         "link_inertia_median_kg_m2": link_median,
+        "link_inertia_max_kg_m2": link_max,
         "j_eff_kg_m2": j_eff,
         "mode_min_hz": mode_min,
         "mode_max_hz": mode_max,
         "control_bandwidth_lower_bound_Nm_per_rad": control_bandwidth_bound,
         "lower_bound_satisfied": k_min >= control_bandwidth_bound,
         "required_time_step_at_k_max_s": required_step_at_kmax,
+        "control_separation_ratio_worst": separation_ratio,
+        "control_separation_satisfied": separation_ratio >= config.control_separation.min_ratio,
         "published_anchor": [anchors[name] for name in names],
     })
 
@@ -119,8 +138,9 @@ def write_reports(bounds: pd.DataFrame, config, output: Path) -> None:
     bounds.to_csv(output / "bounds.csv", index=False)
 
     lines = [
-        "| Joint | k range [Nm/rad] | width [decades] | mode range [Hz] | control bound [Nm/rad] | satisfied | step @ k_max [s] | anchor |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Joint | k range [Nm/rad] | width [decades] | mode range [Hz] | control bound [Nm/rad] | satisfied "
+        "| step @ k_max [s] | separation ratio (worst) | separation ok | anchor |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in bounds.itertuples():
         lines.append(
@@ -128,7 +148,10 @@ def write_reports(bounds: pd.DataFrame, config, output: Path) -> None:
             f"| {row.width_decades:.2f} | {row.mode_min_hz:.0f}-{row.mode_max_hz:.0f} "
             f"| {row.control_bandwidth_lower_bound_Nm_per_rad:.0f} "
             f"| {'yes' if row.lower_bound_satisfied else 'NO'} "
-            f"| {row.required_time_step_at_k_max_s:.2e} | {row.published_anchor} |"
+            f"| {row.required_time_step_at_k_max_s:.2e} "
+            f"| {row.control_separation_ratio_worst:.2f} "
+            f"| {'yes' if row.control_separation_satisfied else 'NO'} "
+            f"| {row.published_anchor} |"
         )
     (output / "bounds.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -178,6 +201,10 @@ def main() -> None:
     if not violated.empty:
         print(f"\nwarning: {len(violated)} joint(s) violate the control-bandwidth lower bound: "
               f"{', '.join(violated['joint'])}")
+    separation_violated = bounds[~bounds["control_separation_satisfied"]]
+    if not separation_violated.empty:
+        print(f"\nwarning: {len(separation_violated)} joint(s) fall below control_separation.min_ratio="
+              f"{config.control_separation.min_ratio:g} at their worst corner: {', '.join(separation_violated['joint'])}")
     print(f"\nWrote {output / 'bounds.csv'}, {output / 'bounds.md'}, {output / 'modes.png'}")
 
 

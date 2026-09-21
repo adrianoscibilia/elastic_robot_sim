@@ -1435,12 +1435,77 @@ def test_provenance_letters_are_validated(tmp_path):
         load_config(path)
 
 
-def test_every_shipped_nominal_has_a_provenance_row():
-    """A nominal with no row in docs/PARAMETER_PROVENANCE.md must not ship."""
+# Provenance-doc section heading, and a joint-name alias, per shipped
+# config's asset -- the doc labels a joint however its own narrative reads
+# best (the iiwa's `A1..A7`, the UR10's URDF names with the `_joint` suffix
+# dropped), so a rename lives here rather than in the doc (R4_04 Sec 2).
+_PROVENANCE_SECTIONS: dict[str, tuple[str, dict[str, str]]] = {
+    "kuka_lbr_iiwa_14_r820_table": (
+        "kuka_lbr_iiwa_14_r820", {f"iiwa_A{i}": f"A{i}" for i in range(1, 8)},
+    ),
+    "ur10_table": (
+        "ur10",
+        {
+            "shoulder_pan_joint": "shoulder_pan", "shoulder_lift_joint": "shoulder_lift",
+            "elbow_joint": "elbow", "wrist_1_joint": "wrist_1",
+            "wrist_2_joint": "wrist_2", "wrist_3_joint": "wrist_3",
+        },
+    ),
+}
+
+
+def test_every_shipped_config_has_provenance_rows_for_its_own_joints():
+    """Replacement for the old iiwa-only test: for every shipped config, a
+    provenance row exists for each active joint and each of stiffness/
+    rotor_inertia inside that asset's own `## <source>` section, and its
+    class letter matches the config's `*_provenance` entry (R4_04 Sec 2)."""
+    from elastic_sim.dataset import load_config
+
     doc = (Path(_REPO) / "docs" / "PARAMETER_PROVENANCE.md").read_text(encoding="utf-8")
-    for joint in ("A1", "A2", "A3", "A4", "A5", "A6", "A7"):
-        assert f"| {joint} | stiffness" in doc
-        assert f"| {joint} | rotor_inertia" in doc
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in doc.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip()
+            sections.setdefault(current, [])
+        elif current is not None and line.startswith("|"):
+            sections[current].append(line)
+
+    config_dir = Path(_REPO) / "config" / "identification"
+    configs = sorted(config_dir.glob("*.yaml"))
+    assert configs, f"no shipped configs found under {config_dir}"
+    for config_path in configs:
+        config = load_config(config_path)
+        assert config.asset in _PROVENANCE_SECTIONS, (
+            f"{config_path}: no provenance-section mapping for asset {config.asset!r}; "
+            "add one to _PROVENANCE_SECTIONS in this test"
+        )
+        section_name, alias = _PROVENANCE_SECTIONS[config.asset]
+        rows = sections.get(section_name, [])
+        assert rows, f"{config_path}: docs/PARAMETER_PROVENANCE.md has no '## {section_name}' section"
+        asset = AssetRegistry.for_repository(_REPO).load(config.asset)
+        provenance_by_param = {
+            "stiffness": config.transmission.stiffness_provenance,
+            "rotor_inertia": config.transmission.rotor_inertia_provenance,
+        }
+        for param, provenance in provenance_by_param.items():
+            if not provenance:
+                continue
+            for joint_name, expected_class in zip(asset.joint_names, provenance):
+                label = alias.get(joint_name, joint_name)
+                matches = [
+                    row for row in rows
+                    if row.split("|")[1].strip() == label and row.split("|")[2].strip() == param
+                ]
+                assert matches, (
+                    f"{config_path}: no provenance row for joint {label!r} parameter {param!r} "
+                    f"in section '## {section_name}'"
+                )
+                actual_class = matches[0].split("|")[5].strip()
+                assert actual_class == expected_class, (
+                    f"{config_path}: provenance row for {label!r} {param!r} has class {actual_class!r}, "
+                    f"but the config's {param}_provenance says {expected_class!r}"
+                )
 
 
 def test_config_rejects_the_old_tier_ladder(tmp_path):

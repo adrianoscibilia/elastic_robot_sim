@@ -42,7 +42,7 @@ from elastic_sim.dataset import (
     run_condition, sample_all_payloads,
 )
 from elastic_sim.payload import Payload, payload_asset
-from elastic_sim.torque_runners import link_inertia_envelope
+from elastic_sim.torque_runners import control_separation_ratio, link_inertia_envelope, link_inertia_max
 
 
 def _load_asset(reference: str):
@@ -214,9 +214,22 @@ def main() -> None:
         print(f"  control gains: natural_frequency={natural_frequency:.2f} rad/s  damping_ratio={damping_ratio:.3f}")
     link_inertia = None
     if not tier.is_rigid:
+        bounds = None
+        if config.excitation.position_window:
+            window_lower, window_upper = exc.effective_position_window(asset, config.excitation)
+            bounds = tuple(zip(window_lower.tolist(), window_upper.tolist()))
         with payload_asset(asset, payload) as asset_p:
-            link_inertia = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples)
-        _report_transmission(tier.transmission(len(asset.joint_names), link_inertia), run_config)
+            link_inertia = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples, bounds=bounds)
+            worst_link_inertia = link_inertia_max(asset_p, n_samples=config.transmission.inertia_samples, bounds=bounds)
+        transmission = tier.transmission(len(asset.joint_names), link_inertia)
+        _report_transmission(transmission, run_config)
+        ratios = control_separation_ratio(
+            transmission.stiffness, transmission.rotor_inertia, worst_link_inertia, natural_frequency,
+        )
+        print(f"  control/transmission separation ratio (>= {config.control_separation.min_ratio:g} wanted):")
+        for name, ratio in zip(asset.joint_names, ratios):
+            flag = "  <-- below min_ratio" if ratio < config.control_separation.min_ratio else ""
+            print(f"    {name:20s} {ratio:6.2f}{flag}")
     result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia,
                            payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio)
     _report_rollout(asset, result, friction)

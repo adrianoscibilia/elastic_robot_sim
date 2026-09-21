@@ -27,7 +27,7 @@ import pandas as pd
 from .assets import AssetSpec
 from .payload import Payload, payload_asset
 from .backend_comparison import ComparisonThresholds, compare_backends, format_report, summarize
-from .excitation import FourierExcitationConfig, optimize_excitation
+from .excitation import FourierExcitationConfig, effective_position_window, optimize_excitation
 from .identification import FrictionModel
 from .kinematics import PortableKinematics
 from .materialized import MaterializedTrajectory
@@ -35,7 +35,9 @@ from .torque_runners import (
     ComputedTorqueController,
     SeaMotorController,
     TransmissionSpec,
+    control_separation_ratio,
     link_inertia_envelope,
+    link_inertia_max,
     run_mujoco_elastic_torque,
     run_mujoco_torque,
     run_newton_elastic_torque,
@@ -508,6 +510,37 @@ class ControlGainSampling:
                 raise ValueError(f"control_gains.{name} must satisfy 0 < min <= max")
 
 
+_CONTROL_SEPARATION_ACTIONS = ("warn", "error")
+
+
+@dataclass(frozen=True)
+class ControlSeparationCheck:
+    """Per-bag guard on ``sqrt(k / J_eff) / omega >= min_ratio`` (R4_02 Sec 7).
+
+    Below ``min_ratio`` the ``SeaMotorController``'s feedback linearization
+    and the plant's own open-loop transmission mode are not cleanly
+    separated in frequency: on a joint with heavy link inertia and soft
+    transmission stiffness -- true of the UR10's shoulder at the soft end of
+    its prior, even at the UR10's own retuned gains -- a fixed control gain
+    tuned for one robot's transmission can end up close to or above its
+    resonance on another sampled robot.  ``action: "warn"`` reports it once,
+    aggregated, at the end of the build; ``"error"`` raises before that bag
+    is simulated.  Absent from a config, every config (iiwa included) still
+    gets the default ``{min_ratio: 5.0, action: "warn"}`` check -- it changes
+    nothing the iiwa build writes to the CSV, only two new manifest-record
+    keys per bag (R4_06 Sec A1).
+    """
+
+    min_ratio: float = 5.0
+    action: str = "warn"
+
+    def __post_init__(self) -> None:
+        if self.min_ratio <= 0.0:
+            raise ValueError("control_separation.min_ratio must be positive")
+        if self.action not in _CONTROL_SEPARATION_ACTIONS:
+            raise ValueError(f"control_separation.action must be one of {_CONTROL_SEPARATION_ACTIONS}")
+
+
 DEFAULT_CONFIG_DIR = "config/identification"
 DEFAULT_CONFIG = "config/identification/kuka_lbr_iiwa_14_r820_table.yaml"
 
@@ -536,6 +569,7 @@ class DatasetConfig:
     excitation: FourierExcitationConfig = field(default_factory=FourierExcitationConfig)
     regime: RegimeSampling = field(default_factory=RegimeSampling)
     control_gains: ControlGainSampling = field(default_factory=ControlGainSampling)
+    control_separation: ControlSeparationCheck = field(default_factory=ControlSeparationCheck)
     candidates: int = 48
     control_frequency: float = 25.0
     control_damping_ratio: float = 1.0
@@ -560,6 +594,30 @@ _TRANSMISSION_KEYS = {
     "stiffness_nominal", "stiffness_factor", "stiffness_common_fraction", "stiffness_provenance",
     "rotor_inertia_nominal", "rotor_inertia_factor", "rotor_inertia_provenance",
 }
+_EXCITATION_KEYS = {
+    "n_harmonics", "base_frequency", "n_periods", "limit_margin", "max_acceleration", "velocity_fraction",
+    "centre_jitter", "probe_harmonics", "probe_acceleration_fraction", "candidates", "regime", "position_window",
+}
+_REGIME_KEYS = {"enabled", "max_acceleration", "velocity_fraction"}
+_PAYLOAD_KEYS = {"enabled", "mass", "offset_x", "offset_y", "offset_z", "size", "per"}
+_DATASET_KEYS = {
+    "trajectories", "trajectories_per_robot", "friction_samples", "friction_scale", "seed", "output",
+    "metadata_columns", "split",
+}
+_SPLIT_KEYS = {"mode", "test_robots", "val_robots", "test_trajectories", "val_trajectories"}
+_SIMULATION_KEYS = {
+    "control_frequency", "control_damping_ratio", "control_gains", "control_decimation",
+    "allow_control_decimation", "rigid_time_step", "max_time_step", "sample_time_step", "control_separation",
+}
+_CONTROL_GAINS_KEYS = {"enabled", "natural_frequency", "damping_ratio"}
+_CONTROL_SEPARATION_KEYS = {"min_ratio", "action"}
+_VISUALIZATION_KEYS = {"enabled", "realtime_scale"}
+
+
+def _check_keys(mapping: Mapping[str, Any], allowed: set[str], block: str, source: Path) -> None:
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {block} keys in {source}: {', '.join(unknown)}")
 
 
 def load_config(path: str | Path) -> DatasetConfig:
@@ -582,9 +640,7 @@ def load_config(path: str | Path) -> DatasetConfig:
         raise ValueError(f"unknown keys in {source}: {', '.join(unknown)}")
 
     tr_cfg = raw.get("transmission", {}) or {}
-    unknown = sorted(set(tr_cfg) - _TRANSMISSION_KEYS)
-    if unknown:
-        raise ValueError(f"unknown transmission keys in {source}: {', '.join(unknown)}")
+    _check_keys(tr_cfg, _TRANSMISSION_KEYS, "transmission", source)
     zeta = tr_cfg.get("damping_ratio", [0.05, 0.2])
     if "stiffness" in tr_cfg and "stiffness_nominal" not in tr_cfg:
         warnings.warn(
@@ -614,10 +670,25 @@ def load_config(path: str | Path) -> DatasetConfig:
     sim_cfg = raw.get("simulation", {}) or {}
     data_cfg = raw.get("dataset", {}) or {}
     view_cfg = raw.get("visualization", {}) or {}
+    _check_keys(exc_cfg, _EXCITATION_KEYS, "excitation", source)
+    _check_keys(exc_cfg.get("regime", {}) or {}, _REGIME_KEYS, "excitation.regime", source)
+    _check_keys(data_cfg, _DATASET_KEYS, "dataset", source)
+    _check_keys(sim_cfg, _SIMULATION_KEYS, "simulation", source)
+    _check_keys(sim_cfg.get("control_gains", {}) or {}, _CONTROL_GAINS_KEYS, "simulation.control_gains", source)
+    _check_keys(sim_cfg.get("control_separation", {}) or {}, _CONTROL_SEPARATION_KEYS,
+                "simulation.control_separation", source)
+    _check_keys(view_cfg, _VISUALIZATION_KEYS, "visualization", source)
     scale = data_cfg.get("friction_scale", [0.5, 2.0])
     seed = int(data_cfg.get("seed", 20260917))
     rigid_reference = bool(raw.get("rigid_reference", True))
     split_cfg = data_cfg.get("split", {}) or {}
+    _check_keys(split_cfg, _SPLIT_KEYS, "dataset.split", source)
+    position_window_cfg = exc_cfg.get("position_window", {}) or {}
+    if not isinstance(position_window_cfg, dict):
+        raise ValueError(f"{source}: excitation.position_window must be a mapping of joint name -> [lo, hi]")
+    position_window = tuple(
+        (str(name), (float(bounds[0]), float(bounds[1]))) for name, bounds in position_window_cfg.items()
+    )
     split = SplitPolicy(
         mode=str(split_cfg.get("mode", "contiguous")),
         test_robots=int(split_cfg.get("test_robots", 0)),
@@ -626,6 +697,7 @@ def load_config(path: str | Path) -> DatasetConfig:
         val_trajectories=int(split_cfg.get("val_trajectories", 0)),
     )
     payload_cfg = raw.get("payload", {}) or {}
+    _check_keys(payload_cfg, _PAYLOAD_KEYS, "payload", source)
     payload_mass = payload_cfg.get("mass", [0.0, 0.0])
     payload_size = payload_cfg.get("size", [0.1, 0.1])
     payload_x = payload_cfg.get("offset_x", [0.0, 0.0])
@@ -683,6 +755,7 @@ def load_config(path: str | Path) -> DatasetConfig:
             centre_jitter=float(exc_cfg.get("centre_jitter", 0.0)),
             probe_harmonics=tuple(int(v) for v in exc_cfg.get("probe_harmonics", []) or []),
             probe_acceleration_fraction=float(exc_cfg.get("probe_acceleration_fraction", 0.2)),
+            position_window=position_window,
         ),
         regime=RegimeSampling(
             enabled=bool((exc_cfg.get("regime", {}) or {}).get("enabled", False)),
@@ -705,6 +778,10 @@ def load_config(path: str | Path) -> DatasetConfig:
                     "damping_ratio", [sim_cfg.get("control_damping_ratio", 1.0)] * 2
                 )
             ),
+        ),
+        control_separation=ControlSeparationCheck(
+            min_ratio=float((sim_cfg.get("control_separation", {}) or {}).get("min_ratio", 5.0)),
+            action=str((sim_cfg.get("control_separation", {}) or {}).get("action", "warn")),
         ),
         candidates=int(exc_cfg.get("candidates", 48)),
         control_frequency=float(sim_cfg.get("control_frequency", 25.0)),
@@ -788,6 +865,21 @@ def elastic_time_step(transmission: TransmissionSpec, config: DatasetConfig) -> 
     return min(config.max_time_step, transmission.required_time_step())
 
 
+def _inertia_envelope_bounds(asset: AssetSpec, config: DatasetConfig) -> tuple[tuple[float, float], ...] | None:
+    """Per-active-joint ``(lo, hi)`` for ``link_inertia_envelope``/``link_inertia_max``.
+
+    ``None`` (the whole URDF range) unless ``config.excitation.position_window``
+    is set, in which case the envelope is sampled over the same effective
+    window the excitation trajectories live in, instead of the full URDF
+    range (R4_03 Sec 1) -- for the iiwa (no window) this keeps the historical
+    call exactly as it was.
+    """
+    if not config.excitation.position_window:
+        return None
+    lower, upper = effective_position_window(asset, config.excitation)
+    return tuple(zip(lower.tolist(), upper.tolist()))
+
+
 def run_condition(
     asset: AssetSpec,
     trajectory: MaterializedTrajectory,
@@ -852,7 +944,10 @@ def run_condition(
                          natural_frequency=natural_frequency, damping_ratio=damping_ratio)
             return result
         if link_inertia is None:
-            link_inertia = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples)
+            link_inertia = link_inertia_envelope(
+                asset_p, n_samples=config.transmission.inertia_samples,
+                bounds=_inertia_envelope_bounds(asset_p, config),
+            )
         transmission = tier.transmission(n_dof, link_inertia)
         time_step = elastic_time_step(transmission, config)
         _check_control_rate(time_step)
@@ -1057,8 +1152,29 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     call order -- so worker order never affects the result.
     """
     (asset, trajectory, tier, backend, friction, config, link_inertia, payload,
-     split, bag, bag_index, traj_index, friction_index, control_gains) = args
+     split, bag, bag_index, traj_index, friction_index, control_gains, link_inertia_max_value) = args
     natural_frequency, damping_ratio = control_gains
+    separation_ratio = None
+    separation_joint = None
+    if not tier.is_rigid:
+        # Cheap (no simulation): built again, identically, inside
+        # run_condition -- computing it here lets an "error" action raise
+        # *before* that bag is actually simulated (R4_03 Sec 2).
+        n_dof = len(asset.joint_names)
+        preview = tier.transmission(n_dof, link_inertia)
+        ratios = control_separation_ratio(
+            preview.stiffness, preview.rotor_inertia, link_inertia_max_value, natural_frequency,
+        )
+        worst = int(np.argmin(ratios))
+        separation_ratio = float(ratios[worst])
+        separation_joint = asset.joint_names[worst]
+        if separation_ratio < config.control_separation.min_ratio and config.control_separation.action == "error":
+            raise ValueError(
+                f"bag {bag!r}: control/transmission separation ratio {separation_ratio:.2f} on joint "
+                f"{separation_joint!r} is below simulation.control_separation.min_ratio="
+                f"{config.control_separation.min_ratio:g} (natural_frequency={natural_frequency:g} rad/s); "
+                "lower control_gains.natural_frequency or raise the sampled stiffness"
+            )
     result = run_condition(asset, trajectory, tier, backend, friction, config,
                            link_inertia=link_inertia, payload=payload,
                            natural_frequency=natural_frequency, damping_ratio=damping_ratio)
@@ -1096,6 +1212,8 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
             np.mean(np.abs(result["tau_feedback"])) / max(np.mean(np.abs(result["tau_feedforward"])), 1e-12)
         ),
         "peak_torque_ratio": peak_torque_ratio,
+        "control_separation_min_ratio": separation_ratio,
+        "control_separation_joint": separation_joint,
     }
     return frame, record
 
@@ -1221,6 +1339,7 @@ def generate(
     def _payload_for(tier: Tier, traj_index: int) -> Payload | None:
         return payload_for(config, payload_by_tier, payload_by_key, tier, traj_index)
 
+    envelope_bounds = _inertia_envelope_bounds(asset, config)
     link_inertia = None
     # link_inertia_envelope is asset-*and*-payload dependent; cache it keyed
     # on the payload so a "per: robot" dataset does at most robots + 1 CRBA
@@ -1229,13 +1348,28 @@ def generate(
     # instead of a payload-free number that would silently disagree with
     # that same robot's per-bag records (R3_10 task table, row C4).
     envelope_cache: dict[tuple, LinkInertia] = {}
+    # Separate cache for the *maximum* link inertia the control/transmission
+    # separation check needs (R4_03 Sec 2): the worst, softest-effective
+    # corner, not the median/floor pair damping and the integration step use.
+    envelope_max_cache: dict[tuple, np.ndarray] = {}
 
     def _envelope_for(payload: Payload | None) -> LinkInertia:
         key = () if payload is None or payload.is_empty else (payload.mass, payload.offset, payload.size)
         if key not in envelope_cache:
             with payload_asset(asset, payload) as asset_p:
-                envelope_cache[key] = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples)
+                envelope_cache[key] = link_inertia_envelope(
+                    asset_p, n_samples=config.transmission.inertia_samples, bounds=envelope_bounds,
+                )
         return envelope_cache[key]
+
+    def _envelope_max_for(payload: Payload | None) -> np.ndarray:
+        key = () if payload is None or payload.is_empty else (payload.mass, payload.offset, payload.size)
+        if key not in envelope_max_cache:
+            with payload_asset(asset, payload) as asset_p:
+                envelope_max_cache[key] = link_inertia_max(
+                    asset_p, n_samples=config.transmission.inertia_samples, bounds=envelope_bounds,
+                )
+        return envelope_max_cache[key]
 
     robots: list[dict[str, Any]] = []
     if elastic_tiers:
@@ -1244,7 +1378,8 @@ def generate(
         # "trajectory" does not (a robot's payload varies bag to bag), so
         # its summary stays nominal/payload-free, exactly as documented in
         # the per-bag payload_* columns being the ground truth there.
-        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples)
+        link_inertia = link_inertia_envelope(asset, n_samples=config.transmission.inertia_samples, bounds=envelope_bounds)
+        envelope_max_cache[()] = link_inertia_max(asset, n_samples=config.transmission.inertia_samples, bounds=envelope_bounds)
         if verbose:
             print(f"link inertia M_ii [kg m^2]: median {np.array2string(link_inertia[0], precision=4)}")
             print(f"                            floor  {np.array2string(link_inertia[1], precision=4)}")
@@ -1356,9 +1491,10 @@ def generate(
                         )
                 validated[key] = True
             link_inertia_for_bag = _envelope_for(payload) if not tier.is_rigid else None
+            link_inertia_max_for_bag = _envelope_max_for(payload) if not tier.is_rigid else None
             gains = control_gains[(tier.name if config.trajectories_per_robot else "", traj_index)]
             work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, payload,
-                        split, bag, bag_index, traj_index, friction_index, gains))
+                        split, bag, bag_index, traj_index, friction_index, gains, link_inertia_max_for_bag))
     finally:
         kinematics_stack.close()
 
@@ -1380,6 +1516,15 @@ def generate(
             if record["peak_torque_ratio"] > 0.8:
                 print(f"    warning: bag {record['bag']!r} peak |tau| is "
                       f"{record['peak_torque_ratio']:.0%} of the effort limit on its worst joint")
+
+    if verbose:
+        below = [r for r in records if r["control_separation_min_ratio"] is not None
+                 and r["control_separation_min_ratio"] < config.control_separation.min_ratio]
+        if below:
+            worst = min(below, key=lambda r: r["control_separation_min_ratio"])
+            print(f"warning: {len(below)}/{len(records)} bags have a control/transmission separation ratio "
+                  f"below min_ratio={config.control_separation.min_ratio:g}; worst is bag {worst['bag']!r} "
+                  f"at {worst['control_separation_min_ratio']:.2f} on joint {worst['control_separation_joint']!r}")
 
     frame = pd.concat(frames, ignore_index=True)
     # ``dynamic_model_nn`` differentiates with a Savitzky-Golay filter that

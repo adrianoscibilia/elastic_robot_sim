@@ -324,6 +324,10 @@ uv run python scripts/run_identification_simulation.py --visualize
 
 # Generate the dataset (defaults come from config/identification/*.yaml)
 uv run python scripts/generate_identification_dataset.py
+
+# Same stack on a UR10 instead of the iiwa
+uv run python scripts/generate_identification_dataset.py \
+  --config config/identification/ur10_table.yaml
 ```
 
 Unlike the calibration path, this one uses `computed torque` rather than position tracking, neutralizes the two importers' conflicting readings of the URDF `<dynamics>` tag, and validates the result by recovering the robot's base inertial parameters from the generated data.

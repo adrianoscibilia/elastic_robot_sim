@@ -33,6 +33,54 @@ uv run python scripts/compare_identification_backends.py \
     data/identification/kuka_lbr_iiwa_14_r820_table.csv
 ```
 
+### Other assets: UR10
+
+`config/identification/ur10_table.yaml` runs the same stack on a UR10 (CB3)
+on the same table, selected with `--config`:
+
+```bash
+uv run python scripts/compose_scene_urdf.py \
+    --asset ur10 --table-height 0.75 --write-asset-yaml
+
+uv run python scripts/generate_identification_dataset.py \
+    --config config/identification/ur10_table.yaml
+```
+
+What differs from the iiwa, and why, is in
+`docs/PARAMETER_PROVENANCE.md#ur10` and
+`REFACTOR_SPECS/round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md`; in
+short:
+
+- **Excitation window.** The URDF joint limits are +-2 pi on five of the
+  UR10's six joints, wide enough that an unconstrained excitation spreads
+  trajectory centres over dynamically-duplicate (wrap-around) and
+  table-colliding configurations. `excitation.position_window` (a per-joint
+  `[lo, hi]` override, intersected with the URDF limit) narrows this to a
+  sensible band; it is a generic feature, not UR10-specific, and a no-op
+  (the iiwa keeps its URDF limits verbatim) when unset.
+- **Control gains.** `simulation.control_gains.natural_frequency: [4.0, 7.5]`
+  rad/s, well below the iiwa's `[15, 40]`: the UR10's heavier link inertia
+  and reflected rotor inertia bring the control/transmission separation
+  bound `k >= (5 omega)^2 J_eff` down with it. `simulation.control_separation`
+  checks this bound per bag (manifest-only fields, every config including
+  the iiwa's gets the check with the iiwa's own numbers).
+- **Probe band.** `excitation.probe_harmonics` covers 3-150 Hz (iiwa:
+  8-190 Hz) -- the UR10's proximal open-loop modes sit at 7.5-67 Hz, lower
+  than the iiwa's 50-170 Hz, and the closed-loop observable resonance is
+  lower still.
+- **Friction is a no-op.** The UR10 URDF declares `damping="0"
+  friction="0"` on every joint, so `friction_samples`/`friction_scale` do
+  nothing on this asset and the rigid tier has `tau == ft` exactly, as on
+  the iiwa.
+- **6-DoF contract.** At `n_dof == 6`, `ft0..ft5` collides in name with a
+  legacy end-effector wrench some consumers infer from column count; the
+  written `.contract.json` sidecar's `target_kind: "per_joint_torque"` is
+  load-bearing for this asset in a way it never was for the 7-DoF iiwa.
+- **Cost.** The bare-flange wrist-3 mode (400-1200 Hz, the same situation as
+  the iiwa's A7) sets the integration step, so a UR10 rollout is not cheaper
+  than an iiwa one despite the arm looking "softer" overall -- see the
+  round-4 report for measured wall time.
+
 ## Looking before you save
 
 `run_identification_simulation.py` runs a *single* rollout and writes nothing

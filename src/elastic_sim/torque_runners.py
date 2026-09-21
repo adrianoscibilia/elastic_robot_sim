@@ -59,13 +59,17 @@ def _inertia_diagonals(pin: Any, model: Any, data: Any, configurations: np.ndarr
     return np.asarray([np.diag(np.asarray(pin.crba(model, data, q), dtype=float)).copy() for q in configurations])
 
 
-def link_inertia_envelope(asset: AssetSpec, *, n_samples: int = 512, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    """Median and minimum link-side inertia ``M_ii`` of each joint over its range.
+def _sample_inertia_diagonals(
+    asset: AssetSpec, n_samples: int, seed: int, bounds: tuple[tuple[float, float], ...] | None,
+) -> np.ndarray:
+    """``(n_samples, n_joints)`` link-side inertia diagonals sampled inside ``bounds``.
 
-    This is a property of the robot, not of any one trajectory, so it is
-    sampled uniformly inside the joint limits.  The median sizes transmission
-    damping; the minimum bounds the highest transmission mode, which on the
-    iiwa is the wrist (``M_77 = 3e-4 kg m^2``), not the rotor.
+    ``bounds`` defaults to each joint's own URDF limit (``[-pi, pi]`` when
+    absent); pass an explicit per-joint ``(lo, hi)`` sequence (e.g. from
+    ``excitation.effective_position_window``) to sample the same joint range
+    the excitation trajectories actually live in instead of the full URDF
+    range (R4_03 Sec 1) -- harmless for a periodic joint, but the two ranges
+    can differ a lot on a robot with very wide URDF limits.
     """
     from . import identification as idn
 
@@ -73,11 +77,46 @@ def link_inertia_envelope(asset: AssetSpec, *, n_samples: int = 512, seed: int =
         raise ValueError("n_samples must be positive")
     pin, model, data = idn.build_model(asset)
     joints = asset.resolve_active_joints()
-    lower = np.asarray([-np.pi if joint.lower is None else joint.lower for joint in joints], dtype=float)
-    upper = np.asarray([np.pi if joint.upper is None else joint.upper for joint in joints], dtype=float)
+    if bounds is None:
+        lower = np.asarray([-np.pi if joint.lower is None else joint.lower for joint in joints], dtype=float)
+        upper = np.asarray([np.pi if joint.upper is None else joint.upper for joint in joints], dtype=float)
+    else:
+        bounds_array = np.asarray(bounds, dtype=float).reshape(-1, 2)
+        if len(bounds_array) != len(joints):
+            raise ValueError(f"bounds has {len(bounds_array)} entries, expected {len(joints)} (one per active joint)")
+        lower, upper = bounds_array[:, 0], bounds_array[:, 1]
     rng = np.random.default_rng(seed)
-    diagonals = _inertia_diagonals(pin, model, data, lower + (upper - lower) * rng.random((n_samples, len(joints))))
+    return _inertia_diagonals(pin, model, data, lower + (upper - lower) * rng.random((n_samples, len(joints))))
+
+
+def link_inertia_envelope(
+    asset: AssetSpec, *, n_samples: int = 512, seed: int = 0,
+    bounds: tuple[tuple[float, float], ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Median and minimum link-side inertia ``M_ii`` of each joint over its range.
+
+    This is a property of the robot, not of any one trajectory, so it is
+    sampled uniformly inside the joint limits (or ``bounds``, when given).
+    The median sizes transmission damping; the minimum bounds the highest
+    transmission mode, which on the iiwa is the wrist (``M_77 = 3e-4 kg
+    m^2``), not the rotor.
+    """
+    diagonals = _sample_inertia_diagonals(asset, n_samples, seed, bounds)
     return np.median(diagonals, axis=0), np.min(diagonals, axis=0)
+
+
+def link_inertia_max(
+    asset: AssetSpec, *, n_samples: int = 512, seed: int = 0,
+    bounds: tuple[tuple[float, float], ...] | None = None,
+) -> np.ndarray:
+    """Maximum link-side inertia ``M_ii`` of each joint over its range (or ``bounds``).
+
+    The worst-case (softest-effective) corner for the control/transmission
+    separation bound ``k >= (5 omega)^2 J_eff`` uses this, not the median
+    ``link_inertia_envelope`` sizes damping with (R4_02 Sec 7, R4_03 Sec 2).
+    """
+    diagonals = _sample_inertia_diagonals(asset, n_samples, seed, bounds)
+    return np.max(diagonals, axis=0)
 
 
 class ComputedTorqueController:
@@ -543,6 +582,21 @@ def effective_inertia(rotor_inertia: np.ndarray, link_inertia: np.ndarray) -> np
     rotor = np.asarray(rotor_inertia, dtype=float)
     link = np.asarray(link_inertia, dtype=float)
     return rotor * link / (rotor + link)
+
+
+def control_separation_ratio(
+    stiffness: np.ndarray, rotor_inertia: np.ndarray, link_inertia_max: np.ndarray, natural_frequency: float,
+) -> np.ndarray:
+    """Per-joint ``sqrt(k / J_eff) / omega``: closed-loop bandwidth vs the open-loop transmission mode.
+
+    Below ~5 the ``SeaMotorController``'s feedback linearization and the
+    plant's own transmission dynamics are not cleanly separated in frequency
+    (R4_02 Sec 7, R4_03 Sec 2).  Uses the *maximum* link inertia over the
+    robot's range (the worst, softest-effective corner), not the median
+    ``link_inertia_envelope`` value damping is derived from.
+    """
+    j_eff = effective_inertia(rotor_inertia, link_inertia_max)
+    return np.sqrt(np.asarray(stiffness, dtype=float) / j_eff) / float(natural_frequency)
 
 
 @dataclass(frozen=True)

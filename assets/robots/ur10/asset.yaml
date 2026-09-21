@@ -8,6 +8,10 @@ base:
   quaternion: [0.0, 0.0, 0.0, 1.0]
 gravity: [0.0, 0.0, -9.81]
 self_collisions: true
+# Upper arm vertical, forearm horizontal, tool pointing down: collision-free
+# above the table and well inside the position_window of
+# config/identification/ur10_table.yaml (R4_01 Sec 3).
+default_configuration: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
 kinematic_groups:
   arm:
     joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]

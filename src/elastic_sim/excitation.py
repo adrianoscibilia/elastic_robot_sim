@@ -56,6 +56,18 @@ class FourierExcitationConfig:
     # Fraction of max_acceleration reserved for the probe; the main harmonics
     # get the rest.
     probe_acceleration_fraction: float = 0.2
+    # Per-joint ``(lower, upper)`` [rad], overriding the URDF limit for that
+    # joint before ``limit_margin`` is applied.  Empty means every joint keeps
+    # its URDF limit (the iiwa's historical behaviour).  Needed on robots
+    # whose URDF limits are much wider than a sensible excitation band (e.g.
+    # the UR10's +-2 pi on five joints): without it, ``centre_jitter`` spreads
+    # trajectory centres over the whole +-2 pi box, most of which is either a
+    # dynamical duplicate (wrap-around) or collides with the table.  Stored as
+    # the raw ``(joint_name, (lo, hi))`` pairs rather than resolved to the
+    # active-joint order, because this config has no asset reference of its
+    # own; ``joint_bounds``/``effective_position_window`` resolve it once the
+    # asset (and so the active-joint order) is known.
+    position_window: tuple[tuple[str, tuple[float, float]], ...] = ()
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -90,6 +102,9 @@ class FourierExcitationConfig:
                     f"probe_harmonics top frequency {probe[-1] * self.base_frequency:g} Hz would alias "
                     f"the {1.0 / self.time_step:g} Hz output grid (keep it below {nyquist_margin:g} Hz)"
                 )
+        for name, (lo, hi) in self.position_window:
+            if lo >= hi:
+                raise ValueError(f"excitation.position_window[{name!r}] = [{lo}, {hi}] must satisfy lo < hi")
 
     @property
     def period(self) -> float:
@@ -201,24 +216,67 @@ def log_spaced_probe_harmonics(
     return tuple(int(i) for i in indices)
 
 
-def joint_bounds(asset: AssetSpec, config: FourierExcitationConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(safe_lower, safe_upper, velocity_limit)`` for the active joints."""
+def effective_position_window(asset: AssetSpec, config: FourierExcitationConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-active-joint ``(lower, upper)`` [rad], before ``limit_margin``.
+
+    The URDF limit (or ``[-pi, pi]`` when the URDF declares none, or a
+    malformed one), intersected with ``config.position_window`` for joints it
+    names.  Also used by ``link_inertia_envelope`` so the sampled inertia
+    envelope reflects the same joint range the excitation trajectories
+    actually live in (R4_03 Sec 1).
+    """
     joints = asset.resolve_active_joints()
-    lower, upper, velocity = [], [], []
+    window = dict(config.position_window)
+    if window:
+        unknown = sorted(set(window) - {joint.name for joint in joints})
+        if unknown:
+            available = ", ".join(joint.name for joint in joints)
+            raise ValueError(
+                f"excitation.position_window has unknown joint name(s) {unknown}; available: {available}"
+            )
+    lower, upper = [], []
     for joint in joints:
         lo, hi = joint.lower, joint.upper
         if lo is None or hi is None or not np.isfinite([lo, hi]).all() or lo >= hi:
             lo, hi = -np.pi, np.pi
+        if joint.name in window:
+            window_lo, window_hi = window[joint.name]
+            lo, hi = max(lo, window_lo), min(hi, window_hi)
+            if lo >= hi:
+                raise ValueError(
+                    f"excitation.position_window[{joint.name!r}] = [{window_lo}, {window_hi}] does not "
+                    f"intersect the joint's admissible range [{joint.lower}, {joint.upper}]"
+                )
         lower.append(float(lo))
         upper.append(float(hi))
-        velocity.append(float(joint.velocity) if joint.velocity else 1.0)
-    lower = np.asarray(lower)
-    upper = np.asarray(upper)
+    return np.asarray(lower), np.asarray(upper)
+
+
+def _position_window_metadata_entry(config: FourierExcitationConfig) -> dict:
+    """The ``{"position_window": ...}`` entry ``optimize_excitation`` merges into its metadata dict.
+
+    Empty (no key at all, not even ``null``) when ``config.position_window``
+    is unset, so a config without one -- every shipped config before this
+    round -- gets a bit-identical metadata dict and so an unchanged
+    ``trajectory_digest`` (R4_03 Sec 1).  Factored out of
+    ``optimize_excitation`` so this can be checked directly without building
+    a Pinocchio model.
+    """
+    if not config.position_window:
+        return {}
+    return {"position_window": [[name, list(bounds)] for name, bounds in config.position_window]}
+
+
+def joint_bounds(asset: AssetSpec, config: FourierExcitationConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(safe_lower, safe_upper, velocity_limit)`` for the active joints."""
+    joints = asset.resolve_active_joints()
+    lower, upper = effective_position_window(asset, config)
+    velocity = np.asarray([float(joint.velocity) if joint.velocity else 1.0 for joint in joints])
     span = upper - lower
     return (
         lower + config.limit_margin * span,
         upper - config.limit_margin * span,
-        np.asarray(velocity) * config.velocity_fraction,
+        velocity * config.velocity_fraction,
     )
 
 
@@ -455,6 +513,12 @@ def optimize_excitation(
         "candidate_index": int(best["index"]),
         "collision_rejections": int(rejected_for_collision),
         "include_friction": bool(include_friction),
+        # Part of the trajectory's identity (it changes the feasible band the
+        # coefficients were fit against), so it must enter trajectory_digest()
+        # -- but only when set, or the iiwa's metadata dict (and so its
+        # digest()) would change with no behaviour change (signal_digest(),
+        # which excludes metadata, is unaffected either way) (R4_03 Sec 1).
+        **_position_window_metadata_entry(config),
         "coefficients_a": np.asarray(best["a"]).tolist(),
         "coefficients_b": np.asarray(best["b"]).tolist(),
         "offset": np.asarray(best["offset"]).tolist(),
