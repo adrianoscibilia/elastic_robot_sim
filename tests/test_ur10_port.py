@@ -475,6 +475,56 @@ def test_generate_with_error_action_never_calls_run_condition(monkeypatch):
         dataset_module.generate(config, asset, verbose=False, jobs=1)
 
 
+def test_rigid_only_build_falls_back_to_contiguous_split(capsys):
+    """R4_14 Sec 3 C-1: `--robots 0` (or any count below the shipped
+    holdout_robots test+val requirement) must not raise -- it falls back to
+    `split.mode=contiguous` with a one-line notice, so a rigid-only Newton
+    cross-check works without a bespoke config copy."""
+    import importlib
+
+    scripts_dir = os.path.join(_REPO, "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    gid = importlib.import_module("generate_identification_dataset")
+    parser = gid.build_parser()
+
+    resolved = gid.resolve_config(parser.parse_args(["--config", str(UR10_CONFIG), "--robots", "0"]), parser)
+    assert resolved.split.mode == "contiguous"
+    notice = capsys.readouterr().out
+    assert "falling back to split.mode=contiguous" in notice
+
+
+def test_split_mode_can_be_overridden_explicitly():
+    """R4_14 Sec 3 C-1: `--split-mode` wins over the auto-fallback."""
+    import importlib
+
+    scripts_dir = os.path.join(_REPO, "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    gid = importlib.import_module("generate_identification_dataset")
+    parser = gid.build_parser()
+
+    resolved = gid.resolve_config(
+        parser.parse_args(["--config", str(UR10_CONFIG), "--robots", "7", "--split-mode", "contiguous"]), parser,
+    )
+    assert resolved.split.mode == "contiguous"
+
+
+def test_split_mode_is_unchanged_when_robots_is_enough_for_the_default_split():
+    """R4_14 Sec 3 C-1: the fallback only fires when it has to -- a normal
+    build with enough robots keeps the config's own `holdout_robots` mode."""
+    import importlib
+
+    scripts_dir = os.path.join(_REPO, "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    gid = importlib.import_module("generate_identification_dataset")
+    parser = gid.build_parser()
+
+    resolved = gid.resolve_config(parser.parse_args(["--config", str(UR10_CONFIG)]), parser)
+    assert resolved.split.mode == "holdout_robots"
+
+
 @pytest.mark.parametrize("config_path", [IIWA_CONFIG, UR10_CONFIG], ids=["iiwa", "ur10"])
 def test_resolve_config_without_overrides_equals_load_config(config_path):
     """R4_06 B9: nothing new is dropped by the CLI reconstruction
@@ -961,3 +1011,41 @@ def test_ur10_contract_sidecar_declares_six_per_joint_channels(tmp_path, ur10_as
     assert contract["target_kind"] == "per_joint_torque"
     assert contract["target_columns"] == [f"ft0..ft{n_dof - 1}"]
     assert contract["split"]["mode"] == "holdout_robots"
+
+
+@pytest.mark.slow
+def test_ur10_payload_enabled_false_gives_every_bag_a_bare_flange(ur10_asset):
+    """R4_Q Q0 (owner, R4_14 Sec 2.4): `payload.enabled: false` -> bare
+    flange on every bag (no payload drawn at all); an explicit range like
+    `[0.3, 5.0]` -> every draw falls inside it, exactly like every other
+    sampled parameter. Both are already-shipped YAML-settable behaviour;
+    this is the confirming test, not a new feature."""
+    pytest.importorskip("mujoco")
+    from dataclasses import replace
+
+    from elastic_sim.dataset import (
+        PayloadSampling, SplitPolicy, TransmissionSampling, build_tiers, generate, load_config,
+    )
+
+    config = load_config(UR10_CONFIG)
+    transmission = replace(config.transmission, robots=6)
+    tiers = build_tiers(True, transmission, config.seed)
+    base = replace(
+        config, backends=("mujoco",), transmission=transmission, tiers=tiers,
+        n_trajectories=1, trajectories_per_robot=True, n_friction_samples=1, candidates=16,
+        split=SplitPolicy(mode="holdout_robots", test_robots=2, val_robots=0),
+    )
+
+    disabled = replace(base, payload=PayloadSampling(enabled=False))
+    _, manifest_disabled, _ = generate(disabled, ur10_asset, verbose=False)
+    elastic_records = [r for r in manifest_disabled["records"] if r["tier"] != "rigid"]
+    assert elastic_records
+    assert all(r["payload"] is None for r in elastic_records), "enabled: false must draw no payload at all"
+
+    ranged = replace(base, payload=PayloadSampling(enabled=True, mass=(0.3, 5.0), size=(0.05, 0.05)))
+    _, manifest_ranged, _ = generate(ranged, ur10_asset, verbose=False)
+    elastic_records = [r for r in manifest_ranged["records"] if r["tier"] != "rigid"]
+    assert elastic_records
+    for record in elastic_records:
+        assert record["payload"] is not None
+        assert 0.3 <= record["payload"]["mass"] <= 5.0

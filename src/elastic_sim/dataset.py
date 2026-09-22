@@ -1216,6 +1216,16 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
         [joint.effort if joint.effort else np.inf for joint in asset.resolve_active_joints()]
     )
     peak_torque_ratio = float(np.max(np.abs(np.asarray(result["tau_motor"])) / effort_limits[None, :]))
+    # The reference trajectory is validated collision-free at build time
+    # (optimize_excitation), but tracking error means the *achieved* path
+    # can differ, especially on a soft elastic robot -- flagged, not
+    # dropped, same policy as the backend comparison (R4_14 Sec 2.3).
+    margin = float(asset.metadata.get("collision", {}).get("margin", 0.0))
+    max_joint_step = float(asset.metadata.get("collision", {}).get("max_joint_step", 0.05))
+    with payload_asset(asset, payload) as asset_p:
+        achieved_report = PortableKinematics(asset_p).validate_path(
+            np.asarray(result["q_link"]), margin=margin, max_joint_step=max_joint_step,
+        )
     record = {
         "bag": bag, "bag_index": bag_index, "trajectory": traj_index, "tier": tier.name, "split": split,
         **describe_transmission(result["transmission"], result["time_step"]),
@@ -1241,6 +1251,7 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
         "peak_torque_ratio": peak_torque_ratio,
         "control_separation_min_ratio": separation_ratio,
         "control_separation_joint": separation_joint,
+        "achieved_min_clearance_m": float(achieved_report.minimum_distance),
     }
     return frame, record
 
@@ -1570,6 +1581,18 @@ def generate(
         # Emitted unconditionally (R4_10 Sec 2.2: a --quiet build previously
         # left this violation visible only in the manifest, with no trace on
         # stderr/stdout); the print is kept as well for verbose runs.
+        warnings.warn(message, stacklevel=2)
+        if verbose:
+            print(f"warning: {message}")
+
+    collision_margin = float(asset.metadata.get("collision", {}).get("margin", 0.0))
+    too_close = [r for r in records if r["achieved_min_clearance_m"] < collision_margin]
+    if too_close:
+        worst = min(too_close, key=lambda r: r["achieved_min_clearance_m"])
+        message = (f"{len(too_close)}/{len(records)} bags' achieved path (not the reference, which is "
+                   f"validated collision-free at build time) comes closer than margin={collision_margin:g} m; "
+                   f"worst is bag {worst['bag']!r} at {worst['achieved_min_clearance_m']:.4f} m "
+                   "(R4_14 Sec 2.3: tracking error, not a code defect -- flagged, not dropped)")
         warnings.warn(message, stacklevel=2)
         if verbose:
             print(f"warning: {message}")

@@ -47,9 +47,7 @@ uv run python scripts/generate_identification_dataset.py \
 ```
 
 What differs from the iiwa, and why, is in
-`docs/PARAMETER_PROVENANCE.md#ur10` and
-`round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md`; in
-short:
+`docs/PARAMETER_PROVENANCE.md#ur10`; in short:
 
 - **Excitation window.** The URDF joint limits are +-2 pi on five of the
   UR10's six joints, wide enough that an unconstrained excitation spreads
@@ -79,21 +77,29 @@ short:
 - **Cost.** The bare-flange wrist-3 mode (400-1200 Hz, the same situation as
   the iiwa's A7) sets the integration step, so a UR10 rollout is not cheaper
   than an iiwa one despite the arm looking "softer" overall. Measured
-  (`round4_ur10/R4_11` T5.2, 7-robot smoke builds): with the shipped
-  `payload.mass: [0, 5]` fitted, the median elastic step is `~4.4e-4 s` --
-  itself already *coarser* than the iiwa's own `6-8e-5 s`, i.e. cheaper per
-  step, not more expensive; the "not cheaper" correction bites specifically
-  when the flange is bare (`payload.enabled: false` or every draw near 0),
-  which drops the step to `~7.5e-5 s` and the wall time per bag to ~3.7-3.8x
-  the payload-fitted case.
+  (7-robot smoke builds): with the shipped `payload.mass: [0, 5]` fitted,
+  the median elastic step is `~4.4e-4 s` -- itself already *coarser* than
+  the iiwa's own `6-8e-5 s`, i.e. cheaper per step, not more expensive; the
+  "not cheaper" correction bites specifically when the flange is bare
+  (`payload.enabled: false` or every draw near 0), which drops the step to
+  `~7.5e-5 s` and the wall time per bag to ~3.7-3.8x the payload-fitted
+  case.
+- **Payload.** `payload.enabled: false` gives every bag a bare flange (no
+  payload drawn at all); with `enabled: true`, `payload.mass`/`offset_*`/
+  `size` are YAML-settable intervals sampled the same way as every other
+  robot parameter -- there is no separate "minimum tool mass" knob, just the
+  interval's own floor.
 - **Backends.** `--backends mujoco` only is recommended for a full UR10
   build. Newton's *elastic* path runs `SolverMuJoCo` (the MuJoCo-Warp GPU
-  port, float32) rather than an independent solver, and was found
-  (`round4_ur10/R4_Q` Q5) to occasionally diverge on the softer/
-  lower-damping end of the sampled stiffness prior -- deterministically
-  given a fixed `--jobs` count, but on a *different* bag depending on the
-  process/worker layout, consistent with float32 marginal stability rather
-  than a fixable per-robot bug. Newton (`SolverFeatherstone`) remains a
+  port, float32) rather than an independent solver, and was found to
+  occasionally diverge on the softer/lower-damping end of the sampled
+  stiffness prior -- deterministically given a fixed `--jobs` count, but on
+  a *different* bag depending on the process/worker layout. That pattern
+  (same divergence, different bag, when only the process/worker count
+  changes) points at **state shared across bags inside one process**
+  (a reused model/solver cache) rather than at float32 precision itself,
+  which would be expected to hit the same bag regardless of process layout;
+  not established either way yet. Newton (`SolverFeatherstone`) remains a
   genuine independent cross-check on the **rigid** tier only
   (`--robots 0 --backends mujoco newton`).
 

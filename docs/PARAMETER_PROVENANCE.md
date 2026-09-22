@@ -51,8 +51,7 @@ admissible range? Criterion (i) is defended by Anchor 2 below; criterion
 
 ## ur10
 
-Joint labels are the URDF joint names, not `A1..A6` (`REFACTOR_SPECS/round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md`
-has the full derivation). The upper end of every stiffness interval is the
+Joint labels are the URDF joint names, not `A1..A6`. The upper end of every stiffness interval is the
 gearbox-only datasheet stiffness (`K2`) of the Harmonic Drive size inferred
 from the joint's URDF effort limit (UR does not publish its supplier or
 size); the centre is `K2 / r` with `r = 3` (wider than the iiwa's `r = 2`:
@@ -74,7 +73,7 @@ indirect identification, no torque sensor, stronger nonlinearity/hysteresis
 | wrist_2 | rotor_inertia | 0.5 kg m^2 | 2.0 | E | as wrist_1 | |
 | wrist_3 | rotor_inertia | 0.5 kg m^2 | 2.0 | E | as wrist_1 | |
 | shoulder_pan..wrist_3 | damping_ratio | 0.05-0.2 (interval, not nominal x factor) | - | E | as iiwa | same observability caveats; weaker still on pan/lift (heavier motor loop) |
-| flange | payload mass | 0-5 kg (interval) | - | E | 50% of the 10 kg rating (iiwa: 6/14 = 43%); effort compliance asserted at generation time | see `REFACTOR_SPECS/round4_ur10/R4_00_OVERVIEW_AND_PROTOCOL.md Sec 5` decision D1 |
+| flange | payload mass | 0-5 kg (interval) | - | E | 50% of the 10 kg rating (iiwa: 6/14 = 43%); effort compliance asserted at generation time | bare flange allowed (drawn continuously from this interval, `payload.enabled: false` forces it); the floor and ceiling are configured per-asset in `config/identification/*.yaml` |
 
 Containment cross-check: the iiwa A1 published value (18500 Nm/rad, Disney
 Research) against its size-32-class gearbox (K2 = 7.8e4) is a ratio of 0.24,
@@ -162,14 +161,17 @@ from the current config, rather than hand-editing numbers here.
 
 Do not justify a lower range by asserting "the UR10 is more compliant." Run
 the same anchors; only what the hardware changes, changes. The UR10 port is
-done: see the `## ur10` section above for its rows and
-`REFACTOR_SPECS/round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md` Sec 6
-for what "the UR10 is more compliant" does and does not mean (arm-level
-compliance from long, heavy links on the same class of gearbox as the iiwa,
-not a lower joint-level nominal). The two corrections to
-`REFACTOR_SPECS/round3/R3_04_RANGE_JUSTIFICATION_AND_PROVENANCE.md Sec A5`'s
-predictions (proximal-only resonance drop, and the wrist-3 mode making the
-UR10 rollouts *not* cheaper than the iiwa's) are in the same section, Sec 5.
+done: see the `## ur10` section above for its rows. "The UR10 is more
+compliant" is true at the **arm** level (long, heavy links) but not at the
+**joint** level (similar-size gearboxes to the iiwa, no lower nominal
+stiffness) -- the softness is inertia, not a softer spring. Two corrections
+to the original porting prediction: the proximal resonance drop from the
+iiwa is real but modest (a factor of ~2.5-7, not "an order of magnitude"),
+and it is driven by link/rotor inertia, not lower stiffness; and the bare
+wrist-3 mode (400-1200 Hz, the same situation as the iiwa's A7) sets the
+integration step, so a UR10 rollout is **not** cheaper than an iiwa one
+despite the arm looking softer overall (`docs/IDENTIFICATION_DATASET.md`
+"Other assets: UR10" has the measured wall-time numbers).
 
 For a robot with no joint torque sensor and no link-side encoder (the UR10's
 situation), Anchor 2's cheap direct measurement (`k = tau/delta` from
@@ -203,7 +205,7 @@ the gear ratio squared, then invert `k = (2 pi f)^2 J_eff`.
   Engineering Practice 2020 -- https://www.sciencedirect.com/science/article/abs/pii/S0967066120300988
 - Madsen et al., *Model-Based On-line Estimation of Time-Varying Nonlinear
   Joint Stiffness on an e-Series Universal Robots Manipulator*, ICRA 2019
-  (not IROS -- corrected in `round4_ur10/R4_12`) --
+  (not IROS) --
   https://ieeexplore.ieee.org/document/8793935/
 - Testa et al., *Experimental identification of the joints stiffness of the
   UR5 robot arm* -- https://www.semanticscholar.org/paper/563b40a956156ad22d81577a2912adb6b59e616d

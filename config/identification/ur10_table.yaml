@@ -1,15 +1,3 @@
-# ==========================================================================
-# DRAFT (round 4, REFACTOR_SPECS/round4_ur10) -- do not build a training
-# dataset from this file until R4 stages 1-3 have landed:
-#   * assets/robots/ur10_table does not exist yet (R4 T1.3);
-#   * excitation.position_window and simulation.control_separation are
-#     parsed only after R4 T2.2 / T2.4 -- until then they are SILENTLY
-#     IGNORED (no sub-block key validation before R4 T2.1).
-# Numeric priors are architect-owned: change them only through
-# REFACTOR_SPECS/round4_ur10/R4_Q_OPEN_QUESTIONS.md.
-# Remove this banner at the end of R4 stage 5.
-# ==========================================================================
-#
 # Simulation-only identification workflow for the UR10 (CB3) on the same
 # 1.2 x 0.8 x 0.75 m table as the iiwa.  Select it with
 #   --config config/identification/ur10_table.yaml

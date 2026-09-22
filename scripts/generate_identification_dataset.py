@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backends", nargs="+", choices=("mujoco", "newton"), default=None)
     parser.add_argument("--robots", type=int, default=None,
                         help="Number of sampled elastic robots; 0 for the rigid reference only")
+    parser.add_argument("--split-mode", choices=("contiguous", "holdout_robots"), default=None,
+                        help="Override split.mode; auto-falls back to contiguous when --robots is too "
+                             "small for the config's holdout_robots test_robots+val_robots")
     parser.add_argument("--no-rigid", action="store_true", help="Omit the rigid reference tier")
     parser.add_argument("--trajectories", type=int, default=None)
     parser.add_argument("--friction-samples", type=int, default=None)
@@ -109,6 +112,21 @@ def resolve_config(args: argparse.Namespace, parser: argparse.ArgumentParser):
     except ValueError as exc:
         parser.error(str(exc))
 
+    split = config.split
+    if args.split_mode is not None:
+        split = replace(split, mode=args.split_mode)
+    elif (split.mode == "holdout_robots"
+          and split.test_robots + split.val_robots > transmission.robots):
+        # A rigid-only or small --robots run (e.g. an ad-hoc Newton
+        # cross-check) cannot satisfy the shipped config's holdout counts;
+        # falling back instead of raising is what a rigid-only build (which
+        # has no elastic robots to hold out from at all) needs to work
+        # without a config copy (R4_14 Sec 3, C-1).
+        print(f"note: --robots {transmission.robots} is smaller than "
+              f"split.test_robots+val_robots ({split.test_robots + split.val_robots}); "
+              "falling back to split.mode=contiguous for this run")
+        split = replace(split, mode="contiguous")
+
     sample_step = args.sample_step or config.sample_time_step
     if args.max_acceleration is not None and config.regime.enabled:
         parser.error(
@@ -143,6 +161,7 @@ def resolve_config(args: argparse.Namespace, parser: argparse.ArgumentParser):
         rigid_reference=rigid_reference,
         transmission=transmission,
         tiers=tiers,
+        split=split,
         n_trajectories=args.trajectories or config.n_trajectories,
         n_friction_samples=args.friction_samples or config.n_friction_samples,
         friction_scale_range=(tuple(args.friction_scale) if args.friction_scale
