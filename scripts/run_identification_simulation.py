@@ -190,7 +190,7 @@ def main() -> None:
         # collision margin below; cheap relative to the trajectory search.
         with payload_asset(asset, payload) as asset_p:
             report_kinematics = PortableKinematics(asset_p)
-        _report_trajectory(asset, trajectory, report_kinematics)
+            _report_trajectory(asset, trajectory, report_kinematics)
 
     if args.save_trajectory:
         trajectory.save(args.save_trajectory)

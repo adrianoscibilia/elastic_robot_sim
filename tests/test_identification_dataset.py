@@ -116,11 +116,33 @@ def test_mujoco_inverse_dynamics_matches_pinocchio(asset, model):
     pin, pin_model, pin_data = model
     built, _ = _build_model(asset, mujoco, 0.002)
     neutralize_mujoco_passive(built)
+    # pin.rnea is a pure unconstrained-tree computation with no notion of
+    # geometry; mj_inverse is not, unless contacts are disabled. Sampling
+    # across an asset's full URDF limits can land on a self-colliding
+    # configuration (the UR10's wide +-2pi range makes this common; found
+    # while porting this test there, R4_10/R4_11) -- MuJoCo then folds a
+    # contact-constraint force into qfrc_inverse that pin.rnea has no way to
+    # know about, up to O(1e4) Nm on the affected joints, with `data.ncon`
+    # sometimes still 0 at the settled state. Disabling contacts here (this
+    # test's freshly built model only, not the shared production one) is the
+    # correct apples-to-apples setup for this comparison and drops every
+    # case back to ~1e-9 (float noise).
+    built.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
     data = mujoco.MjData(built)
     active = _joint_addresses(built, mujoco, tuple(asset.joint_names))
     rng = np.random.default_rng(11)
+    lower, upper = np.asarray(pin_model.lowerPositionLimit), np.asarray(pin_model.upperPositionLimit)
     for _ in range(5):
-        q = pin.randomConfiguration(pin_model)
+        # A local, seeded draw over this model's own limits, not
+        # ``pin.randomConfiguration`` (R4_10/R4_11: that call advances
+        # Pinocchio's process-global RNG, so this test's result depended on
+        # how many other tests -- e.g. the UR10 port's own copy of this test
+        # -- already called it earlier in the same pytest session, up to and
+        # including spuriously landing outside another model's *compiled*
+        # MuJoCo joint range and activating a limit constraint in
+        # mj_inverse; reproduced as an order-dependent failure of whichever
+        # of the two tests ran second, never in isolation).
+        q = lower + (upper - lower) * rng.random(pin_model.nq)
         dq = rng.normal(size=pin_model.nv)
         ddq = rng.normal(size=pin_model.nv)
         for index, (qpos, dof) in enumerate(active):

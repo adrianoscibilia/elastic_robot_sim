@@ -13,9 +13,12 @@ truth for inertias and joint limits.
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+import numpy as np
 
 from .assets import AssetSpec
 
@@ -76,6 +79,69 @@ def strip_world_root(root: ET.Element) -> tuple[ET.Element, tuple[str, str]]:
     return root, (xyz, rpy)
 
 
+def _rotation_matrix_from_rpy(rpy: str) -> np.ndarray:
+    """URDF convention: ``R = Rz(yaw) . Ry(pitch) . Rx(roll)``."""
+    roll, pitch, yaw = (float(v) for v in rpy.split())
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    return rz @ ry @ rx
+
+
+def normalize_inertial_frames(root: ET.Element) -> ET.Element:
+    """Fold every link's ``<inertial><origin rpy=...>`` rotation into the tensor.
+
+    R4_Q (round 4, UR10 port): MuJoCo 3.6.0's rigid-body composition
+    (``mj_crb``, feeding ``mj_inverse``) disagrees with Pinocchio 4.1.0's
+    RNEA/CRBA by up to ~0.3% relative in specific mass-matrix entries for a
+    link whose ``<inertial><origin>`` carries a non-identity ``rpy`` --
+    reproduced on the bare ``ur10`` asset (so it predates and is independent
+    of this round's table composition), even though each engine's own
+    per-body inertia tensor, reconstructed from its native representation
+    (Pinocchio's ``model.inertias[i]``; MuJoCo's ``body_inertia`` +
+    ``body_iquat``), is bit-identical to the other's and to the tensor
+    obtained by hand-rotating the URDF's raw coefficients by ``rpy``. The
+    discrepancy is present at rest (``q=0``) already, is independent of the
+    robot's configuration, and vanishes when the same physical tensor is
+    instead expressed directly in the link frame (``rpy="0 0 0"``,
+    coefficients pre-rotated) -- i.e. it is specific to how one of the two
+    engines *composes* a rotated inertial frame through the kinematic chain,
+    not to the tensor itself. This function performs that pre-rotation
+    generically (any link, any asset), so it is a no-op -- verified,
+    `R4_06 Sec A2` -- on every URDF in this repository that already uses
+    ``rpy="0 0 0"`` everywhere (the iiwa's), and only changes links that
+    actually have a rotated inertial frame (three on the UR10: shoulder,
+    wrist_1, wrist_2).
+    """
+    for link in root.findall("link"):
+        inertial = link.find("inertial")
+        if inertial is None:
+            continue
+        origin = inertial.find("origin")
+        rpy = origin.get("rpy", "0 0 0") if origin is not None else "0 0 0"
+        if tuple(float(v) for v in rpy.split()) == (0.0, 0.0, 0.0):
+            continue
+        inertia = inertial.find("inertia")
+        tensor = np.array([
+            [float(inertia.get("ixx", 0.0)), float(inertia.get("ixy", 0.0)), float(inertia.get("ixz", 0.0))],
+            [float(inertia.get("ixy", 0.0)), float(inertia.get("iyy", 0.0)), float(inertia.get("iyz", 0.0))],
+            [float(inertia.get("ixz", 0.0)), float(inertia.get("iyz", 0.0)), float(inertia.get("izz", 0.0))],
+        ])
+        rotation = _rotation_matrix_from_rpy(rpy)
+        rotated = rotation @ tensor @ rotation.T
+        inertia.set("ixx", f"{rotated[0, 0]:.17g}")
+        inertia.set("ixy", f"{rotated[0, 1]:.17g}")
+        inertia.set("ixz", f"{rotated[0, 2]:.17g}")
+        inertia.set("iyy", f"{rotated[1, 1]:.17g}")
+        inertia.set("iyz", f"{rotated[1, 2]:.17g}")
+        inertia.set("izz", f"{rotated[2, 2]:.17g}")
+        origin.set("rpy", "0 0 0")
+    return root
+
+
 def _compose_translation_then_transform(translation: tuple[float, float, float], xyz: str, rpy: str) -> tuple[str, str]:
     """Fold ``T(translation) . T(xyz, rpy)`` into one origin, ``T(translation)`` having identity rotation.
 
@@ -120,6 +186,7 @@ def compose_table_scene(
         raise ValueError("table_size and table_mass must be positive")
 
     source = ET.parse(asset.urdf_path).getroot()
+    source = normalize_inertial_frames(source)
     source, removed_origin = strip_world_root(source)
     root_link = robot_root_link(source)
     mount_xyz, mount_rpy = _compose_translation_then_transform(

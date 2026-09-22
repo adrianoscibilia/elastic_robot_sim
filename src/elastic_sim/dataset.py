@@ -1141,6 +1141,49 @@ def rollout_frame(
     return frame
 
 
+def control_separation_for_bag(
+    asset: AssetSpec, tier: Tier, link_inertia: LinkInertia, link_inertia_max_value: np.ndarray,
+    natural_frequency: float,
+) -> tuple[float, str]:
+    """Per-bag control/transmission separation ratio and its worst joint.
+
+    Cheap (no simulation, just the tier's transmission preview), so
+    ``generate()`` can call this for *every* bag while it still builds the
+    work list -- before any bag is simulated -- and either raise immediately
+    (``action: error``, R4_10 Sec 2.3: raising inside a worker meant bags
+    already queued ahead of it, possibly minutes to hours of work with
+    ``--jobs N``, would already have run) or record the ratio for the
+    aggregated warning.
+    """
+    n_dof = len(asset.joint_names)
+    preview = tier.transmission(n_dof, link_inertia)
+    ratios = control_separation_ratio(
+        preview.stiffness, preview.rotor_inertia, link_inertia_max_value, natural_frequency,
+    )
+    worst = int(np.argmin(ratios))
+    return float(ratios[worst]), asset.joint_names[worst]
+
+
+def raise_on_control_separation_violation(
+    offending: Sequence[tuple[str, float, str]], min_ratio: float,
+) -> None:
+    """Raise once for every bag ``generate()`` found below ``min_ratio``.
+
+    Split out from ``generate()`` so the "action: error raises before any bag
+    is simulated, listing every offender" contract (R4_02 Sec 7, R4_10 Sec
+    2.3) is unit-testable on a plain list of ``(bag, ratio, joint)`` tuples,
+    with no trajectory optimisation (hence no Pinocchio) needed to reach it.
+    """
+    if not offending:
+        return
+    detail = "; ".join(f"{bag!r} ratio={ratio:.2f} joint={joint!r}" for bag, ratio, joint in offending)
+    raise ValueError(
+        f"{len(offending)} bag(s) violate simulation.control_separation.min_ratio="
+        f"{min_ratio:g} before any bag was simulated: {detail}; "
+        "lower control_gains.natural_frequency or raise the sampled stiffness"
+    )
+
+
 def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Execute one bag and return ``(frame, record)``.
 
@@ -1149,32 +1192,16 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     the asset spec, the tier, ...), never a built simulator model, which is
     what makes it picklable across the process boundary.  Bags are fully
     independent -- their RNG streams are keyed on ``(seed, index)``, not on
-    call order -- so worker order never affects the result.
+    call order -- so worker order never affects the result.  The control-
+    separation ratio/joint are computed by the caller (``generate()``)
+    *before* any bag is dispatched, so an ``action: error`` violation is
+    caught before the pool starts, not inside a worker (R4_10 Sec 2.3); this
+    function only carries them through to the manifest record.
     """
     (asset, trajectory, tier, backend, friction, config, link_inertia, payload,
-     split, bag, bag_index, traj_index, friction_index, control_gains, link_inertia_max_value) = args
+     split, bag, bag_index, traj_index, friction_index, control_gains, link_inertia_max_value,
+     separation_ratio, separation_joint) = args
     natural_frequency, damping_ratio = control_gains
-    separation_ratio = None
-    separation_joint = None
-    if not tier.is_rigid:
-        # Cheap (no simulation): built again, identically, inside
-        # run_condition -- computing it here lets an "error" action raise
-        # *before* that bag is actually simulated (R4_03 Sec 2).
-        n_dof = len(asset.joint_names)
-        preview = tier.transmission(n_dof, link_inertia)
-        ratios = control_separation_ratio(
-            preview.stiffness, preview.rotor_inertia, link_inertia_max_value, natural_frequency,
-        )
-        worst = int(np.argmin(ratios))
-        separation_ratio = float(ratios[worst])
-        separation_joint = asset.joint_names[worst]
-        if separation_ratio < config.control_separation.min_ratio and config.control_separation.action == "error":
-            raise ValueError(
-                f"bag {bag!r}: control/transmission separation ratio {separation_ratio:.2f} on joint "
-                f"{separation_joint!r} is below simulation.control_separation.min_ratio="
-                f"{config.control_separation.min_ratio:g} (natural_frequency={natural_frequency:g} rad/s); "
-                "lower control_gains.natural_frequency or raise the sampled stiffness"
-            )
     result = run_condition(asset, trajectory, tier, backend, friction, config,
                            link_inertia=link_inertia, payload=payload,
                            natural_frequency=natural_frequency, damping_ratio=damping_ratio)
@@ -1466,6 +1493,7 @@ def generate(
             return report.valid
 
         work: list[tuple] = []
+        offending: list[tuple[str, float, str]] = []
         for bag_index, (traj_index, tier, friction_index, backend) in enumerate(iter_conditions(config)):
             trajectory = trajectories[(tier.name if config.trajectories_per_robot else "", traj_index)]
             friction = frictions[friction_index]
@@ -1493,10 +1521,25 @@ def generate(
             link_inertia_for_bag = _envelope_for(payload) if not tier.is_rigid else None
             link_inertia_max_for_bag = _envelope_max_for(payload) if not tier.is_rigid else None
             gains = control_gains[(tier.name if config.trajectories_per_robot else "", traj_index)]
+            separation_ratio = separation_joint = None
+            if not tier.is_rigid:
+                separation_ratio, separation_joint = control_separation_for_bag(
+                    asset, tier, link_inertia_for_bag, link_inertia_max_for_bag, gains[0],
+                )
+                if separation_ratio < config.control_separation.min_ratio:
+                    offending.append((bag, separation_ratio, separation_joint))
             work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, payload,
-                        split, bag, bag_index, traj_index, friction_index, gains, link_inertia_max_for_bag))
+                        split, bag, bag_index, traj_index, friction_index, gains, link_inertia_max_for_bag,
+                        separation_ratio, separation_joint))
     finally:
         kinematics_stack.close()
+
+    # Checked once the whole work list is built, *before* a single bag is
+    # dispatched to a worker: with "action: error", raising from inside
+    # _run_bag would let bags queued ahead of the first offender in the pool
+    # already run, sometimes for minutes to hours (R4_10 Sec 2.3).
+    if config.control_separation.action == "error":
+        raise_on_control_separation_violation(offending, config.control_separation.min_ratio)
 
     frames: list[pd.DataFrame] = []
     records: list[dict[str, Any]] = []
@@ -1517,14 +1560,19 @@ def generate(
                 print(f"    warning: bag {record['bag']!r} peak |tau| is "
                       f"{record['peak_torque_ratio']:.0%} of the effort limit on its worst joint")
 
-    if verbose:
-        below = [r for r in records if r["control_separation_min_ratio"] is not None
-                 and r["control_separation_min_ratio"] < config.control_separation.min_ratio]
-        if below:
-            worst = min(below, key=lambda r: r["control_separation_min_ratio"])
-            print(f"warning: {len(below)}/{len(records)} bags have a control/transmission separation ratio "
-                  f"below min_ratio={config.control_separation.min_ratio:g}; worst is bag {worst['bag']!r} "
-                  f"at {worst['control_separation_min_ratio']:.2f} on joint {worst['control_separation_joint']!r}")
+    below = [r for r in records if r["control_separation_min_ratio"] is not None
+             and r["control_separation_min_ratio"] < config.control_separation.min_ratio]
+    if below:
+        worst = min(below, key=lambda r: r["control_separation_min_ratio"])
+        message = (f"{len(below)}/{len(records)} bags have a control/transmission separation ratio "
+                   f"below min_ratio={config.control_separation.min_ratio:g}; worst is bag {worst['bag']!r} "
+                   f"at {worst['control_separation_min_ratio']:.2f} on joint {worst['control_separation_joint']!r}")
+        # Emitted unconditionally (R4_10 Sec 2.2: a --quiet build previously
+        # left this violation visible only in the manifest, with no trace on
+        # stderr/stdout); the print is kept as well for verbose runs.
+        warnings.warn(message, stacklevel=2)
+        if verbose:
+            print(f"warning: {message}")
 
     frame = pd.concat(frames, ignore_index=True)
     # ``dynamic_model_nn`` differentiates with a Savitzky-Golay filter that
