@@ -201,8 +201,9 @@ the gear ratio squared, then invert `k = (2 pi f)^2 J_eff`.
 - Madsen et al., *Comprehensive modeling and identification of nonlinear
   joint dynamics for collaborative industrial robot manipulators*, Control
   Engineering Practice 2020 -- https://www.sciencedirect.com/science/article/abs/pii/S0967066120300988
-- *Model-Based On-line Estimation of Time-Varying Nonlinear Joint Stiffness
-  on an e-Series Universal Robots Manipulator*, IROS 2019 --
+- Madsen et al., *Model-Based On-line Estimation of Time-Varying Nonlinear
+  Joint Stiffness on an e-Series Universal Robots Manipulator*, ICRA 2019
+  (not IROS -- corrected in `round4_ur10/R4_12`) --
   https://ieeexplore.ieee.org/document/8793935/
 - Testa et al., *Experimental identification of the joints stiffness of the
   UR5 robot arm* -- https://www.semanticscholar.org/paper/563b40a956156ad22d81577a2912adb6b59e616d

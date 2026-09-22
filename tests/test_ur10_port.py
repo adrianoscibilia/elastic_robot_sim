@@ -576,12 +576,13 @@ def test_ur10_base_parameter_count(ur10_asset, ur10_model):
     pin, pin_model, pin_data = ur10_model
     basis = idn.base_parameter_basis(pin, pin_model, pin_data, n_samples=200, seed=0)
     assert basis.shape[0] == 60, "10 standard parameters x 6 UR10 joints"
-    # The rigid base-parameter count (basis.shape[1], the iiwa's is 43) has
-    # not been measured yet -- this environment has no Pinocchio (R4_09).
-    # Once it is, freeze it here as `assert basis.shape[1] == <N>` with a
-    # comment citing the run, mirroring the iiwa's test_base_parameter_count.
-    # The friction offset below is asset-agnostic and needs no such
-    # measurement, so it is checked now.
+    # Rigid base-parameter count, frozen (R4_12 Sec 1 C2): 36, stable across
+    # seed in {0, 1} and n_samples in {200, 500} (measured directly; the
+    # iiwa's equivalent count is 43 for its 7 DoF, so 36 for 6 DoF is not a
+    # simple ratio -- expected, since which combinations of the 60 raw
+    # parameters are unidentifiable depends on this arm's own kinematic
+    # structure, not just its joint count).
+    assert basis.shape[1] == 36
     with_friction = idn.base_parameter_basis(
         pin, pin_model, pin_data, n_samples=200, seed=0, include_friction=True
     )
@@ -664,33 +665,42 @@ def test_ur10_peak_torque_stays_under_the_warning_threshold_at_the_worst_payload
 
 @pytest.mark.slow
 @pytest.mark.parametrize("omega", [4.0, 7.5])
-def test_ur10_feedback_is_a_small_share_of_the_torque(omega, ur10_asset, ur10_short_trajectory, ur10_rigid_rollout):
-    """R4_06 C4: < 5 % at both ends of the control-gain range, rigid and one
-    elastic robot.
-
-    Both halves pass here (rigid ~0.02%, elastic ~2.6-4.4%) -- but this uses
-    ``ur10_short_trajectory``, a brief, *probe-free* trajectory, the same
-    simplification the iiwa's own fixture makes for test speed. R4_Q Q4:
-    against the **real, shipped** trajectory (probe harmonics included,
-    measured directly via ``run_identification_simulation.py --tier e00``,
-    not this fixture), the same softest stratum measures ~8.2% at both
-    omega=4.0 and 7.5 -- above the 5% bar. The probe's own excitation of the
-    transmission's resonance is the likely reason this fast unit test does
-    not reproduce it; escalated to the architect in R4_Q rather than
-    silently loosened, and left passing here rather than forced to fail on
-    a trajectory that does not match the finding.
+def test_ur10_feedback_is_a_small_share_of_the_torque(omega, ur10_asset):
+    """R4_06 C4 / R4_Q Q4 (architect's answer, R4_12 Sec 4): the 5% bar is a
+    rigid-tier-only statement -- on a rigid plant the controller model *is*
+    the plant, so feedback measures only numerical mismatch and must be
+    tiny. On an elastic plant the controller deliberately does not model
+    the transmission, so feedback is the loop rejecting the unmodelled
+    spring dynamics; a ratio flat in omega (steady-state feedback ~ the
+    disturbance torque, independent of the gains) is the *signature* of
+    that, not evidence of mistuning. Decision: < 5% rigid, < 15% elastic,
+    measured on the real, **probe-bearing** trajectory (not a probe-free
+    fixture, which understates it -- R4_Q Q4's original evidence used
+    ``run_identification_simulation.py`` against the shipped config
+    directly, ~8.2% at the softest stratum, because the probe's own energy
+    near the transmission resonance is what the loop has to reject).
     """
     pytest.importorskip("mujoco")
+    from dataclasses import replace
+
+    from elastic_sim import excitation as exc
     from elastic_sim import identification as idn
-    from elastic_sim.dataset import Tier
+    from elastic_sim.dataset import Tier, load_config
     from elastic_sim.torque_runners import ComputedTorqueController, SeaMotorController, run_mujoco_torque, run_mujoco_elastic_torque, link_inertia_envelope
 
+    shipped = load_config(UR10_CONFIG).excitation
+    # Same frequency content as the shipped config (main harmonics, probe
+    # comb, regime caps) -- candidates lowered from 48 purely for search
+    # speed, which does not change what frequencies are excited.
+    probe_config = replace(shipped, time_step=0.002)
     friction = idn.FrictionModel.from_asset(ur10_asset)
+    trajectory = exc.optimize_excitation(ur10_asset, probe_config, seed=11, n_candidates=8)
+
     rigid_controller = ComputedTorqueController(
-        ur10_asset, ur10_short_trajectory, friction=friction, natural_frequency=omega,
+        ur10_asset, trajectory, friction=friction, natural_frequency=omega,
     )
     rigid_result = run_mujoco_torque(
-        ur10_asset, ur10_short_trajectory, rigid_controller, time_step=5e-4, friction=friction,
+        ur10_asset, trajectory, rigid_controller, time_step=5e-4, friction=friction,
     )
     rigid_ratio = np.mean(np.abs(rigid_result["tau_feedback"])) / np.mean(np.abs(rigid_result["tau_feedforward"]))
     assert rigid_ratio < 0.05, f"rigid feedback ratio {rigid_ratio:.3f} at omega={omega}"
@@ -701,17 +711,17 @@ def test_ur10_feedback_is_a_small_share_of_the_torque(omega, ur10_asset, ur10_sh
     transmission = Tier("e_soft", stiffness=(8.7e3, 8.7e3, 4.1e3, 1.9e3, 1.9e3, 1.9e3),
                         damping_ratio=(0.1,) * n).transmission(n, link_inertia)
     elastic_controller = SeaMotorController(
-        ur10_asset, ur10_short_trajectory, transmission, friction=friction, natural_frequency=omega,
+        ur10_asset, trajectory, transmission, friction=friction, natural_frequency=omega,
     )
     elastic_result = run_mujoco_elastic_torque(
-        ur10_asset, ur10_short_trajectory, elastic_controller, transmission,
+        ur10_asset, trajectory, elastic_controller, transmission,
         time_step=min(5e-4, transmission.required_time_step()), friction=friction, check_step=False,
     )
     elastic_ratio = (np.mean(np.abs(elastic_result["tau_feedback"]))
                      / np.mean(np.abs(elastic_result["tau_feedforward"])))
-    assert elastic_ratio < 0.05, (
-        f"elastic feedback ratio {elastic_ratio:.3f} at omega={omega} exceeds the 5% bar "
-        "-- see R4_Q Q4 (escalated, not a code defect: flat across the whole retuned gain range)"
+    assert elastic_ratio < 0.15, (
+        f"elastic feedback ratio {elastic_ratio:.3f} at omega={omega} exceeds the 15% bar "
+        "(R4_Q Q4/R4_12 Sec 4: warn above 0.15, escalate above 0.25)"
     )
 
 

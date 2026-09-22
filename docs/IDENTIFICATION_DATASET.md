@@ -48,7 +48,7 @@ uv run python scripts/generate_identification_dataset.py \
 
 What differs from the iiwa, and why, is in
 `docs/PARAMETER_PROVENANCE.md#ur10` and
-`REFACTOR_SPECS/round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md`; in
+`round4_ur10/R4_02_PARAMETER_PRIORS_AND_PROVENANCE.md`; in
 short:
 
 - **Excitation window.** The URDF joint limits are +-2 pi on five of the
@@ -78,8 +78,24 @@ short:
   load-bearing for this asset in a way it never was for the 7-DoF iiwa.
 - **Cost.** The bare-flange wrist-3 mode (400-1200 Hz, the same situation as
   the iiwa's A7) sets the integration step, so a UR10 rollout is not cheaper
-  than an iiwa one despite the arm looking "softer" overall -- see the
-  round-4 report for measured wall time.
+  than an iiwa one despite the arm looking "softer" overall. Measured
+  (`round4_ur10/R4_11` T5.2, 7-robot smoke builds): with the shipped
+  `payload.mass: [0, 5]` fitted, the median elastic step is `~4.4e-4 s` --
+  itself already *coarser* than the iiwa's own `6-8e-5 s`, i.e. cheaper per
+  step, not more expensive; the "not cheaper" correction bites specifically
+  when the flange is bare (`payload.enabled: false` or every draw near 0),
+  which drops the step to `~7.5e-5 s` and the wall time per bag to ~3.7-3.8x
+  the payload-fitted case.
+- **Backends.** `--backends mujoco` only is recommended for a full UR10
+  build. Newton's *elastic* path runs `SolverMuJoCo` (the MuJoCo-Warp GPU
+  port, float32) rather than an independent solver, and was found
+  (`round4_ur10/R4_Q` Q5) to occasionally diverge on the softer/
+  lower-damping end of the sampled stiffness prior -- deterministically
+  given a fixed `--jobs` count, but on a *different* bag depending on the
+  process/worker layout, consistent with float32 marginal stability rather
+  than a fixable per-robot bug. Newton (`SolverFeatherstone`) remains a
+  genuine independent cross-check on the **rigid** tier only
+  (`--robots 0 --backends mujoco newton`).
 
 ## Looking before you save
 

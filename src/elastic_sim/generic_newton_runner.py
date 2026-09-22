@@ -26,6 +26,7 @@ import numpy as np
 
 from .assets import AssetSpec, load_asset_spec
 from .materialized import MaterializedTrajectory
+from .scene import normalize_inertial_frames
 from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig, trajectory_evaluator
 
 if TYPE_CHECKING:
@@ -949,6 +950,13 @@ def _loader_urdf(asset: AssetSpec):
     if "${" in text:
         text = _expand_simple_xacro_text(text)
     text = _ensure_collision_geometry(text)
+    # See generic_mujoco_runner._materialized_mujoco_urdf's identical call
+    # (R4_Q Q2): a link whose <inertial><origin> has a non-identity rpy is
+    # rewritten to rpy=0 with the equivalent rotated tensor before Newton
+    # ever sees it. A no-op for every asset already at rpy=0.
+    from xml.etree import ElementTree as ET
+
+    text = ET.tostring(normalize_inertial_frames(ET.fromstring(text)), encoding="unicode")
 
     def replace_mesh(match: re.Match[str]) -> str:
         try:

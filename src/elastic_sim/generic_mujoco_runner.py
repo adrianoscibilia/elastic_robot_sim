@@ -27,6 +27,7 @@ import numpy as np
 from .assets import AssetSpec, discover_urdf_joints
 from .generic_newton_runner import _ensure_collision_geometry, _expand_simple_xacro_text
 from .materialized import MaterializedTrajectory
+from .scene import normalize_inertial_frames
 from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig, trajectory_evaluator
 
 
@@ -329,6 +330,13 @@ def _materialized_mujoco_urdf(
         text = _expand_simple_xacro_text(text)
     text = _ensure_collision_geometry(text)
     root = ET.fromstring(text)
+    # MuJoCo 3.6.0's rigid-body composition disagrees with the analytic mass
+    # matrix (and with Pinocchio, which matches it) by up to 0.3% for a link
+    # whose <inertial><origin> carries a non-identity rpy (R4_Q Q2); this
+    # rewrites any such frame to rpy=0 with the physically-equivalent
+    # rotated tensor before MuJoCo ever sees it. A no-op for every link
+    # already at rpy=0 (every asset in this repo except the bare `ur10`).
+    root = normalize_inertial_frames(root)
     if elastic_transmissions is not None:
         _insert_elastic_transmissions(root, asset, elastic_transmissions)
     if asset.self_collisions:

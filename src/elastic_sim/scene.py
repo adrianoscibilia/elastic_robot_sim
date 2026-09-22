@@ -94,27 +94,23 @@ def _rotation_matrix_from_rpy(rpy: str) -> np.ndarray:
 def normalize_inertial_frames(root: ET.Element) -> ET.Element:
     """Fold every link's ``<inertial><origin rpy=...>`` rotation into the tensor.
 
-    R4_Q (round 4, UR10 port): MuJoCo 3.6.0's rigid-body composition
-    (``mj_crb``, feeding ``mj_inverse``) disagrees with Pinocchio 4.1.0's
-    RNEA/CRBA by up to ~0.3% relative in specific mass-matrix entries for a
-    link whose ``<inertial><origin>`` carries a non-identity ``rpy`` --
-    reproduced on the bare ``ur10`` asset (so it predates and is independent
-    of this round's table composition), even though each engine's own
-    per-body inertia tensor, reconstructed from its native representation
-    (Pinocchio's ``model.inertias[i]``; MuJoCo's ``body_inertia`` +
-    ``body_iquat``), is bit-identical to the other's and to the tensor
-    obtained by hand-rotating the URDF's raw coefficients by ``rpy``. The
-    discrepancy is present at rest (``q=0``) already, is independent of the
-    robot's configuration, and vanishes when the same physical tensor is
-    instead expressed directly in the link frame (``rpy="0 0 0"``,
-    coefficients pre-rotated) -- i.e. it is specific to how one of the two
-    engines *composes* a rotated inertial frame through the kinematic chain,
-    not to the tensor itself. This function performs that pre-rotation
-    generically (any link, any asset), so it is a no-op -- verified,
-    `R4_06 Sec A2` -- on every URDF in this repository that already uses
-    ``rpy="0 0 0"`` everywhere (the iiwa's), and only changes links that
-    actually have a rotated inertial frame (three on the UR10: shoulder,
-    wrist_1, wrist_2).
+    R4_Q Q2 (round 4, UR10 port): on the bare ``ur10`` asset, at ``q=0``,
+    the analytic composite inertia about the shoulder-pan axis (hand-derived
+    from the raw URDF: parallel-axis theorem plus each link's own rotated
+    inertia tensor, no engine involved) is ``12.222870``; Pinocchio 4.1.0's
+    ``pin.crba`` matches it to 7 significant figures (``12.222870328...``);
+    MuJoCo 3.6.0's ``mj_fullM`` does not (``12.209140...``, off by ~0.11%).
+    **MuJoCo 3.6.0 is the one that disagrees with the analytic value**;
+    Pinocchio needs no correction. The gap reproduces at every configuration
+    tried, not only ``q=0``, is up to ~0.3% relative on other mass-matrix
+    entries, and is specific to a link whose ``<inertial><origin>`` carries a
+    non-identity ``rpy`` (three such links on the UR10: shoulder, wrist_1,
+    wrist_2; zero elsewhere in this repository, which is why no other asset
+    exposed it). This function rewrites such a frame to ``rpy="0 0 0"``
+    with the equivalent rotated tensor coefficients -- the same physical
+    body, just expressed without an inertial-frame rotation -- which is
+    generically correct for any consumer, not only MuJoCo, and is a no-op on
+    a link already at ``rpy="0 0 0"``.
     """
     for link in root.findall("link"):
         inertial = link.find("inertial")
