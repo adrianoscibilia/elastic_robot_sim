@@ -37,6 +37,7 @@ sys.path.insert(0, os.fspath(_REPO / "src"))
 from elastic_sim import excitation as exc
 from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
+from elastic_sim.controllers import CONTROLLER_MODES, ControllerDraw
 from elastic_sim.dataset import (
     DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, payload_for, resolve_bag, rollout_frame,
     run_condition, sample_all_payloads,
@@ -102,6 +103,8 @@ def main() -> None:
     parser.add_argument("--max-acceleration", type=float, default=None)
     parser.add_argument("--candidates", type=int, default=None)
     parser.add_argument("--control-frequency", type=float, default=None)
+    parser.add_argument("--controller-mode", default=None, choices=list(CONTROLLER_MODES),
+                        help="Override simulation.controller.mode for this one rollout (R5_00 Sec 6.1)")
     parser.add_argument("--visualize", action="store_true", help="Open the native viewer")
     parser.add_argument("--realtime-scale", type=float, default=None, help="1.0 is real time")
     parser.add_argument("--trajectory-only", action="store_true",
@@ -137,6 +140,8 @@ def main() -> None:
     # whose payload changed a collision rejection, and always ran a
     # payload-free rollout regardless (R3_14 Sec 1.1).
     elastic_tiers = [t for t in config.tiers if not t.is_rigid]
+    if args.controller_mode is not None:
+        config = replace(config, controller=replace(config.controller, mode=args.controller_mode))
     payload_by_tier, payload_by_key = sample_all_payloads(config, elastic_tiers)
     payload = (
         payload_for(config, payload_by_tier, payload_by_key, tier, args.trajectory)
@@ -175,6 +180,14 @@ def main() -> None:
         natural_frequency, damping_ratio = sample_control_gains(
             config.control_gains, config.control_frequency, config.control_damping_ratio, config.seed, seed,
         )
+        from elastic_sim.controllers import sample_velocity_loop
+        from elastic_sim.dataset import plant_extras_for_bag
+
+        position_gain, velocity_bandwidth, integral_time = sample_velocity_loop(
+            config.controller, config.seed, seed,
+        )
+        draw = ControllerDraw(natural_frequency, damping_ratio, position_gain, velocity_bandwidth, integral_time)
+        extras = plant_extras_for_bag(config.plant_extras, len(asset.joint_names), config.seed, seed)
         with payload_asset(asset, payload) as asset_p:
             report_kinematics = PortableKinematics(asset_p)
             _report_trajectory(asset, trajectory, report_kinematics)
@@ -185,6 +198,7 @@ def main() -> None:
         resolved = resolve_bag(bag_config, asset, tier, args.trajectory, payload)
         trajectory = resolved.trajectory
         natural_frequency, damping_ratio = resolved.natural_frequency, resolved.damping_ratio
+        draw, extras = resolved.draw, resolved.extras
         # PortableKinematics is re-derived here (not reused from resolve_bag,
         # which tears its own down before returning) purely to report the
         # collision margin below; cheap relative to the trajectory search.
@@ -208,8 +222,17 @@ def main() -> None:
     )
     if args.control_frequency is not None:
         natural_frequency = args.control_frequency
+        draw = replace(draw, natural_frequency=natural_frequency)
     friction = idn.FrictionModel.from_asset(asset)
     print(f"\ntier {tier.name!r} on {backend}" + (" with viewer" if run_config.visualize else ""))
+    print(f"  controller   : {config.controller.mode}"
+          + (" (model-free)" if config.controller.is_model_free else "")
+          + ("" if config.controller.nominal.knows_payload else ", payload-unaware"))
+    if config.controller.mode == "velocity_pi":
+        print(f"  velocity loop: kp_pos={draw.position_gain:.2f} 1/s  omega_v={draw.velocity_bandwidth:.1f} rad/s"
+              f"  Ti={draw.integral_time:.3f} s")
+    if extras is not None and not extras.is_empty:
+        print(f"  plant extras : {extras.describe()}")
     if config.control_gains.enabled:
         print(f"  control gains: natural_frequency={natural_frequency:.2f} rad/s  damping_ratio={damping_ratio:.3f}")
     link_inertia = None
@@ -223,15 +246,25 @@ def main() -> None:
             worst_link_inertia = link_inertia_max(asset_p, n_samples=config.transmission.inertia_samples, bounds=bounds)
         transmission = tier.transmission(len(asset.joint_names), link_inertia)
         _report_transmission(transmission, run_config)
+        from elastic_sim.controllers import effective_bandwidth
+
         ratios = control_separation_ratio(
-            transmission.stiffness, transmission.rotor_inertia, worst_link_inertia, natural_frequency,
+            transmission.stiffness, transmission.rotor_inertia, worst_link_inertia,
+            effective_bandwidth(config.controller, draw),
         )
-        print(f"  control/transmission separation ratio (>= {config.control_separation.min_ratio:g} wanted):")
+        # The bound guards SeaMotorController's feedback linearization, which a
+        # model-free loop does not do; there it is reported, not wanted
+        # (R5_02 Sec 2.4).
+        wanted = not config.controller.is_model_free
+        suffix = (f"(>= {config.control_separation.min_ratio:g} wanted)" if wanted
+                  else f"(informational: {config.controller.mode} does no feedback linearization)")
+        print(f"  control/transmission separation ratio {suffix}:")
         for name, ratio in zip(asset.joint_names, ratios):
-            flag = "  <-- below min_ratio" if ratio < config.control_separation.min_ratio else ""
+            flag = "  <-- below min_ratio" if wanted and ratio < config.control_separation.min_ratio else ""
             print(f"    {name:20s} {ratio:6.2f}{flag}")
     result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia,
-                           payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio)
+                           payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+                           draw=draw, extras=None if tier.is_rigid else extras)
     _report_rollout(asset, result, friction)
 
     if not args.output:
@@ -240,6 +273,7 @@ def main() -> None:
     frame = rollout_frame(
         asset, trajectory, result, bag=f"{tier.name}_{backend}", tier=tier,
         backend=backend, friction=friction, resample_step=config.sample_time_step,
+        signals=config.signals, measurement=config.measurement, measurement_seed=config.seed,
     )
     target = Path(args.output).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)

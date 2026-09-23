@@ -24,7 +24,7 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-from .assets import AssetSpec, discover_urdf_joints
+from .assets import AssetSpec, discover_urdf_joints, lock_inactive_one_dof_joints
 from .generic_newton_runner import _ensure_collision_geometry, _expand_simple_xacro_text
 from .materialized import MaterializedTrajectory
 from .scene import normalize_inertial_frames
@@ -337,6 +337,13 @@ def _materialized_mujoco_urdf(
     # rotated tensor before MuJoCo ever sees it. A no-op for every link
     # already at rpy=0 (every asset in this repo except the bare `ur10`).
     root = normalize_inertial_frames(root)
+    # See generic_newton_runner._loader_urdf: a non-active 1-DoF joint is
+    # pinned rather than left free (R5_01 Sec 1.2), before the elastic
+    # transmissions are inserted so that a locked joint never gets one.
+    locked_text, _locked = lock_inactive_one_dof_joints(
+        ET.tostring(root, encoding="unicode"), asset.joint_names
+    )
+    root = ET.fromstring(locked_text)
     if elastic_transmissions is not None:
         _insert_elastic_transmissions(root, asset, elastic_transmissions)
     if asset.self_collisions:

@@ -275,6 +275,64 @@ class AssetRegistry:
             raise KeyError(f"Unknown asset {name!r}; available: {choices}") from exc
 
 
+def expand_simple_xacro_text(xml_text: str) -> str:
+    """Expand the arithmetic-only xacro subset used by the FMRR description.
+
+    ``<xacro:property>`` declarations are evaluated into a numeric scope and
+    every ``${...}`` occurrence replaced by its value, leaving plain URDF.
+    Consumers that parse URDF with a real XML/URDF parser (Pinocchio, the
+    MuJoCo and Newton importers) cannot do this themselves, while
+    :func:`discover_urdf_joints` evaluates the same subset in place -- so
+    without one shared expansion the Python asset layer and the simulators
+    would disagree about the same file (R5_01 Sec 1.1).
+    """
+    text = re.sub(r"<\?xacro[^>]*\?>", "", xml_text)
+    pattern = re.compile(r'<xacro:property\s+name\s*=\s*"([^"]+)"\s+value\s*=\s*"([^"]+)"\s*/?>')
+    properties: dict[str, float] = {}
+    for name, value in pattern.findall(text):
+        properties[name] = _xacro_float(value, properties)
+    text = pattern.sub("", text)
+    return re.sub(r"\$\{([^}]+)\}", lambda match: f"{_xacro_float(match.group(1), properties):.12g}", text)
+
+
+def lock_inactive_one_dof_joints(xml_text: str, active_joints: Iterable[str]) -> tuple[str, tuple[str, ...]]:
+    """Rewrite every non-active, non-mimic 1-DoF joint to ``type="fixed"``.
+
+    Returns ``(xml_text, locked_names)``.  An asset whose ``active_joints``
+    already covers every 1-DoF joint is untouched, which is every asset in
+    this repository except ``fmrr_tecnobody`` (its ``joint_yaw`` is a
+    revolute joint the real platform's drives do not actuate).  Locking is
+    the generic form of the reduced model ``identification.build_model``
+    needs: Pinocchio's joint order must equal the active-joint order, and a
+    torque-driven rollout that left an unactuated 1-DoF joint free would let
+    it swing under gravity as an extra, uncommanded degree of freedom that no
+    part of the identification contract describes (R5_01 Sec 1.2).
+
+    ``<axis>``, ``<limit>`` and ``<dynamics>`` children are dropped with the
+    joint type so that no importer keeps reading them; the joint's
+    ``<origin>`` is what still matters and is preserved, which pins the
+    locked joint at its zero position.
+    """
+    root = ET.fromstring(xml_text)
+    keep = set(active_joints)
+    locked: list[str] = []
+    for joint in root.findall("joint"):
+        name = joint.get("name")
+        joint_type = joint.get("type")
+        if not name or joint_type not in _ONE_DOF_TYPES or name in keep:
+            continue
+        if joint.find("mimic") is not None:
+            continue
+        joint.set("type", "fixed")
+        for tag in ("axis", "limit", "dynamics", "mimic", "safety_controller", "calibration"):
+            for child in joint.findall(tag):
+                joint.remove(child)
+        locked.append(name)
+    if not locked:
+        return xml_text, ()
+    return ET.tostring(root, encoding="unicode"), tuple(locked)
+
+
 def _optional_float(element: ET.Element | None, attr: str, properties: dict[str, float] | None = None) -> float | None:
     if element is None or element.get(attr) is None:
         return None

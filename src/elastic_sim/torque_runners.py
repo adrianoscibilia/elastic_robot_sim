@@ -23,13 +23,16 @@ from __future__ import annotations
 
 import time as _time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import numpy as np
 
 from .assets import AssetSpec
 from .identification import COULOMB_EPSILON, FrictionModel
 from .materialized import MaterializedTrajectory
+
+if TYPE_CHECKING:  # pragma: no cover - import kept out of the runtime path
+    from .plant_extras import PlantExtras
 
 TorqueLaw = Callable[[float, np.ndarray, np.ndarray], "TorqueCommand"]
 
@@ -148,21 +151,28 @@ class ComputedTorqueController:
         damping_ratio: float = 1.0,
         effort_limit: np.ndarray | None = None,
         epsilon: float = COULOMB_EPSILON,
+        inertia_scale: float = 1.0,
     ) -> None:
         from . import identification as idn
 
         if natural_frequency <= 0.0 or damping_ratio <= 0.0:
             raise ValueError("natural_frequency and damping_ratio must be positive")
+        if inertia_scale <= 0.0:
+            raise ValueError("inertia_scale must be positive")
         self.asset = asset
         self.trajectory = trajectory
         self.friction = FrictionModel.from_asset(asset) if friction is None else friction
         self.epsilon = float(epsilon)
         self.natural_frequency = float(natural_frequency)
         self.damping_ratio = float(damping_ratio)
+        self.inertia_scale = float(inertia_scale)
         # Error-dynamics gains, in 1/s^2 and 1/s -- not torque gains.
         self.kp = self.natural_frequency**2
         self.kd = 2.0 * self.damping_ratio * self.natural_frequency
         self._pin, self._model, self._data = idn.build_model(asset)
+        # A nominal controller's model can be systematically wrong about the
+        # arm's mass (R5_00 Sec 5.4 item 2); 1.0, the default, is a no-op.
+        self._model, self._data = idn.scale_model_inertias(self._pin, self._model, self.inertia_scale)
         self._idn = idn
         if effort_limit is None:
             effort_limit = np.asarray([
@@ -816,11 +826,14 @@ class SeaMotorController:
         friction: FrictionModel | None = None,
         effort_limit: np.ndarray | None = None,
         epsilon: float = COULOMB_EPSILON,
+        inertia_scale: float = 1.0,
     ) -> None:
         from . import identification as idn
 
         if natural_frequency <= 0.0 or damping_ratio <= 0.0:
             raise ValueError("natural_frequency and damping_ratio must be positive")
+        if inertia_scale <= 0.0:
+            raise ValueError("inertia_scale must be positive")
         self.asset = asset
         self.trajectory = trajectory
         self.transmission = transmission
@@ -828,9 +841,12 @@ class SeaMotorController:
         self.epsilon = float(epsilon)
         self.natural_frequency = float(natural_frequency)
         self.damping_ratio = float(damping_ratio)
+        self.inertia_scale = float(inertia_scale)
         self.kp = self.natural_frequency**2
         self.kd = 2.0 * self.damping_ratio * self.natural_frequency
         self._pin, self._model, self._data = idn.build_model(asset)
+        # See ComputedTorqueController: a no-op at the default 1.0.
+        self._model, self._data = idn.scale_model_inertias(self._pin, self._model, self.inertia_scale)
         self._idn = idn
         if effort_limit is None:
             effort_limit = np.asarray([
@@ -876,6 +892,7 @@ def run_mujoco_elastic_torque(
     visualize: bool = False,
     realtime_scale: float = 1.0,
     control_decimation: int = 1,
+    extras: "PlantExtras | None" = None,
 ) -> dict[str, Any]:
     """Torque-driven rollout of a series-elastic chain in MuJoCo.
 
@@ -887,8 +904,18 @@ def run_mujoco_elastic_torque(
     ``control_decimation`` evaluates the controller every ``N`` physics steps
     and holds the applied torque between updates (zero-order hold); see
     ``run_mujoco_torque`` for why this does not affect label correctness.
+
+    ``extras`` adds the non-Lagrangian plant effects of
+    :mod:`elastic_sim.plant_extras` (link-side friction, a nonlinear spring,
+    torque ripple).  ``None`` -- the default -- is round 4's plant exactly.
+    They are applied as generalized forces every physics step, never held with
+    the control decimation: they are the plant, not a command.
     """
     import mujoco
+
+    from .plant_extras import NO_EXTRAS
+
+    extras = NO_EXTRAS if extras is None else extras
 
     if control_decimation < 1:
         raise ValueError("control_decimation must be >= 1")
@@ -901,6 +928,10 @@ def run_mujoco_elastic_torque(
         transmission.require_stable_step(time_step)
     names = tuple(asset.joint_names)
     friction = FrictionModel.from_asset(asset) if friction is None else friction
+    effort_limit = np.asarray(
+        [joint.effort if joint.effort is not None else np.inf for joint in asset.resolve_active_joints()],
+        dtype=float,
+    )
     parameters = transmission.as_mapping(names)
     model, _ = _build_model(asset, mujoco, time_step, elastic_transmissions=parameters,
                             body_overrides=dict(config or {}).get("body_overrides", {}))
@@ -947,7 +978,9 @@ def run_mujoco_elastic_torque(
         # tau_spring is measured from the true, continuous state every step
         # regardless of decimation -- it is the recorded label, not a control
         # signal, so it must never be held.
-        tau_spring = -(transmission.stiffness * elastic_q + transmission.damping * elastic_dq)
+        tau_spring = extras.spring_torque(
+            elastic_q, elastic_dq, transmission.stiffness, transmission.damping,
+        )
         if index % control_decimation == 0:
             # See run_mujoco_torque: the friction subtraction must be held
             # with the same (stale) command, not refreshed every step, or the
@@ -955,8 +988,18 @@ def run_mujoco_elastic_torque(
             # uncancels into an undamped disturbance and diverges.
             command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
             solver_torque = command.total - friction.torque(motor_dq)
+        # Plant effects, evaluated on the live state every step: link-side
+        # friction acts on both coordinates (see PlantExtras.link_friction_torque),
+        # the spring correction only between rotor and link, and the ripple
+        # only on the motor.
+        link_friction_torque = extras.link_friction_torque(link_dq)
         data.qfrc_applied[:] = 0.0
-        data.qfrc_applied[motor_dof_idx] = solver_torque
+        data.qfrc_applied[motor_dof_idx] = (
+            solver_torque + link_friction_torque + extras.ripple_torque(motor_q, effort_limit)
+        )
+        data.qfrc_applied[elastic_dof_idx] = (
+            link_friction_torque + extras.spring_correction(elastic_q, transmission.stiffness)
+        )
         mujoco.mj_forward(model, data)
         rows["q"].append(link_q)
         rows["dq"].append(link_dq)
@@ -1002,6 +1045,7 @@ def run_newton_elastic_torque(
     solver_order: tuple[str, ...] = ("SolverMuJoCo", "SolverFeatherstone", "SolverSemiImplicit"),
     capture_graph: bool = True,
     control_decimation: int = 1,
+    extras: "PlantExtras | None" = None,
 ) -> dict[str, Any]:
     """Torque-driven rollout of a series-elastic chain in Newton.
 
@@ -1018,7 +1062,9 @@ def run_newton_elastic_torque(
     from .generic_newton_runner import (
         ElasticTransmissionParams, _as_numpy, _new_solver, build_elastic_model,
     )
+    from .plant_extras import NO_EXTRAS
 
+    extras = NO_EXTRAS if extras is None else extras
     if control_decimation < 1:
         raise ValueError("control_decimation must be >= 1")
     if tuple(trajectory.joint_names) != tuple(asset.joint_names):
@@ -1027,6 +1073,10 @@ def run_newton_elastic_torque(
         transmission.require_stable_step(time_step)
     names = tuple(asset.joint_names)
     friction = FrictionModel.from_asset(asset) if friction is None else friction
+    effort_limit = np.asarray(
+        [joint.effort if joint.effort is not None else np.inf for joint in asset.resolve_active_joints()],
+        dtype=float,
+    )
     transmissions = {
         name: ElasticTransmissionParams(
             stiffness=float(transmission.stiffness[index]),
@@ -1107,7 +1157,9 @@ def run_newton_elastic_torque(
             raise RuntimeError(f"Newton elastic rollout became non-finite at t={sample_time:.6f}s")
         # tau_spring is measured every step regardless of decimation -- see
         # run_mujoco_elastic_torque.
-        tau_spring = -(transmission.stiffness * elastic_q + transmission.damping * elastic_dq)
+        tau_spring = extras.spring_torque(
+            elastic_q, elastic_dq, transmission.stiffness, transmission.damping,
+        )
         if index % control_decimation == 0:
             # See run_mujoco_torque: hold the friction subtraction with the
             # same (stale) command, not the current motor_dq, or the embedded
@@ -1115,6 +1167,9 @@ def run_newton_elastic_torque(
             # an undamped disturbance and diverges.
             command = controller(float(sample_time), motor_q, motor_dq, tau_spring)
             solver_torque = command.total - friction.torque(motor_dq)
+        # See run_mujoco_elastic_torque for why link-side friction loads both
+        # coordinates while the spring correction and the ripple load one each.
+        link_friction_torque = extras.link_friction_torque(link_dq)
         rows["q"].append(link_q)
         rows["dq"].append(link_dq)
         rows["qm"].append(motor_q)
@@ -1126,7 +1181,12 @@ def run_newton_elastic_torque(
         if index + 1 == len(grid):
             break
         buffer.fill(0.0)
-        buffer[motor_qd_idx] = solver_torque
+        buffer[motor_qd_idx] = (
+            solver_torque + link_friction_torque + extras.ripple_torque(motor_q, effort_limit)
+        )
+        buffer[elastic_qd_idx] = (
+            link_friction_torque + extras.spring_correction(elastic_q, transmission.stiffness)
+        )
         control.joint_f.assign(buffer)
         state_in.clear_forces()
         if not disable_contacts:

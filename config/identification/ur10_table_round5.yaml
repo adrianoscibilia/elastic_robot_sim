@@ -1,0 +1,190 @@
+# Round-5 variant of the UR10 (CB3) identification config: same robot, same
+# scene, same priors and same excitation as config/identification/ur10_table.yaml,
+# with the four things round 5 changes (R5_00 Sec 6, R5_01 Amendment 2):
+#
+#   dataset.signals        motor-side position with a link-side target, the
+#                          non-collocated pair elasticity is visible in
+#   simulation.controller  a model-free velocity-loop cascade instead of exact
+#                          computed torque
+#   simulation.measurement encoder quantization, noise, gain error, delay
+#   simulation.plant_extras link-side friction, so the residual term has
+#                          something a Lagrangian cannot express
+#
+# Everything a prior lives in is *untouched* relative to ur10_table.yaml, on
+# purpose: a difference between a dataset built from that file and one built
+# from this one is a difference round 5 made, not a retune.  Diff the two files
+# to see exactly what round 5 costs.
+schema_version: 1
+
+asset: ur10_table
+
+backends: [mujoco, newton]
+rigid_reference: true
+
+transmission:
+  robots: 20
+  sampling: stratified
+  # Joint order: shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3.
+  # UR joint sizes 4, 4, 3, 2, 2, 2.  nominal = K2 / r of the inferred
+  # harmonic-drive size (32, 32, 25, 20, 20, 20), so the top of each
+  # interval is the gearbox-only datasheet stiffness (R4_02 Sec 2-3).
+  stiffness_nominal: [2.6e4, 2.6e4, 1.23e4, 5.7e3, 5.7e3, 5.7e3]   # Nm/rad
+  # r = 3, not 2: indirect identification on a UR (no torque sensor, no
+  # link encoder) and stronger nonlinearity/hysteresis (R3_04 Sec A5).
+  stiffness_factor: [0.3333333333, 3.0]
+  stiffness_common_fraction: 0.0
+  stiffness_provenance: [D, D, D, D, D, D]
+  damping_ratio: [0.05, 0.2]
+  # Reflected rotor inertia [kg m^2], as armature.  Elbow (size 3) from the
+  # UR5e identification (Clochiatti et al., Robotica 2024); sizes 4 and 2 by
+  # power law in rated torque through the size-1/size-3 points (R4_02 Sec 4).
+  rotor_inertia_nominal: [4.0, 4.0, 1.7, 0.5, 0.5, 0.5]
+  rotor_inertia_factor: [0.5, 2.0]
+  rotor_inertia_provenance: [E, E, C, E, E, E]
+  inertia_samples: 512
+
+# Flange tool.  tool0 == wrist_3_link on this URDF (R4_01 Sec 4), so there
+# is no flange shift in offset_z (the iiwa needs +0.035 m).  5 kg = 50 % of
+# the 10 kg rating.  Mass floor 0 keeps the bare-flange case -- decision D1
+# (R4_00 Sec 5): a floor of 0.3 kg would enlarge the integration step.
+payload:
+  enabled: true
+  mass: [0.0, 5.0]
+  offset_x: [-0.08, 0.08]
+  offset_y: [-0.08, 0.08]
+  offset_z: [0.02, 0.20]
+  size: [0.05, 0.25]
+  per: robot
+
+comparison:
+  q_link_rms: 1.0e-4
+  ft_relative_rms: 0.01
+  deflection_relative_rms: 0.05
+
+excitation:
+  n_harmonics: 5
+  base_frequency: 0.1
+  n_periods: 1
+  limit_margin: 0.12
+  # Lower than the iiwa (0.75 / 4.0): the lift and elbow carry 2-4x the
+  # iiwa's link inertia plus up to 5 kg at 1.3 m (R4_03 Sec 5).
+  velocity_fraction: 0.6
+  max_acceleration: 2.0
+  centre_jitter: 1.0
+  candidates: 48
+  # URDF limits are +-2 pi on five joints; without a window, trajectory
+  # centres spread over +-5.5 rad (wrap-around duplicates, upper arm under
+  # the table).  Intersected with the URDF limits; limit_margin applies to
+  # the window span (R4_03 Sec 1).  [R4 T2.2 -- ignored until then]
+  position_window:
+    shoulder_pan_joint: [-3.1416, 3.1416]
+    shoulder_lift_joint: [-3.1416, 0.0]
+    elbow_joint: [-2.8, 2.8]
+    wrist_1_joint: [-3.1416, 3.1416]
+    wrist_2_joint: [-3.1416, 3.1416]
+    wrist_3_joint: [-3.1416, 3.1416]
+  # Modal probe, 48 lines log-spaced 3-150 Hz =
+  # elastic_sim.excitation.log_spaced_probe_harmonics(3.0, 150.0, 48, 0.1).
+  # Proximal open-loop modes are 7.5-67 Hz on this arm (iiwa 50-170 Hz) and
+  # the closed-loop observable resonance sits lower still, so the iiwa's
+  # 8-190 Hz comb would miss the bottom of the band (R4_03 Sec 3).
+  # Top index 1500 < 0.4 / sample_time_step / base_frequency = 2000.
+  probe_harmonics: [
+    30, 33, 35, 39, 42, 45, 49, 54, 58, 63, 69, 75,
+    81, 89, 96, 105, 114, 123, 134, 146, 159, 172, 187, 203,
+    221, 240, 261, 284, 309, 335, 364, 396, 430, 468, 508, 552,
+    600, 653, 709, 771, 838, 910, 989, 1075, 1169, 1270, 1380, 1500,
+  ]
+  probe_acceleration_fraction: 0.2
+  regime:
+    enabled: true
+    max_acceleration: [0.5, 4.0]     # rad/s^2 (iiwa [1, 8])
+    velocity_fraction: [0.3, 0.8]    # (iiwa [0.3, 0.9])
+
+dataset:
+  trajectories: 3
+  trajectories_per_robot: true
+  # URDF damping = friction = 0 on every UR10 joint: friction sampling is a
+  # no-op on this asset (R4_03 Sec 6).
+  friction_samples: 1
+  friction_scale: [0.5, 2.0]
+  seed: 20260921
+  output: data/identification/ur10_table_round5.parquet
+  metadata_columns: inline
+  split:
+    mode: holdout_robots
+    test_robots: 4
+    val_robots: 2
+  # The owner's signal design (R5_01 Amendment 2).  The UR10 has no link-side
+  # torque sensor and no link encoder: what it reports is a motor-side position
+  # and a current-derived joint torque.  The motor position is therefore the
+  # real input; the link-side torque is the target and, on this arm, is the one
+  # signal that is simulated rather than measured -- R5_Q Q-5 asks the owner
+  # what stands in for it on the real UR10.
+  signals:
+    position_side: motor
+    target: link_torque
+    clean_columns: true
+
+simulation:
+  # The separation bound k >= (5 omega)^2 J_eff at the soft corner of the
+  # prior (k = K2/9, 2x rotor inertia, max link inertia, 5 kg payload) gives
+  # omega_max ~ 7.6 rad/s on pan/lift (R4_02 Sec 7).  The iiwa's 15-40 rad/s
+  # would violate it even at the nominal shoulder stiffness.
+  control_frequency: 6.0
+  control_damping_ratio: 1.0
+  control_gains:
+    enabled: true
+    natural_frequency: [4.0, 7.5]   # rad/s
+    damping_ratio: [0.7, 1.3]
+  # Per-bag check of sqrt(k / J_eff) / omega >= min_ratio.  [R4 T2.4 --
+  # ignored until then]
+  control_separation:
+    min_ratio: 5.0
+    action: warn
+  # The round-5 controller: a model-free outer position loop over the vendor's
+  # inner velocity loop, reached through ur_robot_driver's velocity interface.
+  # The inner loop's gains are the drive's, not ours, so they are drawn per bag
+  # (R5_01 Amendment 2).  The UR10's open-loop transmission modes are 7.5-67 Hz
+  # (47-420 rad/s), so a 20-60 rad/s velocity loop stays below the softest of
+  # them.
+  controller:
+    mode: velocity_pi
+    randomize: true
+    velocity_loop:
+      velocity_bandwidth: [20.0, 60.0]   # rad/s
+      position_gain: [4.0, 10.0]         # 1/s
+      integral_time: [0.05, 0.30]        # s
+    nominal:
+      knows_payload: false
+  # ESTIMATES (R5_Q Q-4): a CB3 UR10 reports through RTDE, with a ~17-bit
+  # absolute encoder (2 pi / 2^17 = 4.8e-5 rad), a visibly noisy velocity, and a
+  # joint torque derived from motor current -- a few percent of the reading plus
+  # a floor, with a per-joint calibration error that does not average out.
+  measurement:
+    encoder_resolution: 4.8e-5     # rad per count
+    q_noise: 1.0e-5                # rad
+    dq_noise: 5.0e-3               # rad/s
+    tau_noise_rel: 0.03
+    tau_noise_abs: 0.5             # Nm
+    tau_gain_error: 0.05
+    delay_samples: 2               # 4 ms at the 500 Hz grid below
+  # ESTIMATES (R5_Q Q-3): output-side friction of a harmonic drive plus its
+  # bearing, ~2 % of the joint's rated torque in Coulomb and ~1 Nm/(rad/s)
+  # viscous.  Joint order: pan, lift, elbow, wrist 1-3.
+  plant_extras:
+    link_friction:
+      viscous: [2.0, 2.0, 1.0, 0.4, 0.4, 0.4]     # Nm per rad/s
+      coulomb: [6.6, 6.6, 3.0, 1.1, 1.1, 1.1]     # Nm
+  rigid_time_step: 5.0e-4
+  max_time_step: 5.0e-4
+  # Kept at the round-4 500 Hz, *not* lowered to the CB3's 125 Hz RTDE rate.
+  # At 125 Hz the Nyquist limit is 62.5 Hz and the probe comb reaches 150 Hz, so
+  # a faithful recording rate and the round-4 probe band are incompatible: one
+  # of them has to give, and which is a numeric-prior decision (R5_Q Q-4).
+  sample_time_step: 0.002
+  control_decimation: 1
+
+visualization:
+  enabled: false
+  realtime_scale: 1.0

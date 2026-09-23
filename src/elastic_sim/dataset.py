@@ -25,7 +25,19 @@ import numpy as np
 import pandas as pd
 
 from .assets import AssetSpec
+from .controllers import (
+    ControllerDraw,
+    ControllerSpec,
+    NominalModelSpec,
+    VelocityLoopSpec,
+    build_controller,
+    describe_controller,
+    effective_bandwidth,
+    sample_velocity_loop,
+)
+from .measurement import IDEAL_MEASUREMENT, MeasurementModel, measure_bag
 from .payload import Payload, payload_asset
+from .plant_extras import NO_EXTRAS, PlantExtras, StiffnessNonlinearity, TorqueRipple
 from .backend_comparison import ComparisonThresholds, compare_backends, format_report, summarize
 from .excitation import FourierExcitationConfig, effective_position_window, optimize_excitation
 from .identification import FrictionModel
@@ -541,6 +553,138 @@ class ControlSeparationCheck:
             raise ValueError(f"control_separation.action must be one of {_CONTROL_SEPARATION_ACTIONS}")
 
 
+_POSITION_SIDES = ("link", "motor")
+_TARGET_SIDES = ("link_torque", "motor_torque")
+
+
+@dataclass(frozen=True)
+class SignalPolicy:
+    """Which physical signals the consumer's ``q``/``dq``/``tau``/``ft`` are.
+
+    The owner's round-5 signal design (``R5_01`` Amendment 2) is *motor*-side
+    position and its derivatives plus the motor effort as inputs, and the
+    *link*-side torque as the target.  That pair is non-collocated -- position
+    and torque are measured on opposite sides of the spring -- which is the
+    only arrangement in which elasticity appears in the data at all
+    (``R5_00`` Amendment 1).  A round-4 dataset pairs link position with link
+    torque, for which the link equation gives
+    ``tau_s = M(q) qdd + c + g`` exactly: rigid-body dynamics with no trace of
+    the spring, however elastic the robot really is.
+
+    The default is round 4's collocated pair, so no existing config changes
+    meaning; the round-5 configs set ``position_side: motor`` explicitly.
+    ``q_motor*``/``q_link*`` columns are written either way, so the physical
+    side of ``q0..q{n-1}`` is never ambiguous in a file -- but a consumer
+    reading ``q0..`` is reading whatever this policy selected, which is why it
+    is recorded in the contract sidecar and not only in the manifest.
+
+    ``clean_columns`` adds ``*_clean`` copies of every measured channel, which
+    is what makes a noisy dataset still decomposable into physics and
+    instrument (``R5_00`` Q-C.3).
+    """
+
+    position_side: str = "link"
+    target: str = "link_torque"
+    clean_columns: bool = False
+
+    def __post_init__(self) -> None:
+        if self.position_side not in _POSITION_SIDES:
+            raise ValueError(f"dataset.signals.position_side must be one of {_POSITION_SIDES}")
+        if self.target not in _TARGET_SIDES:
+            raise ValueError(f"dataset.signals.target must be one of {_TARGET_SIDES}")
+
+    @property
+    def is_collocated(self) -> bool:
+        """True when position and target sit on the same side of the spring.
+
+        A collocated pair carries no elastic signature whatever the robot's
+        stiffness, so the elastic-vs-residual comparison is meaningless on it.
+        """
+        return (self.position_side == "link") == (self.target == "link_torque")
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "position_side": self.position_side,
+            "target": self.target,
+            "collocated": self.is_collocated,
+            "clean_columns": bool(self.clean_columns),
+        }
+
+
+@dataclass(frozen=True)
+class PlantExtrasSampling:
+    """Config-level description of the non-Lagrangian plant effects.
+
+    Resolved per bag by :func:`plant_extras_for_bag`, which is what draws the
+    torque ripple's phase.  Empty by default: a config that says nothing gets
+    round 4's purely Lagrangian link side.
+    """
+
+    link_friction_viscous: tuple[float, ...] = ()
+    link_friction_coulomb: tuple[float, ...] = ()
+    stiffness_breakpoints: tuple[float, ...] = ()
+    stiffness_factors: tuple[float, ...] = ()
+    ripple_amplitude: float = 0.0
+    ripple_order: float = 24.0
+    ripple_random_phase: bool = True
+
+    def __post_init__(self) -> None:
+        viscous, coulomb = self.link_friction_viscous, self.link_friction_coulomb
+        if viscous and coulomb and len(viscous) != len(coulomb) and 1 not in (len(viscous), len(coulomb)):
+            raise ValueError(
+                "plant_extras.link_friction.viscous and .coulomb must have the same length "
+                "(or one of them a single value broadcast to every joint)"
+            )
+        if any(float(v) < 0.0 for v in viscous + coulomb):
+            raise ValueError("plant_extras.link_friction coefficients must be non-negative")
+        if bool(self.stiffness_breakpoints) != bool(self.stiffness_factors):
+            raise ValueError(
+                "plant_extras.stiffness_nonlinearity needs both breakpoints and factors "
+                "(factors one longer than breakpoints)"
+            )
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.link_friction_viscous or self.link_friction_coulomb
+            or self.stiffness_breakpoints or self.ripple_amplitude
+        )
+
+
+def plant_extras_for_bag(
+    sampling: PlantExtrasSampling, n_dof: int, dataset_seed: int, trajectory_seed_value: int,
+) -> PlantExtras:
+    """Resolve one bag's plant extras, drawing the ripple phase.
+
+    Stream ``(seed, 9, trajectory_seed)``: a new index, so enabling this
+    perturbs no existing draw.  The ripple's phase is per bag rather than per
+    dataset for the same reason the drive's velocity-loop gains are: a single
+    fixed phase is a map a network can memorize instead of learning that a
+    motor-angle-periodic disturbance exists at all.
+    """
+    if sampling.is_empty:
+        return NO_EXTRAS
+    link_friction = None
+    if sampling.link_friction_viscous or sampling.link_friction_coulomb:
+        viscous = _per_joint(sampling.link_friction_viscous or (0.0,), n_dof, "plant_extras.link_friction.viscous")
+        coulomb = _per_joint(sampling.link_friction_coulomb or (0.0,), n_dof, "plant_extras.link_friction.coulomb")
+        link_friction = FrictionModel(viscous, coulomb)
+    nonlinearity = None
+    if sampling.stiffness_breakpoints:
+        nonlinearity = StiffnessNonlinearity(
+            breakpoints=tuple(sampling.stiffness_breakpoints), factors=tuple(sampling.stiffness_factors),
+        )
+    ripple = None
+    if sampling.ripple_amplitude:
+        ripple = TorqueRipple(amplitude=float(sampling.ripple_amplitude), order=float(sampling.ripple_order))
+        if sampling.ripple_random_phase:
+            rng = np.random.default_rng((int(dataset_seed), 9, int(trajectory_seed_value)))
+            ripple = ripple.with_phase(rng, n_dof)
+    return PlantExtras(
+        link_friction=link_friction, stiffness_nonlinearity=nonlinearity, torque_ripple=ripple,
+    )
+
+
 DEFAULT_CONFIG_DIR = "config/identification"
 DEFAULT_CONFIG = "config/identification/kuka_lbr_iiwa_14_r820_table.yaml"
 
@@ -570,6 +714,13 @@ class DatasetConfig:
     regime: RegimeSampling = field(default_factory=RegimeSampling)
     control_gains: ControlGainSampling = field(default_factory=ControlGainSampling)
     control_separation: ControlSeparationCheck = field(default_factory=ControlSeparationCheck)
+    # Round 5: which controller closes the loop, what the recorder sees, which
+    # non-Lagrangian effects the plant has, and which physical signals the
+    # consumer's columns carry.  Every default reproduces round 4 exactly.
+    controller: ControllerSpec = field(default_factory=ControllerSpec)
+    measurement: MeasurementModel = field(default_factory=MeasurementModel)
+    plant_extras: PlantExtrasSampling = field(default_factory=PlantExtrasSampling)
+    signals: SignalPolicy = field(default_factory=SignalPolicy)
     candidates: int = 48
     control_frequency: float = 25.0
     control_damping_ratio: float = 1.0
@@ -602,13 +753,26 @@ _REGIME_KEYS = {"enabled", "max_acceleration", "velocity_fraction"}
 _PAYLOAD_KEYS = {"enabled", "mass", "offset_x", "offset_y", "offset_z", "size", "per"}
 _DATASET_KEYS = {
     "trajectories", "trajectories_per_robot", "friction_samples", "friction_scale", "seed", "output",
-    "metadata_columns", "split",
+    "metadata_columns", "split", "signals",
 }
+_SIGNALS_KEYS = {"position_side", "target", "clean_columns"}
 _SPLIT_KEYS = {"mode", "test_robots", "val_robots", "test_trajectories", "val_trajectories"}
 _SIMULATION_KEYS = {
     "control_frequency", "control_damping_ratio", "control_gains", "control_decimation",
     "allow_control_decimation", "rigid_time_step", "max_time_step", "sample_time_step", "control_separation",
+    "controller", "measurement", "plant_extras",
 }
+_CONTROLLER_KEYS = {"mode", "randomize", "nominal", "velocity_loop"}
+_NOMINAL_KEYS = {"knows_payload", "friction_scale", "rotor_inertia_scale", "inertia_scale"}
+_VELOCITY_LOOP_KEYS = {"position_gain", "velocity_bandwidth", "integral_time"}
+_MEASUREMENT_KEYS = {
+    "encoder_resolution", "q_noise", "dq_noise", "tau_noise_rel", "tau_noise_abs",
+    "tau_gain_error", "delay_samples",
+}
+_PLANT_EXTRAS_KEYS = {"link_friction", "stiffness_nonlinearity", "torque_ripple"}
+_LINK_FRICTION_KEYS = {"viscous", "coulomb"}
+_STIFFNESS_NONLINEARITY_KEYS = {"breakpoints", "factors"}
+_TORQUE_RIPPLE_KEYS = {"amplitude", "order", "random_phase"}
 _CONTROL_GAINS_KEYS = {"enabled", "natural_frequency", "damping_ratio"}
 _CONTROL_SEPARATION_KEYS = {"min_ratio", "action"}
 _VISUALIZATION_KEYS = {"enabled", "realtime_scale"}
@@ -618,6 +782,49 @@ def _check_keys(mapping: Mapping[str, Any], allowed: set[str], block: str, sourc
     unknown = sorted(set(mapping) - allowed)
     if unknown:
         raise ValueError(f"unknown {block} keys in {source}: {', '.join(unknown)}")
+
+
+def _pair(mapping: Mapping[str, Any], key: str, default: tuple[float, float]) -> tuple[float, float]:
+    """Read a ``[low, high]`` pair, accepting a single number as a fixed value."""
+    value = mapping.get(key, default)
+    if isinstance(value, (int, float)):
+        return (float(value), float(value))
+    return (float(value[0]), float(value[1]))
+
+
+def _controller_spec(controller_cfg: Mapping[str, Any]) -> ControllerSpec:
+    nominal_cfg = controller_cfg.get("nominal", {}) or {}
+    loop_cfg = controller_cfg.get("velocity_loop", {}) or {}
+    return ControllerSpec(
+        mode=str(controller_cfg.get("mode", "exact_ct")),
+        nominal=NominalModelSpec(
+            knows_payload=bool(nominal_cfg.get("knows_payload", True)),
+            friction_scale=float(nominal_cfg.get("friction_scale", 1.0)),
+            rotor_inertia_scale=float(nominal_cfg.get("rotor_inertia_scale", 1.0)),
+            inertia_scale=float(nominal_cfg.get("inertia_scale", 1.0)),
+        ),
+        velocity_loop=VelocityLoopSpec(
+            position_gain=_pair(loop_cfg, "position_gain", (10.0, 10.0)),
+            velocity_bandwidth=_pair(loop_cfg, "velocity_bandwidth", (100.0, 100.0)),
+            integral_time=_pair(loop_cfg, "integral_time", (0.05, 0.05)),
+        ),
+        randomize=bool(controller_cfg.get("randomize", False)),
+    )
+
+
+def _plant_extras_sampling(extras_cfg: Mapping[str, Any]) -> PlantExtrasSampling:
+    friction_cfg = extras_cfg.get("link_friction", {}) or {}
+    spring_cfg = extras_cfg.get("stiffness_nonlinearity", {}) or {}
+    ripple_cfg = extras_cfg.get("torque_ripple", {}) or {}
+    return PlantExtrasSampling(
+        link_friction_viscous=tuple(float(v) for v in np.atleast_1d(friction_cfg.get("viscous", []) or [])),
+        link_friction_coulomb=tuple(float(v) for v in np.atleast_1d(friction_cfg.get("coulomb", []) or [])),
+        stiffness_breakpoints=tuple(float(v) for v in spring_cfg.get("breakpoints", []) or []),
+        stiffness_factors=tuple(float(v) for v in spring_cfg.get("factors", []) or []),
+        ripple_amplitude=float(ripple_cfg.get("amplitude", 0.0)),
+        ripple_order=float(ripple_cfg.get("order", 24.0)),
+        ripple_random_phase=bool(ripple_cfg.get("random_phase", True)),
+    )
 
 
 def load_config(path: str | Path) -> DatasetConfig:
@@ -677,6 +884,23 @@ def load_config(path: str | Path) -> DatasetConfig:
     _check_keys(sim_cfg.get("control_gains", {}) or {}, _CONTROL_GAINS_KEYS, "simulation.control_gains", source)
     _check_keys(sim_cfg.get("control_separation", {}) or {}, _CONTROL_SEPARATION_KEYS,
                 "simulation.control_separation", source)
+    controller_cfg = sim_cfg.get("controller", {}) or {}
+    _check_keys(controller_cfg, _CONTROLLER_KEYS, "simulation.controller", source)
+    _check_keys(controller_cfg.get("nominal", {}) or {}, _NOMINAL_KEYS, "simulation.controller.nominal", source)
+    _check_keys(controller_cfg.get("velocity_loop", {}) or {}, _VELOCITY_LOOP_KEYS,
+                "simulation.controller.velocity_loop", source)
+    measurement_cfg = sim_cfg.get("measurement", {}) or {}
+    _check_keys(measurement_cfg, _MEASUREMENT_KEYS, "simulation.measurement", source)
+    extras_cfg = sim_cfg.get("plant_extras", {}) or {}
+    _check_keys(extras_cfg, _PLANT_EXTRAS_KEYS, "simulation.plant_extras", source)
+    _check_keys(extras_cfg.get("link_friction", {}) or {}, _LINK_FRICTION_KEYS,
+                "simulation.plant_extras.link_friction", source)
+    _check_keys(extras_cfg.get("stiffness_nonlinearity", {}) or {}, _STIFFNESS_NONLINEARITY_KEYS,
+                "simulation.plant_extras.stiffness_nonlinearity", source)
+    _check_keys(extras_cfg.get("torque_ripple", {}) or {}, _TORQUE_RIPPLE_KEYS,
+                "simulation.plant_extras.torque_ripple", source)
+    signals_cfg = data_cfg.get("signals", {}) or {}
+    _check_keys(signals_cfg, _SIGNALS_KEYS, "dataset.signals", source)
     _check_keys(view_cfg, _VISUALIZATION_KEYS, "visualization", source)
     scale = data_cfg.get("friction_scale", [0.5, 2.0])
     seed = int(data_cfg.get("seed", 20260917))
@@ -782,6 +1006,22 @@ def load_config(path: str | Path) -> DatasetConfig:
         control_separation=ControlSeparationCheck(
             min_ratio=float((sim_cfg.get("control_separation", {}) or {}).get("min_ratio", 5.0)),
             action=str((sim_cfg.get("control_separation", {}) or {}).get("action", "warn")),
+        ),
+        controller=_controller_spec(controller_cfg),
+        measurement=MeasurementModel(
+            encoder_resolution=float(measurement_cfg.get("encoder_resolution", 0.0)),
+            q_noise=float(measurement_cfg.get("q_noise", 0.0)),
+            dq_noise=float(measurement_cfg.get("dq_noise", 0.0)),
+            tau_noise_rel=float(measurement_cfg.get("tau_noise_rel", 0.0)),
+            tau_noise_abs=float(measurement_cfg.get("tau_noise_abs", 0.0)),
+            tau_gain_error=float(measurement_cfg.get("tau_gain_error", 0.0)),
+            delay_samples=int(measurement_cfg.get("delay_samples", 0)),
+        ),
+        plant_extras=_plant_extras_sampling(extras_cfg),
+        signals=SignalPolicy(
+            position_side=str(signals_cfg.get("position_side", "link")),
+            target=str(signals_cfg.get("target", "link_torque")),
+            clean_columns=bool(signals_cfg.get("clean_columns", False)),
         ),
         candidates=int(exc_cfg.get("candidates", 48)),
         control_frequency=float(sim_cfg.get("control_frequency", 25.0)),
@@ -892,6 +1132,8 @@ def run_condition(
     payload: Payload | None = None,
     natural_frequency: float | None = None,
     damping_ratio: float | None = None,
+    draw: ControllerDraw | None = None,
+    extras: PlantExtras | None = None,
 ) -> dict[str, Any]:
     """Execute one trajectory under one condition and return the rollout.
 
@@ -911,9 +1153,32 @@ def run_condition(
     ``config.control_frequency``/``config.control_damping_ratio`` when not
     given; pass the per-trajectory draw from ``sample_control_gains`` to use
     a randomized closed-loop gain instead (``config.control_gains``).
+
+    ``draw`` carries the velocity-loop gains as well and supersedes those two
+    arguments when given (``resolve_bag`` builds it); ``extras`` carries the
+    round-5 non-Lagrangian plant effects.  Both default to round 4's
+    behaviour: exact computed torque at the config's fixed gains, on a purely
+    Lagrangian link side.
+
+    Plant extras are rejected on the rigid tier on purpose.  That tier is the
+    dataset's *analytic reference*: its recorded torque must keep satisfying
+    ``rnea(achieved state)`` so that the Pinocchio cross-check and the
+    MuJoCo/Newton-Featherstone backend comparison stay meaningful.  Link-side
+    friction, a nonlinear spring and torque ripple all break that by
+    construction, and on a rigid chain the first two have no separate link
+    side to act on anyway.
     """
     natural_frequency = config.control_frequency if natural_frequency is None else natural_frequency
     damping_ratio = config.control_damping_ratio if damping_ratio is None else damping_ratio
+    if draw is None:
+        loop = config.controller.velocity_loop
+        draw = ControllerDraw(
+            natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+            position_gain=loop.position_gain[0], velocity_bandwidth=loop.velocity_bandwidth[0],
+            integral_time=loop.integral_time[0],
+        )
+    natural_frequency, damping_ratio = draw.natural_frequency, draw.damping_ratio
+    extras = NO_EXTRAS if extras is None else extras
     n_dof = len(asset.joint_names)
     view = {"visualize": config.visualize, "realtime_scale": config.realtime_scale}
     probe_top_hz = float(trajectory.metadata.get("probe_top_hz", 0.0))
@@ -930,18 +1195,27 @@ def run_condition(
             )
 
     with payload_asset(asset, payload) as asset_p:
+        # What the controller is allowed to know.  `asset` here is always the
+        # bare, payload-free asset; `asset_p` is the plant.
+        nominal_asset = asset_p if config.controller.nominal.knows_payload else asset
         if tier.is_rigid:
+            if not extras.is_empty:
+                raise ValueError(
+                    "simulation.plant_extras cannot be applied to the rigid reference tier "
+                    "(its recorded torque must stay consistent with rnea(achieved state) for the "
+                    "Pinocchio and backend cross-checks); set rigid_reference: false or drop the extras"
+                )
             _check_control_rate(config.rigid_time_step)
-            controller = ComputedTorqueController(
-                asset_p, trajectory, friction=friction,
-                natural_frequency=natural_frequency,
-                damping_ratio=damping_ratio,
+            controller = build_controller(
+                config.controller, draw, asset=asset_p, nominal_asset=nominal_asset,
+                trajectory=trajectory, friction=friction,
             )
             runner = run_mujoco_torque if backend == "mujoco" else run_newton_torque
             result = runner(asset_p, trajectory, controller, time_step=config.rigid_time_step,
                             friction=friction, control_decimation=config.control_decimation, **view)
             result.update(transmission=None, time_step=config.rigid_time_step, payload=payload,
-                         natural_frequency=natural_frequency, damping_ratio=damping_ratio)
+                         natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+                         controller_draw=draw, extras=NO_EXTRAS)
             return result
         if link_inertia is None:
             link_inertia = link_inertia_envelope(
@@ -951,16 +1225,23 @@ def run_condition(
         transmission = tier.transmission(n_dof, link_inertia)
         time_step = elastic_time_step(transmission, config)
         _check_control_rate(time_step)
-        controller = SeaMotorController(
-            asset_p, trajectory, transmission, friction=friction,
-            natural_frequency=natural_frequency,
-            damping_ratio=damping_ratio,
+        controller = build_controller(
+            config.controller, draw, asset=asset_p, nominal_asset=nominal_asset,
+            trajectory=trajectory, friction=friction, transmission=transmission,
+            # The PD and velocity-loop gains are sized from a nominal inertia.
+            # A payload-*unaware* controller must not get it from the
+            # payload-fitted envelope: that would hand it the payload back
+            # through its gains.  Passing None makes `build_controller` derive
+            # it from the nominal asset instead.
+            joint_inertia=link_inertia[0] if config.controller.nominal.knows_payload else None,
         )
         runner = run_mujoco_elastic_torque if backend == "mujoco" else run_newton_elastic_torque
         result = runner(asset_p, trajectory, controller, transmission, time_step=time_step,
-                        friction=friction, control_decimation=config.control_decimation, **view)
+                        friction=friction, control_decimation=config.control_decimation,
+                        extras=extras, **view)
         result.update(transmission=transmission, time_step=time_step, payload=payload,
-                     natural_frequency=natural_frequency, damping_ratio=damping_ratio)
+                     natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+                     controller_draw=draw, extras=extras)
         return result
 
 
@@ -1073,14 +1354,26 @@ def rollout_frame(
     friction: FrictionModel,
     resample_step: float,
     split: str = "train",
+    signals: SignalPolicy | None = None,
+    measurement: MeasurementModel | None = None,
+    measurement_seed: int = 0,
 ) -> pd.DataFrame:
     """Flatten one rollout onto a uniform grid in the consumer's schema.
 
     ``dynamic_model_nn`` differentiates positions with a Savitzky-Golay filter
     and only does so when the time step is uniform, so every bag is resampled
     onto the same grid regardless of the step its tier required.
+
+    ``signals`` selects which physical side ``q0..``/``dq0..`` and ``ft0..``
+    carry (``SignalPolicy``, ``R5_01`` Amendment 2); ``measurement`` applies
+    the sensor model to the recorded channels *after* resampling, since that
+    is the rate a recorder runs at and the rate ``delay_samples`` counts in.
+    Both default to round 4: the collocated link/link pair, perfect
+    instruments.
     """
     names = tuple(asset.joint_names)
+    signals = SignalPolicy() if signals is None else signals
+    measurement = IDEAL_MEASUREMENT if measurement is None else measurement
     time = np.asarray(result["time"], dtype=float)
     grid = np.arange(time[0], time[-1] + 0.5 * resample_step, resample_step)
 
@@ -1088,12 +1381,23 @@ def rollout_frame(
         values = np.asarray(values, dtype=float)
         return np.column_stack([np.interp(grid, time, values[:, i]) for i in range(values.shape[1])])
 
-    q = _on_grid(result["q_link"])
-    dq = _on_grid(result["dq_link"])
-    q_motor = _on_grid(result["q_motor"])
-    dq_motor = _on_grid(result["dq_motor"])
-    tau_motor = _on_grid(result["tau_motor"])
-    tau_link = _on_grid(result["tau_link"])
+    clean = {
+        "q_link": _on_grid(result["q_link"]),
+        "dq_link": _on_grid(result["dq_link"]),
+        "q_motor": _on_grid(result["q_motor"]),
+        "dq_motor": _on_grid(result["dq_motor"]),
+        "tau_motor": _on_grid(result["tau_motor"]),
+        "tau_link": _on_grid(result["tau_link"]),
+    }
+    measured = measure_bag(
+        measurement, seed=measurement_seed,
+        q_motor=clean["q_motor"], dq_motor=clean["dq_motor"],
+        q_link=clean["q_link"], dq_link=clean["dq_link"],
+        tau_motor=clean["tau_motor"], tau_link=clean["tau_link"],
+    )
+    q = measured.q_link if signals.position_side == "link" else measured.q_motor
+    dq = measured.dq_link if signals.position_side == "link" else measured.dq_motor
+    target = measured.tau_link if signals.target == "link_torque" else measured.tau_motor
 
     frame = pd.DataFrame({"t": grid, "bag": bag})
     for index in range(len(names)):
@@ -1101,19 +1405,33 @@ def rollout_frame(
     for index in range(len(names)):
         frame[f"dq{index}"] = dq[:, index]
     for index in range(len(names)):
-        frame[f"tau{index}"] = tau_motor[:, index]
-    # The learning target: link-side generalized force, one channel per joint.
+        frame[f"tau{index}"] = measured.tau_motor[:, index]
+    # The learning target: whichever side `signals.target` names, one channel
+    # per joint.  Its physical meaning is in the contract sidecar.
     for index in range(len(names)):
-        frame[f"ft{index}"] = tau_link[:, index]
+        frame[f"ft{index}"] = target[:, index]
     for index in range(len(names)):
-        frame[f"q_motor{index}"] = q_motor[:, index]
-        frame[f"dq_motor{index}"] = dq_motor[:, index]
-        frame[f"q_link{index}"] = q[:, index]
-        frame[f"dq_link{index}"] = dq[:, index]
+        frame[f"q_motor{index}"] = measured.q_motor[:, index]
+        frame[f"dq_motor{index}"] = measured.dq_motor[:, index]
+        frame[f"q_link{index}"] = measured.q_link[:, index]
+        frame[f"dq_link{index}"] = measured.dq_link[:, index]
     # Direct readout of the transmission deflection tau/k -- the cleanest
     # target for identifying the elastic parameters themselves (R3_01 Sec 3).
+    # Taken from the *measured* positions, so it is the deflection an observer
+    # could actually compute; the clean columns below hold the true one.
     for index in range(len(names)):
-        frame[f"defl{index}"] = q_motor[:, index] - q[:, index]
+        frame[f"defl{index}"] = measured.q_motor[:, index] - measured.q_link[:, index]
+    if signals.clean_columns:
+        # The exact simulator values on the same grid.  A noisy dataset is only
+        # decomposable into physics and instrument if these survive (R5_00
+        # Sec 6.2); they are debug columns and never model inputs.  The
+        # reference is one of them: it is not a measurable signal at all, but
+        # tracking error is the headline difference between controller modes and
+        # a diagnostic reading a written file cannot recover it otherwise.
+        clean = dict(clean, q_ref=_on_grid(result["q_ref"]), dq_ref=_on_grid(result["dq_ref"]))
+        for key, values in clean.items():
+            for index in range(len(names)):
+                frame[f"{key}_clean{index}"] = values[:, index]
     frame["experiment"] = bag
     frame["tier"] = tier.name
     frame["backend"] = backend
@@ -1136,8 +1454,28 @@ def rollout_frame(
     frame["exc_max_acceleration"] = exc_metadata.get("max_acceleration")
     frame["exc_velocity_fraction"] = exc_metadata.get("velocity_fraction")
     frame["exc_probe_top_hz"] = exc_metadata.get("probe_top_hz", 0.0)
-    frame["control_natural_frequency"] = result.get("natural_frequency")
-    frame["control_damping_ratio"] = result.get("damping_ratio")
+    draw: ControllerDraw | None = result.get("controller_draw")
+    if draw is None:
+        frame["control_natural_frequency"] = result.get("natural_frequency")
+        frame["control_damping_ratio"] = result.get("damping_ratio")
+    else:
+        for column, value in draw.as_dict().items():
+            frame[column] = value
+    if not measurement.is_ideal:
+        # The per-bag calibration errors, so a consumer or a diagnostic can
+        # tell a gain error from a modelling error.
+        for index, name in enumerate(names):
+            frame[f"gain_motor__{name}"] = measured.gain_motor[index]
+            frame[f"gain_link__{name}"] = measured.gain_link[index]
+    extras: PlantExtras | None = result.get("extras")
+    if extras is not None and not extras.is_empty:
+        link_friction = extras.link_friction
+        for index, name in enumerate(names):
+            frame[f"link_viscous__{name}"] = 0.0 if link_friction is None else link_friction.viscous[index]
+            frame[f"link_coulomb__{name}"] = 0.0 if link_friction is None else link_friction.coulomb[index]
+        ripple = extras.torque_ripple
+        frame["ripple_amplitude"] = 0.0 if ripple is None else float(ripple.amplitude)
+        frame["ripple_order"] = np.nan if ripple is None else float(ripple.order)
     return frame
 
 
@@ -1184,6 +1522,14 @@ def raise_on_control_separation_violation(
     )
 
 
+def _feedback_ratio(feedforward: np.ndarray, feedback: np.ndarray) -> float | None:
+    """``mean|feedback| / mean|feedforward|``, or ``None`` when there is no feedforward."""
+    reference = float(np.mean(np.abs(np.asarray(feedforward, dtype=float))))
+    if reference <= 0.0:
+        return None
+    return float(np.mean(np.abs(np.asarray(feedback, dtype=float))) / reference)
+
+
 def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Execute one bag and return ``(frame, record)``.
 
@@ -1200,13 +1546,19 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     (asset, trajectory, tier, backend, friction, config, link_inertia, payload,
      split, bag, bag_index, traj_index, friction_index, control_gains, link_inertia_max_value,
-     separation_ratio, separation_joint) = args
+     separation_ratio, separation_joint, draw, extras) = args
     natural_frequency, damping_ratio = control_gains
     result = run_condition(asset, trajectory, tier, backend, friction, config,
                            link_inertia=link_inertia, payload=payload,
-                           natural_frequency=natural_frequency, damping_ratio=damping_ratio)
+                           natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+                           draw=draw, extras=None if tier.is_rigid else extras)
     frame = rollout_frame(asset, trajectory, result, bag=bag, tier=tier, backend=backend,
-                          friction=friction, resample_step=config.sample_time_step, split=split)
+                          friction=friction, resample_step=config.sample_time_step, split=split,
+                          signals=config.signals, measurement=config.measurement,
+                          # Keyed on the bag index, so a bag's noise is the same
+                          # however many bags ran before it and whatever the
+                          # worker order (R4_10 Sec 2.3's reproducibility rule).
+                          measurement_seed=config.seed + 1_000_003 * bag_index)
     # Effort limits come from the bare asset's URDF <limit effort=...> tags,
     # unaffected by payload injection (a payload changes link inertia, not
     # the motor's rated torque) -- a payload heavy/offset enough, combined
@@ -1242,12 +1594,15 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
         "exc_probe_top_hz": float(trajectory.metadata.get("probe_top_hz", 0.0)),
         "control_natural_frequency": float(natural_frequency),
         "control_damping_ratio": float(damping_ratio),
+        "controller": describe_controller(config.controller, draw),
+        "plant_extras": None if extras is None or extras.is_empty or tier.is_rigid else extras.describe(),
         "viscous": friction.viscous.tolist(), "coulomb": friction.coulomb.tolist(),
         "tracking_rms": float(np.sqrt(np.mean((np.asarray(result["q_link"]) - np.asarray(result["q_ref"])) ** 2))),
         "max_deflection": float(np.abs(np.asarray(result["q_motor"]) - np.asarray(result["q_link"])).max()),
-        "feedback_ratio": float(
-            np.mean(np.abs(result["tau_feedback"])) / max(np.mean(np.abs(result["tau_feedforward"])), 1e-12)
-        ),
+        # None rather than a number divided by ~zero: a model-free PD
+        # controller has no feedforward at all, and a ratio of 1e12 would read
+        # as a measurement rather than as "not applicable" (R5_02 Sec 2).
+        "feedback_ratio": _feedback_ratio(result["tau_feedforward"], result["tau_feedback"]),
         "peak_torque_ratio": peak_torque_ratio,
         "control_separation_min_ratio": separation_ratio,
         "control_separation_joint": separation_joint,
@@ -1301,6 +1656,13 @@ class ResolvedBag:
     natural_frequency: float
     damping_ratio: float
     trajectory: MaterializedTrajectory
+    # Round 5: the full controller draw (the two gains above plus the
+    # velocity loop's three) and the bag's plant extras.  Kept on the same
+    # object so that `run_identification_simulation.py` reproduces a bag's
+    # controller by calling `resolve_bag`, exactly as it already reproduces
+    # its trajectory and regime.
+    draw: ControllerDraw | None = None
+    extras: PlantExtras | None = None
 
 
 def resolve_bag(
@@ -1337,6 +1699,14 @@ def resolve_bag(
     natural_frequency, damping_ratio = sample_control_gains(
         config.control_gains, config.control_frequency, config.control_damping_ratio, config.seed, traj_seed,
     )
+    position_gain, velocity_bandwidth, integral_time = sample_velocity_loop(
+        config.controller, config.seed, traj_seed,
+    )
+    draw = ControllerDraw(
+        natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+        position_gain=position_gain, velocity_bandwidth=velocity_bandwidth, integral_time=integral_time,
+    )
+    extras = plant_extras_for_bag(config.plant_extras, len(asset.joint_names), config.seed, traj_seed)
 
     stack = contextlib.ExitStack()
     try:
@@ -1352,7 +1722,7 @@ def resolve_bag(
         stack.close()
 
     return ResolvedBag(payload=payload, excitation=excitation, natural_frequency=natural_frequency,
-                       damping_ratio=damping_ratio, trajectory=trajectory)
+                       damping_ratio=damping_ratio, trajectory=trajectory, draw=draw, extras=extras)
 
 
 def generate(
@@ -1461,6 +1831,8 @@ def generate(
 
     trajectories: dict[tuple[str, int], MaterializedTrajectory] = {}
     control_gains: dict[tuple[str, int], tuple[float, float]] = {}
+    controller_draws: dict[tuple[str, int], ControllerDraw] = {}
+    bag_extras: dict[tuple[str, int], PlantExtras] = {}
     try:
         for tier in (config.tiers if config.trajectories_per_robot else config.tiers[:1]):
             key = tier.name if config.trajectories_per_robot else ""
@@ -1480,6 +1852,8 @@ def generate(
                 resolved = resolve_bag(config, asset, tier, index, payload, kinematics_for=_kinematics_for)
                 trajectories[(key, index)] = resolved.trajectory
                 control_gains[(key, index)] = (resolved.natural_frequency, resolved.damping_ratio)
+                controller_draws[(key, index)] = resolved.draw
+                bag_extras[(key, index)] = resolved.extras
                 if verbose:
                     metadata = resolved.trajectory.metadata
                     label = f"trajectory {index}" + (f" for {tier.name}" if config.trajectories_per_robot else "")
@@ -1531,17 +1905,34 @@ def generate(
                 validated[key] = True
             link_inertia_for_bag = _envelope_for(payload) if not tier.is_rigid else None
             link_inertia_max_for_bag = _envelope_max_for(payload) if not tier.is_rigid else None
-            gains = control_gains[(tier.name if config.trajectories_per_robot else "", traj_index)]
+            resolved_key = (tier.name if config.trajectories_per_robot else "", traj_index)
+            gains = control_gains[resolved_key]
+            draw = controller_draws[resolved_key]
+            extras = bag_extras[resolved_key]
             separation_ratio = separation_joint = None
             if not tier.is_rigid:
                 separation_ratio, separation_joint = control_separation_for_bag(
-                    asset, tier, link_inertia_for_bag, link_inertia_max_for_bag, gains[0],
+                    asset, tier, link_inertia_for_bag, link_inertia_max_for_bag,
+                    # The bandwidth to separate from the transmission mode is
+                    # the *fastest* loop the controller closes, which for
+                    # `velocity_pi` is the drive's inner velocity loop and not
+                    # the error-dynamics frequency (R5_02 Sec 2.4).
+                    effective_bandwidth(config.controller, draw),
                 )
-                if separation_ratio < config.control_separation.min_ratio:
+                # The bound exists because `SeaMotorController`'s feedback
+                # linearization and the plant's own transmission mode have to
+                # separate in frequency.  A model-free loop does no
+                # linearization, and a real drive's velocity loop genuinely
+                # does sit near the transmission mode -- that is why a real
+                # series-elastic platform rings.  So the ratio is still
+                # computed and recorded for every bag, but only enforced where
+                # its rationale applies (R5_02 Sec 2.4).
+                if (separation_ratio < config.control_separation.min_ratio
+                        and not config.controller.is_model_free):
                     offending.append((bag, separation_ratio, separation_joint))
             work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, payload,
                         split, bag, bag_index, traj_index, friction_index, gains, link_inertia_max_for_bag,
-                        separation_ratio, separation_joint))
+                        separation_ratio, separation_joint, draw, extras))
     finally:
         kinematics_stack.close()
 
@@ -1573,6 +1964,9 @@ def generate(
 
     below = [r for r in records if r["control_separation_min_ratio"] is not None
              and r["control_separation_min_ratio"] < config.control_separation.min_ratio]
+    if below and config.controller.is_model_free:
+        # Recorded, not warned about: see the enforcement comment above.
+        below = []
     if below:
         worst = min(below, key=lambda r: r["control_separation_min_ratio"])
         message = (f"{len(below)}/{len(records)} bags have a control/transmission separation ratio "
@@ -1622,6 +2016,10 @@ def generate(
         "joint_names": list(asset.joint_names),
         "sample_time_step": config.sample_time_step,
         "control_decimation": config.control_decimation,
+        "controller": describe_controller(config.controller),
+        "measurement": config.measurement.describe(),
+        "signals": config.signals.describe(),
+        "plant_extras": None if config.plant_extras.is_empty else asdict(config.plant_extras),
         "seed": config.seed,
         "trajectories_per_robot": config.trajectories_per_robot,
         "distinct_trajectories": len(trajectories),
@@ -1639,8 +2037,11 @@ def generate(
             "stiffness": list(config.transmission.stiffness_provenance) or None,
             "rotor_inertia": list(config.transmission.rotor_inertia_provenance) or None,
         },
-        "target": "ft0..ft{n-1} = link-side joint torque [Nm]",
-        "input": "q0..q{n-1} [rad], dq0..dq{n-1} [rad/s], tau0..tau{n-1} = applied motor torque [Nm]",
+        "target": f"ft0..ft{{n-1}} = {_TARGET_SEMANTICS[config.signals.target]}",
+        "input": (
+            f"q0..q{{n-1}}, dq0..dq{{n-1}} = {config.signals.position_side}-side position and velocity; "
+            "tau0..tau{n-1} = commanded motor torque (motor effort)"
+        ),
         "split": {
             "mode": config.split.mode,
             "train": sorted(name for name, label in split_labels.items() if label == "train"),
@@ -1657,9 +2058,18 @@ def generate(
     return frame, manifest, comparison
 
 
+#: Physical meaning of each ``dataset.signals.target`` choice, for the
+#: manifest and the consumer contract.
+_TARGET_SEMANTICS = {
+    "link_torque": "link-side joint torque [Nm]",
+    "motor_torque": "motor-side (commanded) joint torque [Nm]",
+}
+
 _METADATA_COLUMN_PREFIXES = (
     "viscous__", "coulomb__", "stiffness__", "damping__", "damping_ratio__", "rotor_inertia__",
     "payload_", "exc_",
+    # Round 5, same reasoning: one value per bag repeated on every row.
+    "gain_motor__", "gain_link__", "link_viscous__", "link_coulomb__", "ripple_",
 )
 
 
@@ -1724,7 +2134,16 @@ def write_dataset(
         # wrench) instead of pattern-matching target_columns' string form
         # (R3_14 Sec 2).
         "target_kind": "per_joint_torque",
-        "target_semantics": "link-side joint torque [Nm]",
+        "target_semantics": _TARGET_SEMANTICS[str((manifest.get("signals") or {}).get("target", "link_torque"))],
+        # Which side of the spring each column is measured on.  A consumer
+        # comparing an elastic model class against a residual one needs this:
+        # on a collocated pair the link equation has no elastic term at all,
+        # so the comparison measures input availability rather than elasticity
+        # (R5_01 Sec 3, R5_00 Amendment 1).
+        "signals": manifest.get("signals"),
+        "input_semantics": manifest.get("input"),
+        "measurement": manifest.get("measurement"),
+        "controller": manifest.get("controller"),
         "requires_consumer": "dynamic_model_nn dataset.py with the general ft0..ft{dof-1} branch",
         "split": manifest.get("split"),
     }

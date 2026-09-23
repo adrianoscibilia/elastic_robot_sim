@@ -24,7 +24,7 @@ import time as time_module
 
 import numpy as np
 
-from .assets import AssetSpec, load_asset_spec
+from .assets import AssetSpec, load_asset_spec, lock_inactive_one_dof_joints
 from .materialized import MaterializedTrajectory
 from .scene import normalize_inertial_frames
 from .serial_trajectory import SerialArmTrajectory, SerialTrajectoryConfig, trajectory_evaluator
@@ -957,6 +957,11 @@ def _loader_urdf(asset: AssetSpec):
     from xml.etree import ElementTree as ET
 
     text = ET.tostring(normalize_inertial_frames(ET.fromstring(text)), encoding="unicode")
+    # A 1-DoF joint the asset does not declare active is not part of the
+    # robot being simulated: left free it would swing under gravity as an
+    # uncommanded degree of freedom (R5_01 Sec 1.2).  A no-op for every asset
+    # whose active_joints cover all of them.
+    text, _locked = lock_inactive_one_dof_joints(text, asset.joint_names)
 
     def replace_mesh(match: re.Match[str]) -> str:
         try:
@@ -978,15 +983,14 @@ def _loader_urdf(asset: AssetSpec):
 
 
 def _expand_simple_xacro_text(xml_text: str) -> str:
-    """Expand the arithmetic-only xacro subset used by fmrr_tecnobody."""
-    from .assets import _xacro_float
-    text = re.sub(r"<\?xacro[^>]*\?>", "", xml_text)
-    pattern = re.compile(r'<xacro:property\s+name\s*=\s*"([^"]+)"\s+value\s*=\s*"([^"]+)"\s*/?>')
-    properties: dict[str, float] = {}
-    for name, value in pattern.findall(text):
-        properties[name] = _xacro_float(value, properties)
-    text = pattern.sub("", text)
-    return re.sub(r"\$\{([^}]+)\}", lambda match: f"{_xacro_float(match.group(1), properties):.12g}", text)
+    """Expand the arithmetic-only xacro subset used by fmrr_tecnobody.
+
+    Kept as a thin alias: ``elastic_sim.assets`` owns the expansion so that
+    Pinocchio (``identification.build_model``) uses the very same one.
+    """
+    from .assets import expand_simple_xacro_text
+
+    return expand_simple_xacro_text(xml_text)
 
 
 def _ensure_collision_geometry(xml_text: str) -> str:

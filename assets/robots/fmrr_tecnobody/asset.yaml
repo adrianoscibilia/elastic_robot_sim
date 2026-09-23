@@ -2,7 +2,15 @@ schema_version: 1
 name: fmrr_tecnobody
 manufacturer: Tecnobody
 urdf: description/fmrr_tecnobody.urdf
-active_joints: [joint_x, joint_y, joint_z]
+# Kinematic-chain order: the y carriage carries the x beam, which carries the
+# z column (base_link -> joint_y -> link1 -> joint_x -> link2 -> joint_z).
+# The identification stack requires the declared order to equal the URDF's
+# chain order, because that is the order Pinocchio builds and it cannot be
+# permuted (elastic_sim.identification.build_model).  Every consumer derives
+# its column order from this list, so sim and real recordings stay aligned;
+# `ros.sensor.flange_to_link_side_axes` is a sensor-axis permutation, not a
+# joint one, and is unaffected (R5_02 Sec 5).
+active_joints: [joint_y, joint_x, joint_z]
 base:
   position: [0.0, 0.0, 0.0]
   quaternion: [0.0, 0.0, 0.0, 1.0]

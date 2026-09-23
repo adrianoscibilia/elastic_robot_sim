@@ -557,16 +557,20 @@ One row per sample, consumed directly by `dynamic_model_nn`'s `CustomDataset`.
 |---|---|
 | `t` | strictly increasing within a bag, uniform step |
 | `bag` | one trajectory under one condition |
-| `q0..q{n-1}` | link-side joint position [rad] |
-| `dq0..dq{n-1}` | link-side joint velocity [rad/s] |
-| `tau0..tau{n-1}` | applied **motor-side** torque [Nm] — model input |
-| `ft0..ft{n-1}` | **link-side** torque [Nm] — training target |
+| `q0..q{n-1}` | joint position, on the side `dataset.signals.position_side` names (default `link`) [rad] |
+| `dq0..dq{n-1}` | joint velocity, same side [rad/s] |
+| `tau0..tau{n-1}` | commanded **motor-side** torque [Nm] — model input |
+| `ft0..ft{n-1}` | training target, on the side `dataset.signals.target` names (default `link_torque`) [Nm] |
 | `q_motor*`, `dq_motor*`, `q_link*`, `dq_link*` | ingested, available to elastic models |
 | `defl0..defl{n-1}` | `q_motor - q_link` [rad] — Map C target, direct readout of `tau / k` |
 | `split` | `"train"`, `"val"` or `"test"`, one label per bag (see below) |
 | `payload_mass`, `payload_offset_x/y/z`, `payload_size` | the fitted tool, constant within a bag, `NaN` on the rigid tier |
 | `exc_base_frequency`, `exc_max_acceleration`, `exc_velocity_fraction`, `exc_probe_top_hz` | this bag's realized excitation regime (see "Per-trajectory regime randomization" below); constant within a bag |
 | `control_natural_frequency`, `control_damping_ratio` | this bag's realized closed-loop gain (see "The closed-loop finding" above); constant within a bag, equal to `simulation.control_frequency`/`control_damping_ratio` unless `simulation.control_gains.enabled` |
+| `control_position_gain`, `control_velocity_bandwidth`, `control_integral_time` | this bag's realized velocity-loop gains, when `simulation.controller.mode: velocity_pi`; held at the spec's own value under every other mode so a cross-mode comparison reads one schema |
+| `*_clean{i}` (`q_link_clean*`, `tau_link_clean*`, `q_ref_clean*`, …) | the exact simulator values on the same grid, written only when `dataset.signals.clean_columns` is set; debug/diagnostic columns, never model inputs |
+| `gain_motor__<joint>`, `gain_link__<joint>` | this bag's torque calibration errors, written only when a sensor model is configured |
+| `link_viscous__<joint>`, `link_coulomb__<joint>`, `ripple_amplitude`, `ripple_order` | this bag's link-side plant extras, written only when configured |
 | `tier`, `backend`, `experiment`, `viscous__<joint>`, `coulomb__<joint>`, `stiffness__<joint>`, `damping__<joint>`, `damping_ratio__<joint>`, `rotor_inertia__<joint>` | metadata, ignored by the loader; transmission columns are empty on rigid bags |
 
 Per bag, the manifest's `records` entries additionally carry
@@ -592,6 +596,74 @@ Bags are written with trajectory varying slowest and backend fastest, so
 consecutive bags differ by condition rather than by regime; that ordering is
 independent of `split`, which is assigned explicitly per bag (see below) and
 does not depend on file position.
+
+### Round 5: which signals, which controller, which instrument
+
+Four config blocks decide what a dataset *means*, independently of the robot.
+Every one of them defaults to round 4's behaviour, so an existing config keeps
+producing the dataset it produced before.
+
+| Block | What it chooses | Default |
+|---|---|---|
+| `dataset.signals` | which side of the spring `q0..`/`ft0..` are measured on | `link` / `link_torque` (collocated) |
+| `simulation.controller` | `exact_ct`, `nominal_ct`, `pd_gravity`, `pd` or `velocity_pi` | `exact_ct` |
+| `simulation.measurement` | encoder quantization, noise, torque gain error, delay | perfect instruments |
+| `simulation.plant_extras` | link-side friction, a nonlinear spring, torque ripple | none (a purely Lagrangian link side) |
+
+**The signal pair is the load-bearing one.** A dataset that pairs *link*
+position with *link* torque carries no elastic signature at all, however soft
+the robot is: the link equation gives `tau_s = M(q) qdd + c + g` exactly, with
+the spring nowhere in it. Elasticity only appears when position and torque are
+read on opposite sides of the transmission — motor position with link torque,
+which is what the round-5 configs (`fmrr_tecnobody.yaml`,
+`ur10_table_round5.yaml`) set and what the three real platforms actually
+expose. Every dataset records the choice in its `.contract.json`, with a
+`collocated` flag, so a consumer comparing an elastic model class against a
+residual one can tell whether the comparison is meaningful before training
+anything.
+
+**The controller decides what `tau_cmd` is worth.** Exact computed torque
+knows the plant, including its payload, so the commanded torque, the state and
+the target are all near-exact functions of the same reference: many different
+decompositions fit equally well and which one training lands on is arbitrary.
+The other four modes break that on purpose; `velocity_pi` — a model-free outer
+position loop over a PI velocity loop whose gains are drawn per bag — is the
+one that has a counterpart on all three platforms.
+
+`scripts/diagnose_controller_modes.py` measures the difference without
+training anything: the collinearity of `tau_cmd` with the state regressor, the
+conditioning of the achieved motion, the decomposition of what the nominal
+rigid model leaves unexplained, probe-band content, and the deflection's
+signal-to-noise. Run it before generating a production dataset with a new
+controller or a new probe band.
+
+```bash
+uv run python scripts/diagnose_controller_modes.py --generate     --config config/identification/fmrr_tecnobody.yaml     --modes exact_ct velocity_pi --trajectories 2 --robots 3     --out reports/round5/qc_fmrr
+```
+
+Plant extras are rejected on the **rigid reference tier**: that tier's torque
+has to keep satisfying `rnea(achieved state)` for the Pinocchio cross-check and
+the MuJoCo/Newton-Featherstone comparison to mean anything.
+
+### Other assets: FMRR (3-axis Cartesian gantry)
+
+`config/identification/fmrr_tecnobody.yaml` runs the same stack on the
+Tecnobody FMRR platform. Three things differ structurally:
+
+- **Units are metres and newtons** — every axis is prismatic, so "stiffness"
+  is N/m and "rotor inertia" a reflected mass in kg.
+- **No table**: FMRR is its own gantry scene, so `--asset fmrr_tecnobody`
+  needs no `compose_scene_urdf.py` step.
+- **The mass matrix is constant and diagonal** (2.0, 1.2, 1.0 kg) and gravity
+  loads the z axis alone, which makes it the family's analytic test case.
+
+Two generic features were needed to bring it in, both no-ops elsewhere: the
+arithmetic-only xacro subset is expanded before Pinocchio sees the URDF, and
+every 1-DoF joint the asset does not declare active (FMRR's `joint_yaw`) is
+locked to `fixed` in all three consumers — Pinocchio, MuJoCo and Newton — so
+they simulate the same robot. Its `active_joints` are declared in the URDF's
+kinematic-chain order `[joint_y, joint_x, joint_z]`, which Pinocchio builds
+and cannot permute.
 
 ### Splits
 

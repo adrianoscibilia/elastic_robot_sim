@@ -32,6 +32,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(_REPO / "src"))
 
 from elastic_sim.assets import AssetRegistry, load_asset_spec
+from elastic_sim.controllers import CONTROLLER_MODES
 from elastic_sim.dataset import DEFAULT_CONFIG, build_tiers, generate, load_config, write_dataset
 
 
@@ -67,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-acceleration", type=float, default=None)
     parser.add_argument("--candidates", type=int, default=None)
     parser.add_argument("--control-frequency", type=float, default=None)
+    parser.add_argument("--controller-mode", default=None, choices=list(CONTROLLER_MODES),
+                        help="Override simulation.controller.mode (R5_00 Sec 6.1); everything else in the "
+                             "config is untouched, so two runs differing only in this flag differ only in "
+                             "their controller")
+    parser.add_argument("--position-side", default=None, choices=("link", "motor"),
+                        help="Override dataset.signals.position_side: which side of the spring q0../dq0.. are")
+    parser.add_argument("--clean-columns", action="store_true",
+                        help="Also write the exact simulator values as *_clean columns (debug/diagnostics)")
     parser.add_argument("--sample-step", type=float, default=None, help="Output sampling step [s]")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output", default=None)
@@ -170,6 +179,15 @@ def resolve_config(args: argparse.Namespace, parser: argparse.ArgumentParser):
         excitation=excitation,
         candidates=args.candidates or config.candidates,
         control_frequency=args.control_frequency or config.control_frequency,
+        # replace(), never a from-scratch ControllerSpec/SignalPolicy: same
+        # silent-field-drop class as the excitation reconstruction above.
+        controller=(config.controller if args.controller_mode is None
+                    else replace(config.controller, mode=args.controller_mode)),
+        signals=replace(
+            config.signals,
+            position_side=args.position_side or config.signals.position_side,
+            clean_columns=bool(args.clean_columns) or config.signals.clean_columns,
+        ),
         sample_time_step=sample_step,
         output=args.output or config.output,
         visualize=bool(args.visualize) or config.visualize,

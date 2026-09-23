@@ -16,13 +16,15 @@ parameters, so any recovery check has to be posed in the base space.
 
 from __future__ import annotations
 
+import contextlib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from .assets import AssetSpec
+from .assets import AssetSpec, expand_simple_xacro_text, lock_inactive_one_dof_joints
 
 # Velocity below which Coulomb friction is blended through zero.  A hard sign
 # makes the feedforward torque discontinuous and excites the integrator at
@@ -64,19 +66,84 @@ class FrictionModel:
         return cls(np.asarray(viscous), np.asarray(coulomb))
 
 
+@contextlib.contextmanager
+def pinocchio_urdf(asset: AssetSpec):
+    """Yield a plain-URDF path Pinocchio can parse for ``asset``.
+
+    The asset's own file is handed straight back when it needs no rewriting,
+    which is every asset whose description is plain URDF and whose
+    ``active_joints`` already cover every 1-DoF joint.  Otherwise a temporary
+    copy is materialized with
+
+    * the arithmetic-only xacro subset expanded (``${beam_lenght/2}``,
+      ``${PI}``: Pinocchio's parser rejects them where the MuJoCo/Newton
+      materializers expand them, R5_01 Sec 1.1), and
+    * every non-active 1-DoF joint locked to ``fixed`` -- the reduced model of
+      R5_01 Sec 1.2, and exactly the same rewrite both simulator
+      materializers apply, so all three consumers see one robot.
+
+    Mesh references are left untouched: Pinocchio's kinematics and dynamics
+    come from the ``<inertial>`` tags, and ``buildModelFromUrdf`` without a
+    geometry model never opens a mesh file.
+    """
+    text = Path(asset.urdf_path).read_text(encoding="utf-8")
+    rewritten = text
+    if "${" in rewritten or "<?xacro" in rewritten:
+        rewritten = expand_simple_xacro_text(rewritten)
+    rewritten, _locked = lock_inactive_one_dof_joints(rewritten, asset.joint_names)
+    if rewritten == text:
+        yield Path(asset.urdf_path).resolve()
+        return
+    with tempfile.TemporaryDirectory(prefix="elastic_pinocchio_urdf_") as directory:
+        path = Path(directory) / Path(asset.urdf_path).name
+        path.write_text(rewritten, encoding="utf-8")
+        yield path
+
+
 def build_model(asset: AssetSpec) -> tuple[Any, Any, Any]:
     """Return ``(pinocchio, model, data)`` for an asset's URDF."""
     import pinocchio as pin
 
-    model = pin.buildModelFromUrdf(str(Path(asset.urdf_path).resolve()))
+    with pinocchio_urdf(asset) as urdf_path:
+        model = pin.buildModelFromUrdf(str(urdf_path))
     expected = tuple(asset.joint_names)
     present = tuple(model.names[index] for index in range(1, model.njoints))
     if present != expected:
         raise ValueError(
             f"Asset {asset.name!r} active joints {expected} do not match the "
-            f"Pinocchio joint order {present}; identification assumes they agree"
+            f"Pinocchio joint order {present}; identification assumes they agree. "
+            "Pinocchio's order is the URDF's kinematic-chain order and cannot be "
+            f"permuted, so declare active_joints as {list(present)} in the asset YAML "
+            "(every consumer takes its column order from that list, so sim and real "
+            "recordings stay aligned)"
         )
     return pin, model, model.createData()
+
+
+def scale_model_inertias(pin: Any, model: Any, scale: float) -> tuple[Any, Any]:
+    """Return ``(model, data)`` with every body's spatial inertia scaled.
+
+    This is how a *nominal* controller's model is made wrong by a known factor
+    (``simulation.controller.nominal.inertia_scale``, R5_00 Sec 5.4 item 2):
+    a commissioned controller carries link masses from a datasheet or a CAD
+    export, not the arm's own, and the error is systematic rather than
+    per-link.  A scale of exactly one returns the model untouched, so the
+    default costs nothing.
+
+    Both the mass and the rotational inertia are scaled and the centre of mass
+    is left alone, which is a uniform density error -- the tensor scales with
+    the mass, so ``rnea`` and ``computeGeneralizedGravity`` on the result are
+    the same robot ``scale`` times heavier, not a differently-shaped one.
+    """
+    if float(scale) == 1.0:
+        return model, model.createData()
+    scaled = model.copy()
+    for index in range(1, scaled.njoints):
+        inertia = scaled.inertias[index]
+        scaled.inertias[index] = pin.Inertia(
+            inertia.mass * float(scale), inertia.lever, inertia.inertia * float(scale)
+        )
+    return scaled, scaled.createData()
 
 
 def inverse_dynamics(

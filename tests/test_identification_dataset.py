@@ -1473,6 +1473,9 @@ _PROVENANCE_SECTIONS: dict[str, tuple[str, dict[str, str]]] = {
             "wrist_2_joint": "wrist_2", "wrist_3_joint": "wrist_3",
         },
     ),
+    # Round 5: the FMRR gantry's own section.  Joint names are already the
+    # labels, so the alias map is empty (R5_02 Sec 3).
+    "fmrr_tecnobody": ("fmrr_tecnobody", {}),
 }
 
 

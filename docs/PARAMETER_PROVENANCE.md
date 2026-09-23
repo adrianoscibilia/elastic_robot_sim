@@ -84,6 +84,29 @@ iiwa), so if anything its ratio should be higher, nearer the nominal, not
 lower. The size inference from the URDF effort limit is the weakest link in
 this chain and is the first thing "Measurements pending" below should close.
 
+## fmrr_tecnobody
+
+Joint labels are the URDF joint names, in the kinematic-chain order the asset
+declares (`joint_y` carries `joint_x`, which carries `joint_z`). Every axis is
+**prismatic**, so stiffness is N/m and "rotor inertia" is a reflected **mass**
+in kg. Unlike both arms, the stiffness nominals here are not datasheet
+readings: they are the values a sim2real calibration against the real platform
+converged on (`config/assets/fmrr_tecnobody_elastic.yaml`, carried over from
+the legacy Newton work), which is why the factor is `r = 2` rather than the
+UR10's `r = 3`.
+
+| Joint | Parameter | Nominal | Factor | Class | Source | Notes |
+|---|---|---|---|---|---|---|
+| joint_y | stiffness | 7162 N/m | 2.0 | C | sim2real calibration of the real FMRR platform (legacy `elastic_cart_robot_newton.py` line, `config/assets/fmrr_tecnobody_elastic.yaml`) | fitted on this exact platform, but through a controller and a target that `R5_01 Sec 3` shows were both wrong; treated as same-class rather than published-this-robot until a re-record confirms it |
+| joint_x | stiffness | 5977 N/m | 2.0 | C | as joint_y | |
+| joint_z | stiffness | 3861 N/m | 2.0 | C | as joint_y | softest axis; carries the vertical load |
+| joint_y | rotor_inertia | 12.0 kg | 2.0 | E | first principles: ~400 W servo (`J ~ 3e-5 kg m^2`) through a 10 mm/rev ballscrew (`r = 1.59e-3 m/rad`), `J / r^2 ~ 12 kg` | **open, `R5_Q` Q-1**: the drive model and screw pitch per axis are not in either repository. Cross-check: this puts the transmission mode at 10-12 Hz, and `R5_01 Sec 2` reports ~10 Hz for the legacy platform by an independent route |
+| joint_x | rotor_inertia | 12.0 kg | 2.0 | E | as joint_y | |
+| joint_z | rotor_inertia | 12.0 kg | 2.0 | E | as joint_y | the `delta750` drive is a larger frame size than the `delta400x/y`; not yet reflected, part of Q-1 |
+| joint_y..joint_z | damping_ratio | 0.4-1.2 (interval, not nominal x factor) | - | C | the legacy platform's calibrated ratios, 0.49-1.2 (`R5_00 Sec 3`) | an order of magnitude above a harmonic drive's, as a belt/ballscrew axis is |
+| flange | payload mass | 0-2 kg (interval) | - | E | the handle beyond the F/T sensor plus the user's hand load; the real `fz` has a mean of 8.8 N, about 0.9 kg (`R5_01 Sec 5`, O-1) | on a Cartesian gantry the payload's *offset* changes no joint dynamics (a prismatic joint's gravity load is `m g . axis`, its inertia is `m`), so only the collision geometry sees it |
+| joint_y..joint_z | link-side friction | 8/6/5 N per m/s viscous, 10/8/6 N Coulomb | - | E | engineering estimate for a ballscrew and linear guide | **open, `R5_Q` Q-3**: consequential, not cosmetic -- at these values link-side friction is 96 % of the elastic tier's unexplained residual (`R5_02 Sec 6`). A measured breakaway force per axis replaces it |
+
 ## Why factor 2
 
 Harmonic-drive torsional stiffness is genuinely nonlinear. The manufacturer's
