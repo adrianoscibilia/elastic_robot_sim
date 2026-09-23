@@ -244,12 +244,24 @@
     <origin xyz="0 0 0" rpy="0 0 ${-PI/2.0}"/>
   </joint>
 
+  <!-- effort: the drive's continuous rating through the measured transmission
+       ratio, F = tau_rated / r (R5_07 T-17, derived in
+       config/identification/fmrr_tecnobody.yaml): 1.27 N.m through
+       r = 4.850e-3 m/rad on the two 400 W axes, 2.39 N.m through
+       r = 2.4237e-3 m/rad on the 750 W column.  The blanket 1000 N this
+       replaces was 4x over-generous on y and x and slightly optimistic on z.
+       The z figure is also the duty the owner described: holding a patient's
+       load statically needs of order 1000 N, and this axis delivers 986 N
+       continuously, which is the cross-check that the ratio is right.
+       Peak is roughly 3x continuous on these drives and is deliberately not
+       declared here: the excitation's feasibility check should hold against
+       what the machine can sustain, not against a burst. -->
   <joint name="joint_y" type="prismatic">
     <parent link="base_link"/>
     <child link="link1"/>
     <origin xyz="0 ${-beam_lenght/2} ${col_height/2}" rpy="${-PI/2.0} 0 ${PI}"/>
     <axis xyz="0 0 -1"/>
-    <limit lower="${-beam_lenght/2+2*radius}" upper="${beam_lenght/2-2*radius}" effort="1000" velocity="1" acceleration="0.5"/>
+    <limit lower="${-beam_lenght/2+2*radius}" upper="${beam_lenght/2-2*radius}" effort="261.9" velocity="1" acceleration="0.5"/>
   </joint>
 
   <joint name="joint_y_fixed" type="fixed">
@@ -263,7 +275,7 @@
     <child link="link2"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
     <axis xyz="0 0 1"/>
-    <limit lower="${-beam_lenght/2+2*radius}" upper="${beam_lenght/2-2*radius}" effort="1000" velocity="1" acceleration="0.5"/>
+    <limit lower="${-beam_lenght/2+2*radius}" upper="${beam_lenght/2-2*radius}" effort="261.9" velocity="1" acceleration="0.5"/>
   </joint>
 
   <joint name="joint_z" type="prismatic">
@@ -271,7 +283,7 @@
     <child link="link3"/>
     <origin xyz="0 0 0" rpy="-${PI/2.0} 0 0"/>
     <axis xyz="0 0 1"/>
-    <limit lower="${-z_height/2}" upper="${z_height/2}" effort="1000" velocity="1" acceleration="0.5"/>
+    <limit lower="${-z_height/2}" upper="${z_height/2}" effort="986.1" velocity="1" acceleration="0.5"/>
   </joint>
 
   <joint name="flange_joint" type="fixed">

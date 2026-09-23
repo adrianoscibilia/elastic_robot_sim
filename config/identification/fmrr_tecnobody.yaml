@@ -48,18 +48,48 @@ transmission:
   # Legacy platform damping ratios were 0.49-1.2 (R5_00 Sec 3) -- an order of
   # magnitude above a harmonic drive's, as a belt/ballscrew axis is.
   damping_ratio: [0.4, 1.2]
-  # Reflected motor mass [kg], applied as joint armature.  ESTIMATE, open
-  # question R5_Q Q-1: a ~400 W servo (J ~ 3e-5 kg m^2) through a 10 mm/rev
-  # ballscrew (r = 1.59e-3 m/rad) reflects J / r^2 ~ 12 kg.
-  # RE-OPENED by the CAD data (R5_04 Sec 2): the cross-check that justified this
-  # value was that it put the mode near the legacy platform's ~10 Hz, and that
-  # agreement was an artefact of the placeholder masses; with the real ones the
-  # same 12 kg gives 4.2-4.7 Hz.  The estimate is not thereby wrong, only
-  # unchecked again, and it matters more now: it is of the same order as the
-  # moved mass on the two distal axes (12 vs 16.8 and 8.9 kg), so J_eff is set
-  # by both.  The drive model and the screw or belt pitch per axis would settle
-  # it; delta400x / delta400y / delta750 suggest 400 W on two axes, 750 W on one.
-  rotor_inertia_nominal: [12.0, 12.0, 12.0]       # kg
+  # Reflected motor mass [kg], applied as joint armature.  SETTLED in pass 3
+  # (R5_Q Q-1; R5_07 Sec 2, T-17), and the uniform 12 kg it replaces was wrong
+  # by an order of magnitude on the two distal axes.
+  #
+  # The owner named the drives: Delta ASDA-A2, ECMA-C10604 (400 W) on x and y,
+  # ECMA-C10807 (750 W) on z.  The transmission ratio -- which dominates, since
+  # m_ref = J / r^2 is quadratic in it -- did not have to be guessed after all:
+  # the deployed EtherCAT configuration *is* the ratio.  From
+  # CNR-STIIMA-IRAS/Fit4Med, tecnobody_workbench/config (R5_07 Sec 2.5):
+  #
+  #   delta400x/y  0x6064 position factor  2.380734375e-8 m per count
+  #   delta750     0x6064 position factor  1.189742e-8    m per count
+  #
+  # At the ASDA-A2's 1,280,000 counts/rev that is 30.473 mm and 15.229 mm of
+  # travel per motor revolution, i.e. r = 4.850e-3 and 2.4237e-3 m/rad.  The
+  # same files' 0x606c velocity factors (5.079e-5 and 2.539e-5 m/s per 0.1 rpm,
+  # Delta's own velocity unit) give 30.474 mm and 15.234 mm independently, so
+  # two unrelated object-dictionary entries agree to 0.03 %.  The counts/rev
+  # figure is the drive's, not the machine's, which is what makes this a
+  # *measured* ratio rather than an inferred one; the stale "2 * pi / 2^17"
+  # comments beside those lines are a leftover from a rotary template and do
+  # not reproduce either factor.
+  #
+  #   m_ref = J / r^2 = 0.277e-4 / (4.850e-3)^2  =  1.18 kg   (x and y)
+  #                   = 1.13e-4  / (2.4237e-3)^2 = 19.24 kg   (z)
+  #
+  # Three consequences, all re-derived below rather than asserted:
+  #  * the distal axes' reflected mass is ~1.2 kg, not 12: it is now negligible
+  #    beside the moved mass on y and x and the mode is set by the link alone;
+  #  * z is the opposite -- 19.2 kg against 8.9 kg moved -- so its mode is set
+  #    by the *motor*, and the 750 W frame is why;
+  #  * the nominal modes move to 12.52 / 11.73 / 4.01 Hz and the sampled corners
+  #    to 2.60-24.9 Hz, which is what the widened comb below is for.
+  #
+  # Still class E, and only for the rotor inertia: Delta's specification table
+  # is behind a robots.txt block, so 0.277e-4 / 1.13e-4 kg m^2 are the standard
+  # low-inertia figures for those frames rather than a read datasheet. The
+  # factor [0.5, 2.0] is kept, not widened: with r measured it now covers only
+  # the frame-inertia spread (a medium-inertia ECMA variant is ~2.5x the
+  # low-inertia one), which is exactly what it should. One datasheet page moves
+  # this to class D.
+  rotor_inertia_nominal: [1.178, 1.178, 19.236]   # kg  (joint order y, x, z)
   rotor_inertia_factor: [0.5, 2.0]
   rotor_inertia_provenance: [E, E, E]
   inertia_samples: 64   # constant mass matrix: 64 samples is already exact
@@ -106,17 +136,26 @@ excitation:
   max_acceleration: 0.5             # m/s^2, the URDF's own limit
   centre_jitter: 1.0
   candidates: 48
-  # Modal probe, 24 lines log-spaced 1.5-20 Hz =
-  # elastic_sim.excitation.log_spaced_probe_harmonics(1.5, 20.0, 24, 0.1).
-  # With the CAD masses the transmission mode is 4.21 / 4.65 / 4.37 Hz nominal
-  # and 2.25-8.27 Hz across the sampled corners of the priors above, so the comb
-  # brackets it at both ends.  The previously shipped 5-30 Hz comb, sized from
-  # the placeholder masses, missed the whole band (R5_04 Sec 1.4).  Top index
-  # 200 = 20 Hz, below both the 0.4-Nyquist margin (100 Hz) and the stricter
-  # differentiation bound 0.25 / sample_time_step = 62.5 Hz.
+  # Modal probe, 24 lines log-spaced 1.5-22 Hz =
+  # elastic_sim.excitation.log_spaced_probe_harmonics(1.5, 22.0, 24, 0.1).
+  # RE-DERIVED in pass 3 with the measured drive ratios (T-17): the mode is
+  # 12.52 / 11.73 / 4.01 Hz nominal and 2.60-24.93 Hz across the sampled corners
+  # of the priors above, against the 2.25-8.27 Hz the uniform 12 kg implied.  The
+  # pass-2 comb's 20 Hz top was sized for the old band and covered barely half of
+  # the new one.
+  #
+  # The top is 22 Hz and not 25, which would have bracketed the stiffest sampled
+  # corner too, because 22.5 Hz is where this platform stops being able to
+  # differentiate its own probe: a Savitzky-Golay derivative of order 3 has a
+  # five-sample floor, so its widest passband is 0.45 * 250 / 5 = 22.5 Hz
+  # (R5_08 Sec 2).  Between covering one extreme corner of a prior and keeping
+  # FMRR the one config in the family whose probe survives the consumer's own
+  # differentiation, the second is worth more.  The corner it gives up is the
+  # k x 2, m_ref / 2 corner at 24.93 Hz on joint_y, which the 12 robots sample
+  # only at their stiffest edge.
   probe_harmonics: [
-    15, 17, 19, 21, 24, 26, 29, 33, 37, 41, 46, 52,
-    58, 65, 73, 81, 91, 102, 114, 127, 143, 160, 179, 200,
+    15, 17, 19, 21, 24, 27, 30, 34, 38, 43, 48, 54,
+    61, 68, 77, 86, 97, 109, 123, 138, 155, 174, 196, 220,
   ]
   # Raised from 0.3: this is R5_Q Q-2's option (c) in one number.  Gross motion
   # stays inside the URDF's 0.5 m/s^2 while the probe, which is what actually
@@ -150,13 +189,28 @@ dataset:
   # no link-side encoder at all.
   signals:
     position_side: motor
-    target: link_torque
+    # R5_06 Sec 2.1 (Q-10): the target is what the platform can *measure*, and
+    # on FMRR that is the Axia90 at ft_link -- the handle interaction force a
+    # rehabilitation controller acts on.  The tension Q-10 resolved is real and
+    # structural and must stay visible to any consumer: the cell sees the 5 kg
+    # handle while the transmission moves 70 kg, so this target carries 1-3x the
+    # cell's noise in elastic content against the 27-28x the (unmeasurable)
+    # spring force carries on the same bags (R5_05 Sec 6.4).  A target that
+    # cannot be recorded is not a target.
+    target: ee_wrench_joint
+    # T-10: `tau_link_clean*` keeps the simulated spring force in the file as
+    # debug columns beside the measurable target, so the sim-only elastic
+    # science question can still be asked on FMRR -- clearly labelled as
+    # simulation-only -- without regenerating anything.
     clean_columns: true
 
 simulation:
   # The separation bound k >= (5 omega)^2 J_eff at the soft corner of the priors
-  # (k/2, 2x reflected mass) gives omega <= 2.8 rad/s with the real masses,
-  # against 8.8 rad/s from the placeholders.  These gains bind only the
+  # (k/2, 2x reflected mass) gives omega <= 3.3 rad/s with the CAD masses and the
+  # measured drive ratios (the soft corner's mode is 2.60 Hz = 16.3 rad/s; T-17),
+  # against 2.8 rad/s from the uniform 12 kg and 8.8 from the placeholder masses.
+  # The shipped gains are kept: they satisfy the re-derived bound with margin, and
+  # moving them would change the data for no measured reason.  They bind only the
   # computed-torque and PD modes; the shipped `velocity_pi` is model-free, so the
   # guard records its ratio without enforcing it (R5_02 Sec 2.5).
   control_frequency: 2.2
@@ -182,14 +236,15 @@ simulation:
       # The drive's inner loop, [rad/s] -- here [1/s], the axes being prismatic.
       # R5_Q Q-6: the range must *straddle* the transmission mode rather than
       # stay below it, because a real drive does ring against it and the ringing
-      # bags are where the damping ratio becomes observable (C5b/C5c).  With the
-      # CAD masses the mode spans 14.2-52.0 rad/s across the sampled corners, so
-      # [8, 60] brackets it; Q-6's answer said [20, 150], which was sized for the
-      # placeholder masses and is re-derived here (R5_04 Sec 1.4).
-      velocity_bandwidth: [8.0, 60.0]
-      # Halved, to keep the cascade separated from the slowest inner loop the
-      # range now allows (position_gain <= velocity_bandwidth / 2 = 4.0).
-      position_gain: [1.5, 4.0]      # 1/s, outer loop: ours
+      # bags are where the damping ratio becomes observable (C5b/C5c).
+      # RE-DERIVED in pass 3 with the measured drive ratios (T-17): the mode now
+      # spans 16.3-156.6 rad/s across the sampled corners (2.60-24.93 Hz), so
+      # pass 2's [8, 60] sat entirely *below* the upper half of the band and
+      # stopped straddling it.  [10, 200] brackets the new band at both ends.
+      velocity_bandwidth: [10.0, 200.0]
+      # Still the cascade bound against the slowest inner loop the range allows
+      # (position_gain <= velocity_bandwidth / 2 = 5.0).
+      position_gain: [1.5, 5.0]      # 1/s, outer loop: ours
       integral_time: [0.05, 0.30]    # s
     nominal:
       # Irrelevant to a model-free mode and kept explicit so a switch to
@@ -225,15 +280,47 @@ simulation:
     ft_noise_rel: 0.0                # N per N of reading
     ft_noise_abs: 0.25               # N, resolution floor
   # What the link side has that a rigid Lagrangian cannot express (R5_00
-  # Sec 5.4 item 4), and therefore what the residual term exists to learn.
-  # ESTIMATES, open question R5_Q Q-3: a ballscrew/linear-guide axis's own
-  # friction, order 1 % of the effort limit in Coulomb and a few N per m/s
-  # viscous.  Without something here the residual class has nothing to learn
-  # on this dataset and the comparison against the elastic class is vacuous.
+  # Sec 5.4 item 4).  The residual term does not exist to learn friction: it
+  # exists to absorb everything the rigid Lagrangian cannot express -- nominal
+  # inertial-parameter error, unmodelled nonlinearities, and, for the pure
+  # residual class, the elasticity itself.  Friction is one member of that set
+  # (R5_07 Sec 3.2, owner's correction).
   plant_extras:
     link_friction:
-      viscous: [8.0, 6.0, 5.0]       # N per m/s
-      coulomb: [10.0, 8.0, 6.0]      # N
+      # R5_07 T-16 (defect D-12): the friction background is a declared
+      # experimental axis, because it decides what the comparison can see.
+      # Both model classes absorb friction, so it is *shared background* and
+      # the one term being moved between them (the elasticity) has to stand
+      # out against it.
+      #
+      #   off        no link friction.  The science tier: can the elastic class
+      #              beat the residual class on elasticity alone?
+      #   fixed      one law for every bag of every robot.  The honest default
+      #              for a dataset aimed at this one machine -- a real FMRR has
+      #              one friction law and memorizing it is the job -- but it is
+      #              NOT a test of friction generalization, and the
+      #              holdout_robots split above must not be read as one.  The
+      #              manifest now says so in split.does_not_test.
+      #   per_robot  drawn per robot from the factors below and logged in the
+      #              link_viscous__* / link_coulomb__* columns.  The robustness
+      #              tier, and the only one where a holdout claim about
+      #              friction is true.  It makes the comparison harder: a
+      #              pointwise model cannot infer a per-robot coefficient from
+      #              one sample, so the background becomes irreducible variance
+      #              rather than a learnable constant.
+      #
+      # Run T-13 on `off` and `fixed` at minimum and quote the friction share
+      # beside every number (R5_07 Sec 3.4).
+      tier: fixed
+      # ESTIMATES, R5_Q Q-3, which the owner closed as a modelling decision:
+      # link friction cannot be measured on this platform and is never a
+      # separately identified parameter -- it is part of what the residual term
+      # exists to absorb.  Order 1 % of the effort limit in Coulomb and a few N
+      # per m/s viscous, for a ballscrew/linear-guide axis.  The factor is the
+      # per-robot spread and is inert on the `off` and `fixed` tiers.
+      viscous: {nominal: [8.0, 6.0, 5.0], factor: [0.5, 2.0]}   # N per m/s
+      coulomb: {nominal: [10.0, 8.0, 6.0], factor: [0.5, 2.0]}  # N
+      provenance: E
   # The top open-loop mode is 8.27 Hz at the stiffest sampled corner, which needs
   # only dt <= 6.0e-3 s for 20 samples per period.  5e-4 is kept for parity with
   # the arms and because it costs little on a 3-DoF plant (a 10 s bag runs in

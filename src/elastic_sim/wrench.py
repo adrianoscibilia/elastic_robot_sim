@@ -258,6 +258,46 @@ class ForceTorqueSensor:
         )
         return np.asarray(jacobian.T @ np.asarray(wrench, dtype=float), dtype=float)
 
+    def joint_torques(self, q: np.ndarray, wrench: np.ndarray) -> np.ndarray:
+        """:meth:`joint_torque` over a whole bag, one row per sample.
+
+        Used on the *recorded* wrench (`R5_06` Sec 3): the cell measures once,
+        the Jacobian is software, so the mapping is applied to the same
+        6-vector that ends up in the ``w_*`` columns and at the same
+        configuration the ``q*`` columns carry.  A consumer can then reproduce
+        ``ft`` from what the file holds.
+        """
+        q = np.atleast_2d(np.asarray(q, dtype=float))
+        wrench = np.atleast_2d(np.asarray(wrench, dtype=float))
+        if len(q) != len(wrench):
+            raise ValueError("q and wrench must have the same number of rows")
+        torques = np.empty((len(q), q.shape[1]))
+        for index in range(len(q)):
+            torques[index] = self.joint_torque(q[index], wrench[index])
+        return torques
+
+    def smallest_singular_value(self, q: np.ndarray) -> np.ndarray:
+        """``sigma_min(J(q))`` per row (`R5_07` T-15).
+
+        Near a singularity the degenerate wrench directions map to near-zero
+        joint torque: the forward map ``J^T w`` stays bounded, it simply stops
+        carrying part of the wrench.  That is information loss in the *target*,
+        so it is logged per sample rather than guarded against.  The value is
+        of the full 6xn frame Jacobian, whose rows mix force and moment units;
+        on a purely prismatic asset it is a pure force ratio, on an arm it is
+        the usual mixed-unit measure and is meant for comparison against the
+        same asset's own distribution, not across platforms.
+        """
+        pin = self._pin
+        q = np.atleast_2d(np.asarray(q, dtype=float))
+        values = np.empty(len(q))
+        for index in range(len(q)):
+            jacobian = pin.computeFrameJacobian(
+                self._model, self._data, q[index], self.frame_id, pin.ReferenceFrame.LOCAL,
+            )
+            values[index] = float(np.linalg.svd(np.asarray(jacobian, dtype=float), compute_uv=False)[-1])
+        return values
+
     def rollout(
         self, q_link: np.ndarray, dq_link: np.ndarray, ddq_link: np.ndarray,
         *, q_mapping: np.ndarray | None = None,

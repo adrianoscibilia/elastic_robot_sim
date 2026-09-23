@@ -1477,6 +1477,9 @@ _PROVENANCE_SECTIONS: dict[str, tuple[str, dict[str, str]]] = {
     # labels, so the alias map is empty (R5_02 Sec 3).
     "fmrr_tecnobody": ("fmrr_tecnobody", {}),
 }
+# `ur10_table_ft` is `ur10_table` with the flange cell fitted (R5_07 T-14) and
+# has exactly the same joints, so it reads the same provenance rows.
+_PROVENANCE_SECTIONS["ur10_table_ft"] = _PROVENANCE_SECTIONS["ur10_table"]
 
 
 def test_every_shipped_config_has_provenance_rows_for_its_own_joints():

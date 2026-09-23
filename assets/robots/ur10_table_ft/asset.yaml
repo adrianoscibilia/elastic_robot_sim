@@ -1,0 +1,59 @@
+# ur10_table with the round-5 flange force/torque cell fitted (R5_07 T-14).
+#
+# Identical to `ur10_table` in every other respect, and its URDF is that
+# asset's URDF plus the cell and the calibration payload -- a test asserts it,
+# so the two cannot drift.  The separation exists because the payload is 5 kg
+# of permanent hardware at the flange and three round-4 UR10 invariants are
+# written about a bare one (R5_08 D-14).
+#
+# Used by config/identification/ur10_table_round5.yaml, whose target is
+# `ee_wrench_joint`.
+asset:
+  name: ur10_table_ft
+  urdf: description/ur10_table_ft.urdf
+  active_joints:
+  - shoulder_pan_joint
+  - shoulder_lift_joint
+  - elbow_joint
+  - wrist_1_joint
+  - wrist_2_joint
+  - wrist_3_joint
+  gravity:
+  - 0.0
+  - 0.0
+  - -9.81
+  self_collisions: true
+  default_configuration:
+  - 0.0
+  - -1.5708
+  - 1.5708
+  - -1.5708
+  - -1.5708
+  - 0.0
+  kinematic_groups:
+    arm:
+      joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+      tip_link: tool0
+  force_torque_sensor:
+    # Round 5, R5_07 T-14.  The cell sits at the flange and measures only what
+    # is past it: the calibration payload declared in the URDF, plus any
+    # external contact force.  It is *not* a joint torque sensor. The arm's own
+    # link inertia, the gravity of links 1-6 and the joint springs themselves
+    # are proximal to it and therefore invisible (R5_07 Sec 1.1).
+    frame: ft_sensor_link
+  collision:
+    margin: 0.01
+    max_joint_step: 0.05
+  scene:
+    table_height: 0.75
+    table_size:
+    - 1.2
+    - 0.8
+    table_mass: 60.0
+    source_asset: ur10

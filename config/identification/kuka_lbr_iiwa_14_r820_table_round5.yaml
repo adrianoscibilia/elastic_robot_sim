@@ -1,0 +1,302 @@
+# Round-5 variant of the iiwa 14 R820 identification config (R5_06 T-8, T-13).
+#
+# Same robot, same scene, same priors and the same excitation comb as
+# config/identification/kuka_lbr_iiwa_14_r820_table.yaml, with the round-5
+# blocks added and one number changed:
+#
+#   dataset.signals        motor-side position with the link-side target -- the
+#                          non-collocated pair elasticity is visible in.  The
+#                          iiwa is the one platform in the family whose target
+#                          is a real measurement of link-side joint torque
+#                          (R5_07 Sec 1.1), which is why the elastic-vs-residual
+#                          comparison's primary platform is this one.
+#   simulation.controller  drawn per bag instead of fixed
+#   simulation.measurement FRI's own quantization, noise, gain error and delay
+#   simulation.plant_extras link-side friction, so the residual term has
+#                          something a Lagrangian cannot express
+#   simulation.sample_time_step  1 kHz, not 500 Hz (see there)
+#
+# The round-4 file is untouched, so `git diff` of the two is exactly what
+# round 5 costs on this arm, and the round-4 dataset stays byte-reproducible
+# (R5_05 Sec 1, H-1).
+schema_version: 2
+
+asset: kuka_lbr_iiwa_14_r820_table
+
+# Simulator backends.  Newton's SolverFeatherstone is an independent
+# cross-check on the rigid reference; on elastic robots Newton falls back to
+# SolverMuJoCo and is therefore not independent (see docs).
+backends: [mujoco, newton]
+
+# One rigid bag per trajectory and friction sample, validated against
+# Pinocchio's analytic inverse dynamics.
+rigid_reference: true
+
+# Sampled elastic robots, payload 0.  Each robot draws every joint's stiffness
+# log-uniformly (nominal x factor, see docs/PARAMETER_PROVENANCE.md for where
+# the nominals and the factor come from) and its damping ratio uniformly;
+# damping is derived, d = 2 zeta sqrt(k J_eff), with J_eff the rotor/link
+# reduced inertia.  With these values the transmission modes sit near
+# 50-170 Hz at A1-A6 and 600-900 Hz at A7, whose link-side inertia is only
+# 3e-4 kg m^2; that mode sets the integration step (~6e-5 s).
+transmission:
+  robots: 20
+  # 20 stratified draws give ~95% marginal coverage per joint versus ~40-70%
+  # at 6 i.i.d. draws (R3_03 F4); "sobol" is also available and prefix-stable.
+  sampling: stratified
+  stiffness_nominal: [2.4e4, 2.4e4, 1.6e4, 1.6e4, 9.0e3, 5.5e3, 5.5e3]  # Nm/rad, A1..A7
+  # k_j = nominal_j * exp(U(-ln r, +ln r)), r = 2.  Not a guess: it is the
+  # documented reproducibility of a harmonic-drive stiffness measurement (see
+  # "Why factor 2" in docs/PARAMETER_PROVENANCE.md).
+  stiffness_factor: [0.5, 2.0]
+  # Fraction of the log-uncertainty that is one arm-wide scale rather than
+  # per-joint: a real arm is built from one gearbox family, so its joint
+  # stiffnesses are correlated; independent per-joint draws would generate
+  # physically implausible arms (a very stiff A6 under a very soft A2).
+  # Trades per-joint coverage for that realism -- any value above ~0.1 pulls
+  # the achievable per-joint span well under the round's 0.9 coverage bar at
+  # this robot count, since hitting a joint's extreme then also requires the
+  # shared common factor to land at an extreme for the same robot.  0 keeps
+  # full per-joint coverage; raise it (0.3-0.5) if correlated arms matter
+  # more than range coverage for a given use of the dataset.
+  stiffness_common_fraction: 0.0
+  # A2 is C, not P: the Disney Research anchor is a *base-joint* (A1)
+  # measurement; citing it for A2 is "same robot, different joint" (C), not
+  # a direct measurement of A2 itself (R3_10 Sec 3.4).
+  stiffness_provenance: [P, C, C, C, C, E, E]
+  damping_ratio: [0.05, 0.2]  # sampled per joint; unobservable until the excitation probe (below) is enabled
+  rotor_inertia_nominal: [1.0, 1.0, 0.5, 0.5, 0.25, 0.15, 0.15]  # reflected [kg m^2], as armature
+  rotor_inertia_factor: [0.5, 2.0]
+  # A1 and A2 are C, not P: the Disney anchor (Jc = 1.03 kg m^2) is the
+  # *controlled* motor inertia under that paper's torque controller, which
+  # may include inertia shaping -- not confirmed here to be the physical
+  # reflected rotor inertia this field means, and A2 is a different joint
+  # again regardless (R3_10 Sec 3.4).  Upgrade to P only after checking the
+  # paper's definition of Jc against docs/PARAMETER_PROVENANCE.md.
+  rotor_inertia_provenance: [C, C, C, C, C, E, E]
+  inertia_samples: 512        # configurations used for the link-inertia envelope
+
+# Randomized tool/payload rigidly attached to the flange.  Without one the
+# last three link-side torque channels are numerically zero (M_77 = 3e-4
+# kg m^2 on the bare flange) and per-channel normalization in the consumer
+# amplifies their noise to unit variance; a payload also makes the link-side
+# dynamics differ between sampled robots, which transmission stiffness alone
+# does not (R3_01).  0-6 kg stays well inside the 14 kg rating with headroom
+# under max_acceleration; effort-limit compliance is asserted at dataset time.
+payload:
+  enabled: true
+  mass: [0.0, 6.0]             # kg, sampled uniformly; 0 keeps the bare-flange case
+  # Offset of the payload centre of mass, in the frame of the last active
+  # joint's child link (iiwa_link_7 on this asset) -- not the true flange
+  # face (iiwa_link_ee), which sits a further +0.035 m along z from that
+  # link's origin on this URDF (payload.py injects on the last *active*
+  # joint's child by design, not on a fixed ee frame that may not exist on
+  # every asset; see R3_01 Sec 2.3).  offset_z is shifted by that 0.035 m so
+  # the payload still sits 0.02-0.20 m past the *physical* flange, matching
+  # the original intent.  Sampled uniformly and independently per axis.
+  offset_x: [-0.08, 0.08]
+  offset_y: [-0.08, 0.08]
+  offset_z: [0.055, 0.235]      # 0.035 (iiwa_link_7 -> iiwa_link_ee) + [0.02, 0.20] past the flange
+  size: [0.05, 0.25]           # m, cube edge; the payload is a uniform box
+  # Draw one payload per robot (a robot ships with a tool) or one per
+  # trajectory (the same robot is used with many tools).
+  per: robot
+
+# MuJoCo/Newton agreement limits per bag pair, on the worst joint.  Failing
+# pairs are reported and flagged in the manifest, never dropped.
+comparison:
+  q_link_rms: 1.0e-4          # rad
+  ft_relative_rms: 0.01       # link torque difference / link torque RMS
+  deflection_relative_rms: 0.05  # (q_motor - q_link), elastic robots only
+
+# Periodic Fourier excitation.
+#
+# These two values decide dataset quality, so they default to the good end of
+# the range rather than the fast end.  A longer period and a wider candidate
+# search both lower the regressor condition number, and that number is the
+# factor by which torque error is amplified into parameter error:
+#
+#   base_frequency 0.1 Hz (10 s), candidates 48  ->  condition ~150
+#   base_frequency 0.5 Hz  (2 s), candidates 8   ->  condition ~38000
+#
+# Pass --base-frequency 0.5 --candidates 8 for a quick smoke run.
+excitation:
+  n_harmonics: 5
+  base_frequency: 0.1         # Hz; trajectory period is 1/base_frequency
+  n_periods: 1
+  limit_margin: 0.12          # fraction of joint span kept clear of limits
+  velocity_fraction: 0.75     # fraction of the URDF velocity limit
+  max_acceleration: 4.0       # rad/s^2
+  # 0 centres every trajectory in the middle of the joint range, 1 spreads the
+  # centres over the whole feasible band.  Spreading them changes the gravity
+  # load from trajectory to trajectory, which is where most of the information
+  # in the dataset comes from; it raises joint-range coverage from ~0.6 to
+  # ~0.8 without hurting the regressor condition number.
+  centre_jitter: 1.0
+  candidates: 48              # random candidates scored per trajectory
+  # Modal probe.  Small-amplitude high harmonics that put energy at the
+  # transmission resonances (50-170 Hz on A1-A6), without which the sampled
+  # damping ratios leave no signature in the data at all and the stiffness is
+  # only visible as the static deflection tau/k (R3_02 F3).  Indices are
+  # multiples of base_frequency; 300 -> 30 Hz at base_frequency 0.1.  Keep the
+  # top index below 0.4 / sample_time_step (2000 here) to avoid aliasing the
+  # output grid.
+  #
+  # 40 lines, log-spaced 8-190 Hz -- exactly
+  # elastic_sim.excitation.log_spaced_probe_harmonics(8.0, 190.0, 40, 0.1).
+  # A sparse 5-line comb 30 Hz apart (the round's first draft) cannot satisfy
+  # its own acceptance test: a linear system only responds at the excitation
+  # frequencies, so the deflection peak lands on the nearest *line*, not the
+  # mode, and zeta only changes the response within about the half-power
+  # bandwidth 2*zeta*f of the mode (~10 Hz at zeta=0.05, f=100 Hz) -- with
+  # lines 30 Hz apart most robots' zeta stayed unobservable even with the
+  # probe on (R3_10 Sec 4.3).  Adjacent-line spacing here is <= ~7 Hz over
+  # the whole band, comfortably inside that bandwidth.  Lowered from a 30 Hz
+  # floor to 8 Hz: SeaMotorController's own feedback loop adds a motor-side
+  # damper roughly proportional to (M_ii + J_r), so on a heavy joint (A1-A3)
+  # the *observable* (closed-loop) resonance sits well below the *open-loop*
+  # two-mass TransmissionSpec.natural_frequency() prediction -- as low as
+  # ~10-35 Hz at the median link inertia on this arm -- and a probe starting
+  # at 30 Hz missed it entirely (R3_12 Sec 1).
+  probe_harmonics: [
+    80, 87, 94, 102, 111, 120, 130, 141, 153, 166,
+    180, 195, 212, 230, 249, 271, 293, 318, 345, 374,
+    406, 440, 478, 518, 562, 609, 661, 717, 778, 843,
+    915, 992, 1076, 1167, 1266, 1373, 1489, 1615, 1752, 1900,
+  ]
+  probe_acceleration_fraction: 0.2
+  # Per-trajectory regime randomization.  Without it every trajectory is
+  # amplitude-maximized against the same caps, so the acceleration and
+  # velocity distributions are near-identical bag to bag and the dataset
+  # spans a single dynamic regime (R3_02 F6).  base_frequency is
+  # deliberately left fixed for now (see RegimeSampling's docstring) so bag
+  # lengths stay uniform.
+  regime:
+    enabled: true
+    max_acceleration: [1.0, 8.0]     # rad/s^2
+    velocity_fraction: [0.3, 0.9]
+
+dataset:
+  # robots x trajectories is a budget; parameter coverage is the scarce axis
+  # (R3_03), so 20 robots x 3 trajectories keeps the same ~60-bag total as
+  # the old 6 x 10 while raising stiffness coverage from ~40-70% to ~95%.
+  trajectories: 3
+  # Give every elastic variant its own trajectories instead of replaying one
+  # shared set: the file then holds robots x trajectories distinct paths.
+  trajectories_per_robot: true
+  # Friction is compensated exactly by the controller and subtracted from the
+  # plant, so it cancels: sampling it leaves the motion and the link-side
+  # target untouched and only shifts the recorded motor torque.  One sample,
+  # the URDF's own values, is therefore all that is meaningful here.
+  friction_samples: 1
+  friction_scale: [0.5, 2.0]  # log-uniform multiplier on the URDF values
+  seed: 20260917
+  output: data/identification/kuka_lbr_iiwa_14_r820_table_round5.parquet
+  # "inline" keeps ~42 per-bag-constant metadata columns on every row
+  # (simple, historical).  "sidecar" moves them to a <dataset>.bag_metadata
+  # .json keyed by bag instead, saving ~40% of file size -- worth it once
+  # `robots` pushes past ~25 (R3_06).  Use a .parquet `output` path (instead
+  # of .csv) for a further ~10x reduction via typed, compressed columns.
+  metadata_columns: inline
+  # How bags are assigned to train / validation / test.  "holdout_robots"
+  # reserves whole robots (the softest and stiffest strata), which is the
+  # only split that measures generalization to an unseen transmission --
+  # the reason the transmission is randomized at all (R3_05 F7).
+  split:
+    mode: holdout_robots
+    test_robots: 4
+    val_robots: 2
+  # R5_01 Amendment 2.  The iiwa reports a motor-side position through FRI and
+  # measures the link-side joint torque with real strain-gauge sensors at every
+  # joint, so the non-collocated pair the design asks for is what this arm
+  # actually has -- no part of it is simulated in place of a measurement.
+  signals:
+    position_side: motor
+    target: link_torque
+    clean_columns: true
+
+simulation:
+  control_frequency: 25.0     # closed-loop bandwidth [rad/s]; used as-is unless control_gains below is enabled
+  control_damping_ratio: 1.0
+  # Randomized per-trajectory closed-loop gain.  ComputedTorqueController/
+  # SeaMotorController's own feedback adds a motor-side damper roughly
+  # proportional to (M_ii + J_rotor); on a heavy joint (A1-A3) that can
+  # dominate the transmission's own damping by an order of magnitude, so a
+  # fixed gain bakes one specific closed-loop behaviour into every bag and
+  # zeta is only weakly observable there no matter what the probe does
+  # (R3_12 Sec 1).  Varying the gain makes that dependency visible in the
+  # data instead of a hidden confound; recorded per bag as
+  # control_natural_frequency/control_damping_ratio.
+  control_gains:
+    enabled: true
+    natural_frequency: [15.0, 40.0]   # rad/s
+    damping_ratio: [0.7, 1.3]
+  # The round-5 controller.  Unlike FMRR and the UR10, this arm has a real
+  # joint-torque interface (FRI), so a model-based controller is not a
+  # simulation convenience here -- it is what the robot can be commanded with.
+  # pd_gravity is the honest default: gravity compensation plus a joint PD is
+  # what a KUKA runs without a full identified model.  The Q-C sweep and T-13
+  # drive the other modes from the command line, and every draw but the
+  # velocity loop's is keyed on streams the controller does not touch, so the
+  # modes' datasets are matched pair for pair.
+  controller:
+    mode: pd_gravity
+    randomize: true
+    velocity_loop:
+      # Only used by `velocity_pi`.  The closed-loop observable resonance on
+      # this arm sits at 10-35 Hz on the heavy joints (63-220 rad/s), so the
+      # range straddles it as R5_Q Q-6 requires.
+      velocity_bandwidth: [30.0, 200.0]   # rad/s
+      position_gain: [5.0, 15.0]          # 1/s (<= velocity_bandwidth / 2)
+      integral_time: [0.05, 0.30]         # s
+    nominal:
+      knows_payload: false
+  # ESTIMATES (R5_Q Q-4 for the iiwa): FRI reports a 19-bit joint position
+  # (2 pi / 2^19 = 1.2e-5 rad), and the joint torque comes from a strain-gauge
+  # sensor rather than from motor current -- so its noise is closer to a floor
+  # than to a fraction of the reading, and its calibration error is smaller
+  # than a drive's.  The delay is one 1 ms FRI cycle.
+  measurement:
+    encoder_resolution: 1.2e-5     # rad per count
+    q_noise: 3.0e-6                # rad
+    dq_noise: 2.0e-3               # rad/s
+    tau_noise_rel: 0.005           # 0.5 % of the reading
+    tau_noise_abs: 0.05            # Nm floor
+    tau_gain_error: 0.02           # +-2 % per channel per bag
+    delay_samples: 1               # one 1 ms FRI cycle
+  # ESTIMATES (R5_Q Q-3, closed as a modelling decision: link friction is never
+  # separately identified, it is part of what the residual absorbs).  Output-side
+  # friction of a harmonic drive plus its bearing, ~1.5 % of the joint's rated
+  # torque in Coulomb and ~0.5-1 Nm/(rad/s) viscous.  See
+  # config/identification/fmrr_tecnobody.yaml for what the tier means.
+  plant_extras:
+    link_friction:
+      tier: fixed
+      viscous: {nominal: [1.0, 1.0, 0.8, 0.8, 0.5, 0.3, 0.3], factor: [0.5, 2.0]}
+      coulomb: {nominal: [4.5, 4.5, 3.0, 3.0, 1.7, 1.0, 1.0], factor: [0.5, 2.0]}
+      provenance: E
+  rigid_time_step: 5.0e-4
+  max_time_step: 5.0e-4       # elastic robots use less, set by their fastest mode
+  # 1 kHz, not round 4's 500 Hz (R5_06 Sec 2.2).  FRI runs at 1 kHz, so this is
+  # the rate the real arm records at; and it is what makes the 8-190 Hz comb
+  # above legal under schema_version 2's bound, 190 <= 0.25 * 1000, where at
+  # 500 Hz it was 0.38 of the rate.  The cost is stated plainly: the dataset is
+  # twice the size of the round-4 one for the same bags.
+  #
+  # It does NOT make the probe survive the consumer's differentiation: an
+  # SG(3) derivative's widest passband is 0.45 * rate / 5 = 90 Hz, so the top
+  # half of this comb still lands in the residual rather than in ddq
+  # (R5_08 Sec 2).  The contract says so in differentiation.probe_resolvable.
+  sample_time_step: 0.001     # uniform output grid [s]
+  # Evaluate the controller every N physics steps and hold the torque
+  # (zero-order hold) between updates -- a 4 Hz controller running at the
+  # ~640 Hz-16 kHz the transmission mode demands is 100-4000x oversampled
+  # (R3_06).  Left at 1 (no decimation) by default: raising it needs the
+  # feedback/feedforward and rigid-vs-Pinocchio-residual tests re-verified at
+  # the chosen value, which is a per-deployment check, not a default this
+  # config should silently opt into.
+  control_decimation: 1
+
+visualization:
+  enabled: false
+  realtime_scale: 1.0         # 1.0 is real time; raise it to fast-forward

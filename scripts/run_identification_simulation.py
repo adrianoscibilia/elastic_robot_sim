@@ -187,7 +187,9 @@ def main() -> None:
             config.controller, config.seed, seed,
         )
         draw = ControllerDraw(natural_frequency, damping_ratio, position_gain, velocity_bandwidth, integral_time)
-        extras = plant_extras_for_bag(config.plant_extras, len(asset.joint_names), config.seed, seed)
+        extras = plant_extras_for_bag(
+            config.plant_extras, len(asset.joint_names), config.seed, seed, robot=tier.name,
+        )
         with payload_asset(asset, payload) as asset_p:
             report_kinematics = PortableKinematics(asset_p)
             _report_trajectory(asset, trajectory, report_kinematics)

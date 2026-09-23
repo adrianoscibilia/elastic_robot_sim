@@ -54,6 +54,12 @@ def ur10(registry):
     return registry.load("ur10_table")
 
 
+@pytest.fixture(scope="module")
+def ur10_ft(registry):
+    """The round-5 UR10: same arm, with the flange cell fitted (`R5_07` T-14)."""
+    return registry.load("ur10_table_ft")
+
+
 # ---------------------------------------------------------------------------
 # R5 T1: the round-4 invariant
 # ---------------------------------------------------------------------------
@@ -99,7 +105,9 @@ def test_config_survives_dataclass_replace_reconstruction():
     assert rebuilt.measurement == config.measurement
     assert rebuilt.plant_extras == config.plant_extras
     assert rebuilt.signals == config.signals
-    assert rebuilt.controller.velocity_loop.velocity_bandwidth == (8.0, 60.0)
+    # Re-derived in pass 3 from the measured drive ratios: the mode band moved
+    # to 16.3-156.6 rad/s, so [8, 60] stopped straddling it (`R5_08` Sec 5).
+    assert rebuilt.controller.velocity_loop.velocity_bandwidth == (10.0, 200.0)
 
 
 def test_unknown_round5_keys_are_rejected(tmp_path):
@@ -570,30 +578,6 @@ def test_fmrr_matches_the_cad_mass_properties(fmrr):
         assert np.isclose(gravity[2], 8.9 * 9.81, rtol=2e-3)
 
 
-def test_fmrr_probe_brackets_the_cad_derived_modes(fmrr):
-    """The comb has to cover the mode band the *real* masses put it in.
-
-    With 70.06 / 16.85 / 8.90 kg moved, the legacy calibrated stiffnesses and a
-    12 kg reflected motor mass, the transmission mode is 4.21 / 4.65 / 4.37 Hz
-    nominal and 2.25-8.27 Hz over the sampled corners of the priors -- an octave
-    below where the placeholder masses put it (R5_04 Sec 1.4).
-    """
-    from elastic_sim.torque_runners import effective_inertia
-
-    config = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
-    stiffness = np.asarray(config.transmission.stiffness_nominal)
-    moved = np.array([70.0594, 16.8491, 8.9000])
-    rotor = np.asarray(config.transmission.rotor_inertia_nominal)
-    k_factor, r_factor = config.transmission.stiffness_factor, config.transmission.rotor_inertia_factor
-    soft = np.sqrt(stiffness * k_factor[0] / effective_inertia(rotor * r_factor[1], moved)) / (2 * np.pi)
-    stiff = np.sqrt(stiffness * k_factor[1] / effective_inertia(rotor * r_factor[0], moved)) / (2 * np.pi)
-    assert 2.0 < soft.min() < 3.0, soft
-    assert 8.0 < stiff.max() < 9.0, stiff
-    probe = np.asarray(config.excitation.probe_harmonics) * config.excitation.base_frequency
-    assert probe.min() <= soft.min(), "comb starts above the softest mode"
-    assert probe.max() >= stiff.max(), "comb stops below the stiffest mode"
-
-
 # ---------------------------------------------------------------------------
 # R5 pass 2 -- T-1: the end-effector force/torque target
 # ---------------------------------------------------------------------------
@@ -648,11 +632,16 @@ def test_sensor_adds_the_handles_inertial_force(fmrr):
         assert np.isclose(torque[axis] - baseline[axis], 5.0 * 2.0, rtol=1e-6), (axis, torque)
 
 
-def test_wrench_target_needs_a_declared_sensor(ur10):
-    """An asset with no cell cannot carry an end-effector target."""
+def test_wrench_target_needs_a_declared_sensor(registry):
+    """An asset with no cell cannot carry an end-effector target.
+
+    The iiwa is that asset: its target is the real joint torque sensors'
+    `link_torque` and it has no flange cell.  (The UR10 had none either until
+    `R5_07` T-14 fitted one.)
+    """
     from elastic_sim.wrench import SensorSpec
 
-    assert SensorSpec.from_asset(ur10) is None
+    assert SensorSpec.from_asset(registry.load("kuka_lbr_iiwa_14_r820_table")) is None
     assert SignalPolicy("motor", "ee_wrench_joint").needs_sensor
     assert not SignalPolicy("motor", "link_torque").needs_sensor
     # An end-effector wrench is a link-side quantity: the cell is past every
@@ -974,3 +963,253 @@ def test_rigid_tier_refuses_plant_extras(fmrr, fmrr_trajectory):
     with pytest.raises(ValueError, match="rigid reference tier"):
         run_condition(fmrr, fmrr_trajectory, Tier(RIGID_TIER), "mujoco",
                       FrictionModel.from_asset(fmrr), config, extras=extras)
+
+
+# ---------------------------------------------------------------------------
+# R5 pass 3 -- T-7, T-8, T-14, T-15, T-16, T-17
+# ---------------------------------------------------------------------------
+
+def _wrench_bag(asset, samples=24, step=0.01):
+    """One synthetic rollout with a moving link side, for the cell tests."""
+    n_dof = len(asset.joint_names)
+    time = np.arange(samples) * step
+    base = np.linspace(0.0, 0.4, samples)[:, None] * np.ones((1, n_dof))
+    link = base + 0.1 * np.sin(2.0 * np.pi * 3.0 * time)[:, None]
+    return {
+        "time": time, "q_ref": link, "dq_ref": link, "q_link": link, "dq_link": 0.3 * link,
+        "ddq_link": 0.2 * link, "q_motor": link + 1e-3, "dq_motor": 0.3 * link,
+        "tau_motor": link, "tau_link": link, "joint_names": asset.joint_names,
+    }
+
+
+@pytest.mark.parametrize("measurement", [
+    IDEAL_MEASUREMENT,
+    MeasurementModel(q_noise=1e-4, dq_noise=1e-3, tau_noise_abs=0.2, tau_gain_error=0.05,
+                     delay_samples=2, ft_noise_rel=0.0, ft_noise_abs=0.25),
+])
+def test_recorded_target_is_the_recorded_wrench_mapped_by_the_recorded_jacobian(ur10_ft, measurement):
+    """`R5_06` Sec 3: one instrument, one realization, then the Jacobian.
+
+    Pass 2 measured the raw wrench and the mapped target as two independent
+    draws, so a consumer could not reproduce `ft` from `w` and the two columns
+    carried different gain errors of the same physical reading.  The identity
+    that says the defect is gone is exactly `ft == J(q)^T w` on the *recorded*
+    columns -- recorded wrench, recorded configuration -- and it has to hold
+    with the instrument model on, not only with a perfect one.
+    """
+    pytest.importorskip("pinocchio")
+    from elastic_sim import excitation as exc
+    from elastic_sim.dataset import RIGID_TIER, Tier
+    from elastic_sim.identification import FrictionModel
+    from elastic_sim.wrench import WRENCH_COLUMNS, ForceTorqueSensor, SensorSpec
+
+    config = exc.FourierExcitationConfig(n_harmonics=3, base_frequency=1.0, time_step=0.01,
+                                         max_acceleration=1.0)
+    trajectory = exc.optimize_excitation(ur10_ft, config, seed=0, n_candidates=2)
+    frame = rollout_frame(
+        ur10_ft, trajectory, _wrench_bag(ur10_ft), bag="b", tier=Tier(RIGID_TIER), backend="mujoco",
+        friction=FrictionModel.from_asset(ur10_ft), resample_step=0.01,
+        signals=SignalPolicy(position_side="motor", target="ee_wrench_joint"),
+        measurement=measurement, measurement_seed=7,
+    )
+    sensor = ForceTorqueSensor(ur10_ft, SensorSpec.from_asset(ur10_ft))
+    n_dof = len(ur10_ft.joint_names)
+    q = frame[[f"q{i}" for i in range(n_dof)]].to_numpy()
+    wrench = frame[list(WRENCH_COLUMNS)].to_numpy()
+    target = frame[[f"ft{i}" for i in range(n_dof)]].to_numpy()
+    assert np.allclose(target, sensor.joint_torques(q, wrench), atol=1e-12, rtol=0.0)
+
+
+def test_sigma_min_is_logged_and_falls_towards_a_singularity(ur10_ft):
+    """T-15: posture is a property of the bag, so it is recorded per sample."""
+    pytest.importorskip("pinocchio")
+    from elastic_sim.wrench import ForceTorqueSensor, SensorSpec
+
+    sensor = ForceTorqueSensor(ur10_ft, SensorSpec.from_asset(ur10_ft))
+    # Elbow straight: the arm loses a Cartesian direction, so sigma_min drops.
+    stretched = np.array([0.0, -1.5708, 0.0, -1.5708, -1.5708, 0.0])
+    folded = np.array([0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
+    values = sensor.smallest_singular_value(np.vstack([stretched, folded]))
+    assert values.shape == (2,)
+    assert values[0] < values[1]
+
+
+def test_ur10_cell_measures_only_the_calibration_payload(ur10_ft):
+    """T-14: the flange cell sees what is distal to it and nothing else.
+
+    5 kg of declared payload past the cell is 49.05 N at rest.  The arm's own
+    links, the table and the joint springs are all proximal and invisible --
+    which is the point that has to stay visible to any consumer of this target.
+    """
+    pytest.importorskip("pinocchio")
+    from elastic_sim.wrench import ForceTorqueSensor, SensorSpec
+
+    sensor = ForceTorqueSensor(ur10_ft, SensorSpec.from_asset(ur10_ft))
+    assert sensor.beyond == ("calibration_payload",)
+    assert np.isclose(sensor.mass, 5.0)
+    rest = sensor.wrench(np.zeros(6), np.zeros(6), np.zeros(6))
+    assert np.isclose(np.linalg.norm(rest[:3]), 5.0 * 9.81, rtol=1e-6)
+
+
+def test_round5_schema_refuses_an_unresolvable_probe(tmp_path):
+    """T-8: the bound is an error for `schema_version: 2`, a warning before."""
+    from elastic_sim.dataset import require_probe_within_sampling_bound
+
+    config = load_config(_REPO / "config" / "identification" / "ur10_table_round5.yaml")
+    assert config.schema_version == 2
+    # As shipped it clears the bound: 30 Hz against 0.25 x 125 Hz.
+    require_probe_within_sampling_bound(config)
+    faster_probe = replace(config, excitation=replace(config.excitation, probe_harmonics=(30, 400)))
+    with pytest.raises(ValueError, match="0.25 x"):
+        require_probe_within_sampling_bound(faster_probe)
+    # The same probe under the round-4 schema is the D-8 warning, not an error.
+    require_probe_within_sampling_bound(replace(faster_probe, schema_version=1))
+
+
+def test_round4_configs_still_load_under_the_new_bound():
+    """D-8 stands: the two round-4 files keep loading, warnings and all."""
+    for name in ("kuka_lbr_iiwa_14_r820_table", "ur10_table"):
+        config = load_config(_REPO / "config" / "identification" / f"{name}.yaml")
+        assert config.schema_version == 1
+
+
+def test_friction_tier_off_removes_the_background_and_fixed_keeps_it():
+    """T-16: `off` is the science tier and must leave nothing behind."""
+    config = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
+    sampling = config.plant_extras
+    assert sampling.link_friction_tier == "fixed"
+    fixed = plant_extras_for_bag(sampling, 3, 20260922, 1, robot="e01")
+    assert fixed.link_friction is not None
+    off = plant_extras_for_bag(replace(sampling, link_friction_tier="off"), 3, 20260922, 1, robot="e01")
+    assert off.link_friction is None
+
+
+def test_per_robot_friction_varies_by_robot_and_not_by_bag():
+    """T-16: a machine has one friction law; the split holds out machines."""
+    config = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
+    sampling = replace(config.plant_extras, link_friction_tier="per_robot")
+    first = plant_extras_for_bag(sampling, 3, 20260922, 1, robot="e01")
+    same_robot_other_bag = plant_extras_for_bag(sampling, 3, 20260922, 2, robot="e01")
+    other_robot = plant_extras_for_bag(sampling, 3, 20260922, 1, robot="e02")
+    assert np.allclose(first.link_friction.viscous, same_robot_other_bag.link_friction.viscous)
+    assert not np.allclose(first.link_friction.viscous, other_robot.link_friction.viscous)
+    # Inside the declared bracket, around the nominal.
+    nominal = np.asarray(sampling.link_friction_viscous)
+    low, high = sampling.link_friction_viscous_factor
+    assert np.all(first.link_friction.viscous >= nominal * low - 1e-12)
+    assert np.all(first.link_friction.viscous <= nominal * high + 1e-12)
+
+
+def test_per_robot_friction_does_not_perturb_the_fixed_tier_or_the_ripple():
+    """The new draw is on its own RNG index (`R5_07` T-16)."""
+    config = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
+    sampling = replace(config.plant_extras, ripple_amplitude=0.02)
+    fixed = plant_extras_for_bag(sampling, 3, 20260922, 1, robot="e01")
+    drawn = plant_extras_for_bag(replace(sampling, link_friction_tier="per_robot"),
+                                 3, 20260922, 1, robot="e01")
+    assert fixed.torque_ripple.phase == drawn.torque_ripple.phase
+
+
+def test_scalar_friction_config_still_loads_as_a_degenerate_factor(tmp_path):
+    """Round-4 and pass-2 configs keep their exact meaning (`R5_07` T-16)."""
+    from elastic_sim.dataset import _plant_extras_sampling
+
+    sampling = _plant_extras_sampling({"link_friction": {"viscous": [1.0, 2.0], "coulomb": [3.0, 4.0]}})
+    assert sampling.link_friction_tier == "fixed"
+    assert sampling.link_friction_viscous == (1.0, 2.0)
+    assert sampling.link_friction_viscous_factor == (1.0, 1.0)
+
+
+def test_fmrr_probe_brackets_the_drive_derived_modes(fmrr):
+    """T-17: with the measured transmission ratio the mode band moves up.
+
+    The EtherCAT position factors give r = 4.850e-3 / 4.850e-3 / 2.4237e-3
+    m/rad, so the reflected motor mass is 1.18 / 1.18 / 19.24 kg instead of a
+    uniform 12, and the nominal modes are 12.5 / 11.7 / 4.0 Hz against pass 2's
+    4.2 / 4.7 / 4.4.  The comb has to cover the sampled corners of that band,
+    which the pass-2 comb's 20 Hz top did not.
+    """
+    from elastic_sim.torque_runners import effective_inertia
+
+    config = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
+    stiffness = np.asarray(config.transmission.stiffness_nominal)
+    moved = np.array([70.0594, 16.8491, 8.9000])
+    rotor = np.asarray(config.transmission.rotor_inertia_nominal)
+    assert np.allclose(rotor, [1.178, 1.178, 19.236], rtol=1e-3)
+    nominal = np.sqrt(stiffness / effective_inertia(rotor, moved)) / (2 * np.pi)
+    assert np.allclose(nominal, [12.52, 11.73, 4.01], rtol=5e-3), nominal
+    k_factor, r_factor = config.transmission.stiffness_factor, config.transmission.rotor_inertia_factor
+    soft = np.sqrt(stiffness * k_factor[0] / effective_inertia(rotor * r_factor[1], moved)) / (2 * np.pi)
+    stiff = np.sqrt(stiffness * k_factor[1] / effective_inertia(rotor * r_factor[0], moved)) / (2 * np.pi)
+    assert np.isclose(soft.min(), 2.60, atol=0.05), soft
+    assert np.isclose(stiff.max(), 24.93, atol=0.1), stiff
+    probe = np.asarray(config.excitation.probe_harmonics) * config.excitation.base_frequency
+    assert probe.min() <= soft.min(), "comb starts above the softest mode"
+    # The stiffest sampled corner (24.9 Hz) is deliberately left outside: the
+    # comb stops at the differentiation floor instead, see the config.
+    assert probe.max() >= nominal.max(), "comb stops below the nominal modes"
+    # And it still clears the differentiation bound at FMRR's 250 Hz grid.
+    # And it still clears the differentiation floor at FMRR's 250 Hz grid:
+    # 0.45 * rate / 5 = 22.5 Hz is the widest passband an SG(3) derivative has.
+    assert probe.max() <= 0.45 / config.sample_time_step / 5.0
+
+
+def test_fmrr_effort_limits_are_the_drives_own(fmrr):
+    """T-17 Sec 2.4: F = tau_rated / r, per axis, not a blanket 1000 N."""
+    limits = np.asarray([joint.effort for joint in fmrr.resolve_active_joints()], dtype=float)
+    assert np.allclose(limits, [261.9, 261.9, 986.1], rtol=1e-3), limits
+
+
+@pytest.mark.slow
+def test_diagnostics_use_the_contracts_differentiation_window(ur10):
+    """T-11: `differentiation_share` must not mix data with a consumer setting.
+
+    `R5_05` Sec 6.5 quoted a 0.94-0.99 share computed with the historical fixed
+    11-sample window against a dataset whose contract recommends another one.
+    The share is a correct measurement of what *a* consumer sees, but it is not
+    a property of the data alone, so the window now comes from the dataset's own
+    `differentiation.sg_window` and travels with every row.
+    """
+    pytest.importorskip("pinocchio")
+    from elastic_sim import excitation as exc
+    from elastic_sim.dataset import RIGID_TIER, Tier
+    from elastic_sim.diagnostics import SG_WINDOW, dataset_diagnostics
+    from elastic_sim.identification import FrictionModel
+
+    config = exc.FourierExcitationConfig(n_harmonics=3, base_frequency=1.0, time_step=0.01,
+                                         max_acceleration=1.0)
+    trajectory = exc.optimize_excitation(ur10, config, seed=0, n_candidates=2)
+    frame = rollout_frame(
+        ur10, trajectory, _wrench_bag(ur10, samples=64), bag="b", tier=Tier(RIGID_TIER),
+        backend="mujoco", friction=FrictionModel.from_asset(ur10), resample_step=0.01,
+        signals=SignalPolicy(position_side="motor", target="link_torque", clean_columns=True),
+    )
+    base = {"n_dof": 6, "sample_time_step": 0.01}
+    declared = dataset_diagnostics(frame, dict(base, differentiation={"sg_window": 31}), ur10)
+    default = dataset_diagnostics(frame, base, ur10)
+    assert int(declared["sg_window"].iloc[0]) == 31
+    assert int(default["sg_window"].iloc[0]) == SG_WINDOW
+    assert declared["differentiation_share"].iloc[0] != default["differentiation_share"].iloc[0]
+
+
+def test_ur10_ft_urdf_is_the_base_urdf_plus_the_cell(registry):
+    """D-14: the derived asset may add the cell and nothing else.
+
+    `ur10_table_ft` exists so that the round-4 UR10 keeps a bare flange -- three
+    round-4 invariants are written about one -- but a copied URDF drifts unless
+    something checks it.  This is that check: strip the derived file's header,
+    its robot name and the block past `tool0`, and what is left must be the
+    base URDF byte for byte.
+    """
+    base = Path(registry.load("ur10_table").urdf_path).read_text(encoding="utf-8")
+    derived = Path(registry.load("ur10_table_ft").urdf_path).read_text(encoding="utf-8")
+    body = derived[derived.index("-->\n") + len("-->\n"):]
+    body = body.replace('name="ur10_table_ft"', 'name="ur10_table"', 1)
+    start = body.index("  <!-- Round 5, R5_07 T-14:")
+    end = body.index("</robot>", start)
+    stripped = base.split("\n", 1)[1]
+    assert body[:start] + body[end:] == stripped
+    # And the block it adds is exactly the cell and the payload.
+    assert body[start:end].count("<link ") == 2
+    assert 'name="ft_sensor_link"' in body[start:end]
+    assert 'name="calibration_payload"' in body[start:end]
