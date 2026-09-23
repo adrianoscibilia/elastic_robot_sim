@@ -21,6 +21,15 @@ kinematic_groups:
     joints: [joint_x, joint_y, joint_z]
     tip_link: ee_link
     translation_only: true
+# ATI Axia90, at `ft_link` after the flange and the (locked) yaw joint -- i.e.
+# at the end effector, not at the transmission output.  In free motion it
+# measures only what is mounted past it, which on this platform is the handle:
+# 5 kg, about 49 N of static weight (R5_04 Sec 3, R5_Q Q-8).  The legacy
+# simulator mapped the *spring* force to this channel, which is not what the
+# cell reads (R5_01 Amendment 1 consequence 3).
+force_torque_sensor:
+  frame: ft_link
+
 collision:
   margin: 0.0
   max_joint_step: 0.05

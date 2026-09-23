@@ -108,3 +108,62 @@ masses. Two direct consequences:
 - Reflected motor mass per axis (`R5_Q` Q-1): still an estimate; the drive and
   screw/belt pitch would settle it, and it now matters more, since it is of the
   same order as the moved mass on the two distal axes.
+
+---
+
+## How this was written into the URDF (agent, 2026-09-23, `R5_04` T-6)
+
+`fmrr_tecnobody.urdf`'s inertials now carry the data above. What was decided
+where the export does not determine the answer:
+
+| Link | mass [kg] | source |
+|---|---|---|
+| `link1` | 53.2093 | CAD red, minus `link1_beam`'s token 0.001 |
+| `link1_beam` | 0.001 | token; rigidly joined to `link1`, so the split is arbitrary |
+| `link2` | 7.9491 | CAD blue |
+| `link3` | 3.898 | green's structure above the sensor: 8.9 as-built − 5.0 handle − 0.002 token |
+| `flange_link`, `ft_link` | 0.001 each | token; counted inside `link3` |
+| `ee_link` | 5.0 | the handle, below the sensor (engineer, `R5_Q` Q-8) |
+
+- **Tensors** are the CAD's own centre-of-mass tensors rotated from world axes
+  into each link frame (`I_link = Rᵀ I_world R`, with `R` read from the URDF's
+  fixed chain at `q = 0`). That rotation is exact: a prismatic chain never
+  changes a link's orientation, so the link frames' orientation does not depend
+  on the configuration. `link3`'s tensor is additionally scaled by
+  `3.9 / 8.4898`, since the export does not split the green tensor at the
+  sensor plane.
+- **Centres of mass** are declared at the link origin, *not* at the CAD's
+  absolute coordinates: reconstructing those needs the CAD assembly's joint
+  positions, which the export does not state. This is dynamically free — for
+  three orthogonal prismatic joints the joint-space mass matrix is the constant
+  diagonal of moved masses, gravity is `m g · axis` and Coriolis is zero, so
+  neither the centre of mass nor the rotational inertia enters it. The one place
+  it does matter is the end-effector wrench, and there only the bodies past the
+  sensor count, so the handle's centre of mass is placed deliberately: 0.10 m
+  below the sensor along the tool axis (`ee_link` local `z = +0.03`, since
+  `ee_joint` already sits 0.07 m below it), per `R5_04` Sec 3.
+- **Frame links** (`col1-3`, `beam0-3`, `base_link`) keep their existing
+  placeholder inertials. They are fixed to the world, so they enter no equation
+  of motion; the CAD's 291.4 kg is recorded here rather than distributed over
+  seven schematic bodies.
+
+**Verified** (`tests/test_round5_controller.py::test_fmrr_matches_the_cad_mass_properties`):
+`M = diag(70.0594, 16.8491, 8.9000) kg`, off-diagonal `< 1e-10`, configuration-
+independent, and gravity `(0, 0, 87.31) N`.
+
+**Deviation from `R5_04` Sec 1.3, which asked to assert
+`diag(69.65, 16.44, 8.49)` and 83.3 N.** Those figures use the CAD's own
+8.4898 kg for the green axis; Sec 1.1 and this file's own "What this implies"
+table both say to build the vertical axis at the engineer's as-built **8.9 kg**
+("F/T sensor, carbon poles and the added ballast included"). The build follows
+the as-built figure, so the assertion is against `(70.06, 16.85, 8.90)` and
+87.31 N. The two differ by 0.6 % / 2.5 % / 4.8 %.
+
+**Geometry not changed.** The CAD implies a frame centre of mass at
+`z ≈ 1.79 m` and the bridge at `2.70 m`, against the URDF's schematic 2.5 m
+columns and 4 m beams (so the bridge sits at 1.25 m). The real beam span and
+column height are still open with the engineer (`R5_04` Sec 4); the URDF's
+geometry is used only for collision and visualisation, and the excitation window
+is derived from the joint limits rather than from the beam length, so nothing in
+the identification stack depends on it yet. Changing it later moves the
+collision geometry and the visual, not the dynamics.

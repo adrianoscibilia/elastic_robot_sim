@@ -15,8 +15,13 @@
 #     column.  Pinocchio builds that order and cannot permute it, so the
 #     asset declares it and every consumer inherits it.
 #
-# The mass matrix is constant and diagonal (2.0, 1.2, 1.0 kg) and gravity acts
-# on the z axis only, which makes this the analytic test case of the family.
+# The mass matrix is constant and diagonal and gravity acts on the z axis only,
+# which makes this the analytic test case of the family.  Since 2026-09-23 the
+# URDF's inertials come from the CAD export
+# (`assets/robots/fmrr_tecnobody/CAD_INERTIA.md`, R5_04 T-6): the machine moves
+# 70.06 / 16.85 / 8.90 kg on joint_y / joint_x / joint_z, not the placeholders'
+# 2.0 / 1.2 / 1.0, and every number below was re-derived from that.  Gravity
+# loads joint_z with 87.3 N.
 schema_version: 1
 
 asset: fmrr_tecnobody
@@ -45,22 +50,30 @@ transmission:
   damping_ratio: [0.4, 1.2]
   # Reflected motor mass [kg], applied as joint armature.  ESTIMATE, open
   # question R5_Q Q-1: a ~400 W servo (J ~ 3e-5 kg m^2) through a 10 mm/rev
-  # ballscrew (r = 1.59e-3 m/rad) reflects J / r^2 ~ 12 kg.  The check that
-  # makes it credible is the resulting transmission mode, 10-12 Hz at the
-  # nominal stiffness, which is the ~10 Hz R5_01 Sec 2 reports for the legacy
-  # platform.  Replace with the drive/screw data when the owner has it.
+  # ballscrew (r = 1.59e-3 m/rad) reflects J / r^2 ~ 12 kg.
+  # RE-OPENED by the CAD data (R5_04 Sec 2): the cross-check that justified this
+  # value was that it put the mode near the legacy platform's ~10 Hz, and that
+  # agreement was an artefact of the placeholder masses; with the real ones the
+  # same 12 kg gives 4.2-4.7 Hz.  The estimate is not thereby wrong, only
+  # unchecked again, and it matters more now: it is of the same order as the
+  # moved mass on the two distal axes (12 vs 16.8 and 8.9 kg), so J_eff is set
+  # by both.  The drive model and the screw or belt pitch per axis would settle
+  # it; delta400x / delta400y / delta750 suggest 400 W on two axes, 750 W on one.
   rotor_inertia_nominal: [12.0, 12.0, 12.0]       # kg
   rotor_inertia_factor: [0.5, 2.0]
   rotor_inertia_provenance: [E, E, E]
   inertia_samples: 64   # constant mass matrix: 64 samples is already exact
 
-# The handle beyond the F/T sensor plus whatever the user holds.  The real
-# platform's fz has a mean of 8.8 N, about 0.9 kg (R5_01 Sec 5, O-1).  Offsets
-# place the box at the flange in link3's frame (flange_joint sits at z = -1.0 m,
-# the F/T sensor 0.04 m and the end effector 0.11 m beyond it).  On a Cartesian
-# gantry a payload's *offset* changes no joint dynamics at all -- a prismatic
-# joint's gravity load is m * g . axis and its inertia is m -- so the offset
-# only matters to the collision geometry.
+# What the *user* adds beyond the machine, not the handle: since the CAD rebuild
+# the handle's own 5 kg is URDF hardware on `ee_link`, past the sensor (R5_04
+# Sec 3), because it is permanently mounted and the URDF is the single source of
+# inertial truth.  This block is therefore a smaller, genuinely variable load.
+# Offsets place the box at the flange in link3's frame (flange_joint sits at
+# z = -1.0 m, the F/T sensor 0.04 m and the end effector 0.11 m beyond it).  On a
+# Cartesian gantry a payload's *offset* changes no joint dynamics at all -- a
+# prismatic joint's gravity load is m * g . axis and its inertia is m -- so the
+# offset only matters to the collision geometry and to the wrench's torque
+# channels.
 payload:
   enabled: true
   mass: [0.0, 2.0]
@@ -83,29 +96,36 @@ excitation:
   # URDF limits are already a sensible band (+-1.8 m on x/y, +-1.0 m on z), so
   # no position_window is needed; limit_margin applies to them directly.
   velocity_fraction: 0.6            # of the URDF's 1 m/s
-  # OPEN (R5_Q Q-2): the URDF declares acceleration="0.5" on every axis, a
-  # patient-safety spec for a rehabilitation device, not a machine limit (the
-  # 1000 N effort limit against 13 kg of reflected plus link mass allows far
-  # more).  R5_01 O-5 requires the excitation to reach the ~10 Hz transmission
-  # mode or elasticity is unobservable whatever the signal pair, which 0.5
-  # m/s^2 cannot do.  2.0 m/s^2 with the regime range below is the value used;
-  # the owner confirms or caps it.
-  max_acceleration: 2.0             # m/s^2
+  # SETTLED by the CAD masses (R5_Q Q-2, option (c); R5_04 Sec 1.4).  The
+  # excitation now stays inside the URDF's own acceleration="0.5" limit: with
+  # the real moved masses 0.5 m/s^2 already deflects the transmission by
+  # 4.89 / 1.41 / 1.15 mm on joint_y / joint_x / joint_z, against micrometre-
+  # scale encoder noise, so reaching the mode no longer needs an excitation
+  # beyond what a rehabilitation device is rated for.  The modal energy goes
+  # into the probe share instead (raised below), which is option (c).
+  max_acceleration: 0.5             # m/s^2, the URDF's own limit
   centre_jitter: 1.0
   candidates: 48
-  # Modal probe, 24 lines log-spaced 5-30 Hz =
-  # elastic_sim.excitation.log_spaced_probe_harmonics(5.0, 30.0, 24, 0.1).
-  # The transmission mode spans 7.0-17.4 Hz over the sampled corners of the
-  # priors above, so the comb brackets it with margin at both ends.  Top index
-  # 300 = 30 Hz < 0.4 / sample_time_step / base_frequency = 1000.
+  # Modal probe, 24 lines log-spaced 1.5-20 Hz =
+  # elastic_sim.excitation.log_spaced_probe_harmonics(1.5, 20.0, 24, 0.1).
+  # With the CAD masses the transmission mode is 4.21 / 4.65 / 4.37 Hz nominal
+  # and 2.25-8.27 Hz across the sampled corners of the priors above, so the comb
+  # brackets it at both ends.  The previously shipped 5-30 Hz comb, sized from
+  # the placeholder masses, missed the whole band (R5_04 Sec 1.4).  Top index
+  # 200 = 20 Hz, below both the 0.4-Nyquist margin (100 Hz) and the stricter
+  # differentiation bound 0.25 / sample_time_step = 62.5 Hz.
   probe_harmonics: [
-    50, 54, 58, 63, 68, 74, 80, 86, 93, 101, 109, 118,
-    127, 138, 149, 161, 174, 188, 203, 220, 237, 257, 278, 300,
+    15, 17, 19, 21, 24, 26, 29, 33, 37, 41, 46, 52,
+    58, 65, 73, 81, 91, 102, 114, 127, 143, 160, 179, 200,
   ]
-  probe_acceleration_fraction: 0.3  # more than the arms' 0.2: the mode is what this platform is for
+  # Raised from 0.3: this is R5_Q Q-2's option (c) in one number.  Gross motion
+  # stays inside the URDF's 0.5 m/s^2 while the probe, which is what actually
+  # reaches the mode, gets a larger share of that budget.
+  probe_acceleration_fraction: 0.4
   regime:
     enabled: true
-    max_acceleration: [0.5, 4.0]    # m/s^2
+    # Inside the URDF limit at the top end, so no sampled trajectory exceeds it.
+    max_acceleration: [0.15, 0.5]   # m/s^2
     velocity_fraction: [0.3, 0.8]
 
 dataset:
@@ -134,13 +154,16 @@ dataset:
     clean_columns: true
 
 simulation:
-  # The separation bound k >= (5 omega)^2 J_eff at the soft corner of the
-  # priors (k/2, 2x reflected mass, heaviest axis) gives omega <= 8.8 rad/s.
-  control_frequency: 6.0
+  # The separation bound k >= (5 omega)^2 J_eff at the soft corner of the priors
+  # (k/2, 2x reflected mass) gives omega <= 2.8 rad/s with the real masses,
+  # against 8.8 rad/s from the placeholders.  These gains bind only the
+  # computed-torque and PD modes; the shipped `velocity_pi` is model-free, so the
+  # guard records its ratio without enforcing it (R5_02 Sec 2.5).
+  control_frequency: 2.2
   control_damping_ratio: 1.0
   control_gains:
     enabled: true
-    natural_frequency: [5.0, 8.0]   # rad/s
+    natural_frequency: [1.8, 2.8]   # rad/s
     damping_ratio: [0.7, 1.3]
   control_separation:
     min_ratio: 5.0
@@ -156,12 +179,17 @@ simulation:
     mode: velocity_pi
     randomize: true
     velocity_loop:
-      # The drive's inner loop, [rad/s] -- here [1/s], the axes being
-      # prismatic.  Kept below the 7-17 Hz (44-110 rad/s) transmission mode so
-      # that the loop does not sit on top of it, and spread 3x so no single
-      # drive tuning is memorizable.
-      velocity_bandwidth: [20.0, 60.0]
-      position_gain: [4.0, 10.0]     # 1/s, outer loop: ours
+      # The drive's inner loop, [rad/s] -- here [1/s], the axes being prismatic.
+      # R5_Q Q-6: the range must *straddle* the transmission mode rather than
+      # stay below it, because a real drive does ring against it and the ringing
+      # bags are where the damping ratio becomes observable (C5b/C5c).  With the
+      # CAD masses the mode spans 14.2-52.0 rad/s across the sampled corners, so
+      # [8, 60] brackets it; Q-6's answer said [20, 150], which was sized for the
+      # placeholder masses and is re-derived here (R5_04 Sec 1.4).
+      velocity_bandwidth: [8.0, 60.0]
+      # Halved, to keep the cascade separated from the slowest inner loop the
+      # range now allows (position_gain <= velocity_bandwidth / 2 = 4.0).
+      position_gain: [1.5, 4.0]      # 1/s, outer loop: ours
       integral_time: [0.05, 0.30]    # s
     nominal:
       # Irrelevant to a model-free mode and kept explicit so a switch to
@@ -178,6 +206,24 @@ simulation:
     tau_noise_abs: 0.01              # N floor
     tau_gain_error: 0.03             # +-3 % per channel per bag
     delay_samples: 1                 # one 4 ms sample of bus + filter delay
+    # The ATI Axia90 is a different instrument from the drives' current-derived
+    # torque, so it gets its own noise figures.  The reason is structural, not a
+    # tuning: a strain-gauge cell's noise is a resolution floor that does not
+    # grow with the load, while a current-derived torque's really is proportional
+    # to the reading.  Applying the drives' 3 % relative figure to a wrench
+    # channel that carries the handle's 49 N of static weight manufactures a
+    # 1.5 N noise term out of that bias alone.
+    # It is *not* a fix for the marginal signature R5_05 Sec 6.4 measures: it
+    # moves which axis suffers.  Measured elastic-force / noise per axis
+    # (joint_y / joint_x / joint_z): 6.3 / 5.1 / 1.0 with the relative model,
+    # 0.9 / 0.8 / 2.5 with this one -- the signature is of order 0.2-1.7 N
+    # either way, because the cell sees the 5 kg handle while the transmission
+    # moves 70 kg.  That is the platform, not the noise model.
+    # ESTIMATE (R5_Q Q-10): 0.25 N is the order of an Axia90's force-axis
+    # resolution; this cell's calibration sheet, or a still recording of the real
+    # sensor, would replace it.
+    ft_noise_rel: 0.0                # N per N of reading
+    ft_noise_abs: 0.25               # N, resolution floor
   # What the link side has that a rigid Lagrangian cannot express (R5_00
   # Sec 5.4 item 4), and therefore what the residual term exists to learn.
   # ESTIMATES, open question R5_Q Q-3: a ballscrew/linear-guide axis's own
@@ -188,6 +234,10 @@ simulation:
     link_friction:
       viscous: [8.0, 6.0, 5.0]       # N per m/s
       coulomb: [10.0, 8.0, 6.0]      # N
+  # The top open-loop mode is 8.27 Hz at the stiffest sampled corner, which needs
+  # only dt <= 6.0e-3 s for 20 samples per period.  5e-4 is kept for parity with
+  # the arms and because it costs little on a 3-DoF plant (a 10 s bag runs in
+  # under a second); the headroom is deliberate, not required.
   rigid_time_step: 5.0e-4
   max_time_step: 5.0e-4
   # 250 Hz, the rate the real EtherCAT master and the ROS 2 recorder run at

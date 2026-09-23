@@ -57,11 +57,26 @@ class MeasurementModel:
     tau_noise_abs: float = 0.0
     tau_gain_error: float = 0.0
     delay_samples: int = 0
+    #: Noise of the *force/torque cell*, when the target comes from one
+    #: (``dataset.signals.target: ee_wrench_joint``).  ``None`` means "use the
+    #: ``tau_*`` values", which is what a config that does not distinguish them
+    #: gets.  They need distinguishing because the two instruments are not
+    #: alike: a drive's current-derived torque really is noisy in proportion to
+    #: the reading, while a strain-gauge cell's noise is a resolution floor
+    #: that does not grow with the load.  Applying a 3 % relative figure to a
+    #: wrench channel carrying a 49 N static bias buries the signal in a noise
+    #: term that bias alone creates (`R5_05` Sec 6.4 measures it).
+    ft_noise_rel: float | None = None
+    ft_noise_abs: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("encoder_resolution", "q_noise", "dq_noise", "tau_noise_rel",
                      "tau_noise_abs", "tau_gain_error"):
             if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"simulation.measurement.{name} must be non-negative")
+        for name in ("ft_noise_rel", "ft_noise_abs"):
+            value = getattr(self, name)
+            if value is not None and float(value) < 0.0:
                 raise ValueError(f"simulation.measurement.{name} must be non-negative")
         if int(self.delay_samples) < 0:
             raise ValueError("simulation.measurement.delay_samples must be non-negative")
@@ -78,6 +93,24 @@ class MeasurementModel:
             self.encoder_resolution == 0.0 and self.q_noise == 0.0 and self.dq_noise == 0.0
             and self.tau_noise_rel == 0.0 and self.tau_noise_abs == 0.0
             and self.tau_gain_error == 0.0 and self.delay_samples == 0
+            and not self.ft_noise_rel and not self.ft_noise_abs
+        )
+
+    def for_force_cell(self) -> "MeasurementModel":
+        """This model with the force/torque cell's own noise figures applied.
+
+        Returns ``self`` unchanged when the config does not distinguish them, so
+        every existing config keeps exactly the behaviour it had.
+        """
+        if self.ft_noise_rel is None and self.ft_noise_abs is None:
+            return self
+        from dataclasses import replace
+
+        return replace(
+            self,
+            tau_noise_rel=self.tau_noise_rel if self.ft_noise_rel is None else float(self.ft_noise_rel),
+            tau_noise_abs=self.tau_noise_abs if self.ft_noise_abs is None else float(self.ft_noise_abs),
+            ft_noise_rel=None, ft_noise_abs=None,
         )
 
     # -- individual channels -------------------------------------------------
@@ -153,6 +186,8 @@ class MeasurementModel:
             "tau_noise_abs": float(self.tau_noise_abs),
             "tau_gain_error": float(self.tau_gain_error),
             "delay_samples": int(self.delay_samples),
+            "ft_noise_rel": None if self.ft_noise_rel is None else float(self.ft_noise_rel),
+            "ft_noise_abs": None if self.ft_noise_abs is None else float(self.ft_noise_abs),
         }
 
 

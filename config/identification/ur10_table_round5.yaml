@@ -152,8 +152,14 @@ simulation:
     mode: velocity_pi
     randomize: true
     velocity_loop:
-      velocity_bandwidth: [20.0, 60.0]   # rad/s
-      position_gain: [4.0, 10.0]         # 1/s
+      # R5_Q Q-6 (architect, 2026-09-23): widened from [20, 60] so the sampled
+      # range *straddles* the transmission mode (47-420 rad/s across the sampled
+      # corners) instead of staying below it.  A real drive does ring against the
+      # mode, and the ringing bags are where the damping ratio becomes observable
+      # at all (C5b/C5c, carried from round 4).  A per-bag stability check flags
+      # the bags that ring hardest rather than dropping them.
+      velocity_bandwidth: [20.0, 150.0]  # rad/s
+      position_gain: [4.0, 10.0]         # 1/s (<= velocity_bandwidth / 2)
       integral_time: [0.05, 0.30]        # s
     nominal:
       knows_payload: false

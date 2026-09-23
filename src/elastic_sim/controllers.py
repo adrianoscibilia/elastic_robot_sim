@@ -195,6 +195,7 @@ class ControllerDraw:
     integral_time: float
 
     def as_dict(self) -> dict[str, float]:
+        """Every gain, for the manifest and the per-bag record."""
         return {
             "control_natural_frequency": float(self.natural_frequency),
             "control_damping_ratio": float(self.damping_ratio),
@@ -202,6 +203,31 @@ class ControllerDraw:
             "control_velocity_bandwidth": float(self.velocity_bandwidth),
             "control_integral_time": float(self.integral_time),
         }
+
+    def as_row(self, mode: str) -> dict[str, float]:
+        """The gains that belong in the *dataset* columns for ``mode``.
+
+        Only the gains the mode actually uses.  An earlier version wrote all
+        five for every mode, reasoning that one schema across modes makes a
+        cross-mode comparison easier to read; running `R4_06 A`'s fingerprint
+        showed the cost -- three columns appear in a round-4 iiwa dataset that
+        no round-4 config has any use for, which breaks the bit-identity the
+        round-4 invariant asks for (every one of the other 122 columns was
+        identical on every row).  The velocity-loop gains describe a cascade
+        only ``velocity_pi`` closes, so they are written only there, and the
+        manifest keeps all five whatever the mode.
+        """
+        row = {
+            "control_natural_frequency": float(self.natural_frequency),
+            "control_damping_ratio": float(self.damping_ratio),
+        }
+        if mode == "velocity_pi":
+            row.update(
+                control_position_gain=float(self.position_gain),
+                control_velocity_bandwidth=float(self.velocity_bandwidth),
+                control_integral_time=float(self.integral_time),
+            )
+        return row
 
 
 def sample_velocity_loop(

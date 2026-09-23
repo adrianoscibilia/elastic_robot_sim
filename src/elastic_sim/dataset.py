@@ -38,6 +38,7 @@ from .controllers import (
 from .measurement import IDEAL_MEASUREMENT, MeasurementModel, measure_bag
 from .payload import Payload, payload_asset
 from .plant_extras import NO_EXTRAS, PlantExtras, StiffnessNonlinearity, TorqueRipple
+from .wrench import WRENCH_COLUMNS, ForceTorqueSensor, SensorSpec
 from .backend_comparison import ComparisonThresholds, compare_backends, format_report, summarize
 from .excitation import FourierExcitationConfig, effective_position_window, optimize_excitation
 from .identification import FrictionModel
@@ -554,7 +555,13 @@ class ControlSeparationCheck:
 
 
 _POSITION_SIDES = ("link", "motor")
-_TARGET_SIDES = ("link_torque", "motor_torque")
+_TARGET_SIDES = ("link_torque", "motor_torque", "ee_wrench_joint")
+#: Which side of the spring each target is measured on, for the collocation
+#: test.  An end-effector wrench is a link-side quantity: the cell sits past
+#: every transmission in the chain.
+_TARGET_SPRING_SIDE = {
+    "link_torque": "link", "ee_wrench_joint": "link", "motor_torque": "motor",
+}
 
 
 @dataclass(frozen=True)
@@ -600,12 +607,18 @@ class SignalPolicy:
         A collocated pair carries no elastic signature whatever the robot's
         stiffness, so the elastic-vs-residual comparison is meaningless on it.
         """
-        return (self.position_side == "link") == (self.target == "link_torque")
+        return self.position_side == _TARGET_SPRING_SIDE[self.target]
+
+    @property
+    def needs_sensor(self) -> bool:
+        """True when the target comes from a force/torque cell, not a joint."""
+        return self.target == "ee_wrench_joint"
 
     def describe(self) -> dict[str, Any]:
         return {
             "position_side": self.position_side,
             "target": self.target,
+            "target_kind": _TARGET_KINDS[self.target],
             "collocated": self.is_collocated,
             "clean_columns": bool(self.clean_columns),
         }
@@ -767,7 +780,7 @@ _NOMINAL_KEYS = {"knows_payload", "friction_scale", "rotor_inertia_scale", "iner
 _VELOCITY_LOOP_KEYS = {"position_gain", "velocity_bandwidth", "integral_time"}
 _MEASUREMENT_KEYS = {
     "encoder_resolution", "q_noise", "dq_noise", "tau_noise_rel", "tau_noise_abs",
-    "tau_gain_error", "delay_samples",
+    "tau_gain_error", "delay_samples", "ft_noise_rel", "ft_noise_abs",
 }
 _PLANT_EXTRAS_KEYS = {"link_friction", "stiffness_nonlinearity", "torque_ripple"}
 _LINK_FRICTION_KEYS = {"viscous", "coulomb"}
@@ -1016,6 +1029,10 @@ def load_config(path: str | Path) -> DatasetConfig:
             tau_noise_abs=float(measurement_cfg.get("tau_noise_abs", 0.0)),
             tau_gain_error=float(measurement_cfg.get("tau_gain_error", 0.0)),
             delay_samples=int(measurement_cfg.get("delay_samples", 0)),
+            ft_noise_rel=(None if measurement_cfg.get("ft_noise_rel") is None
+                          else float(measurement_cfg["ft_noise_rel"])),
+            ft_noise_abs=(None if measurement_cfg.get("ft_noise_abs") is None
+                          else float(measurement_cfg["ft_noise_abs"])),
         ),
         plant_extras=_plant_extras_sampling(extras_cfg),
         signals=SignalPolicy(
@@ -1215,7 +1232,8 @@ def run_condition(
                             friction=friction, control_decimation=config.control_decimation, **view)
             result.update(transmission=None, time_step=config.rigid_time_step, payload=payload,
                          natural_frequency=natural_frequency, damping_ratio=damping_ratio,
-                         controller_draw=draw, extras=NO_EXTRAS)
+                         controller_draw=draw, controller_mode=config.controller.mode,
+                         extras=NO_EXTRAS)
             return result
         if link_inertia is None:
             link_inertia = link_inertia_envelope(
@@ -1241,7 +1259,8 @@ def run_condition(
                         extras=extras, **view)
         result.update(transmission=transmission, time_step=time_step, payload=payload,
                      natural_frequency=natural_frequency, damping_ratio=damping_ratio,
-                     controller_draw=draw, extras=extras)
+                     controller_draw=draw, controller_mode=config.controller.mode,
+                     extras=extras)
         return result
 
 
@@ -1357,6 +1376,7 @@ def rollout_frame(
     signals: SignalPolicy | None = None,
     measurement: MeasurementModel | None = None,
     measurement_seed: int = 0,
+    sensor: ForceTorqueSensor | None = None,
 ) -> pd.DataFrame:
     """Flatten one rollout onto a uniform grid in the consumer's schema.
 
@@ -1370,6 +1390,10 @@ def rollout_frame(
     is the rate a recorder runs at and the rate ``delay_samples`` counts in.
     Both default to round 4: the collocated link/link pair, perfect
     instruments.
+
+    ``sensor`` is required when ``signals.target`` is ``ee_wrench_joint`` and is
+    built from the asset when not given; building it costs one Pinocchio model,
+    so a caller running many bags should build it once and pass it in.
     """
     names = tuple(asset.joint_names)
     signals = SignalPolicy() if signals is None else signals
@@ -1380,6 +1404,34 @@ def rollout_frame(
     def _on_grid(values: np.ndarray) -> np.ndarray:
         values = np.asarray(values, dtype=float)
         return np.column_stack([np.interp(grid, time, values[:, i]) for i in range(values.shape[1])])
+
+    # The end-effector wrench, when that is the target.  Computed here rather
+    # than inside the runners because it is a pure function of the achieved
+    # link-side motion, which the rollout already records: the cell measures
+    # what the bodies past it do, and nothing about it feeds back into the
+    # simulation.  On the *resampled* grid, so it is the wrench a recorder at
+    # that rate would log.
+    wrench = wrench_target = None
+    if signals.needs_sensor:
+        if sensor is None:
+            sensor_spec = SensorSpec.from_asset(asset)
+            if sensor_spec is None:
+                raise ValueError(
+                    f"dataset.signals.target='{signals.target}' needs a force/torque cell, but asset "
+                    f"{asset.name!r} declares no `force_torque_sensor: {{frame: ...}}`; add one to its "
+                    "asset.yaml or choose another target"
+                )
+            sensor = ForceTorqueSensor(asset, sensor_spec)
+        link_position = _on_grid(result["q_link"])
+        link_velocity = _on_grid(result["dq_link"])
+        # The consumer recomputes ddq from the recorded velocity, but the *cell*
+        # experiences the true acceleration, so the simulated wrench uses the
+        # rollout's own ddq rather than a differentiated copy of it.
+        link_acceleration = _on_grid(result["ddq_link"])
+        mapping = link_position if signals.position_side == "link" else _on_grid(result["q_motor"])
+        wrench, wrench_target = sensor.rollout(
+            link_position, link_velocity, link_acceleration, q_mapping=mapping,
+        )
 
     clean = {
         "q_link": _on_grid(result["q_link"]),
@@ -1397,7 +1449,25 @@ def rollout_frame(
     )
     q = measured.q_link if signals.position_side == "link" else measured.q_motor
     dq = measured.dq_link if signals.position_side == "link" else measured.dq_motor
-    target = measured.tau_link if signals.target == "link_torque" else measured.tau_motor
+    if signals.target == "ee_wrench_joint":
+        # The cell's own noise and gain error, drawn on the link-torque channel's
+        # stream: it is the same *instrument slot* in the signal design, just a
+        # different transducer, so a config's `tau_gain_error` applies to it too.
+        cell = measurement.for_force_cell()
+        measured_wrench = measure_bag(
+            cell, seed=measurement_seed + 1,
+            q_motor=wrench, dq_motor=wrench, q_link=wrench, dq_link=wrench,
+            tau_motor=wrench, tau_link=wrench,
+        ).tau_link
+        target = measure_bag(
+            cell, seed=measurement_seed,
+            q_motor=wrench_target, dq_motor=wrench_target, q_link=wrench_target,
+            dq_link=wrench_target, tau_motor=wrench_target, tau_link=wrench_target,
+        ).tau_link
+    elif signals.target == "link_torque":
+        target = measured.tau_link
+    else:
+        target = measured.tau_motor
 
     frame = pd.DataFrame({"t": grid, "bag": bag})
     for index in range(len(names)):
@@ -1421,6 +1491,12 @@ def rollout_frame(
     # could actually compute; the clean columns below hold the true one.
     for index in range(len(names)):
         frame[f"defl{index}"] = measured.q_motor[:, index] - measured.q_link[:, index]
+    if wrench is not None:
+        # The raw 6-axis reading beside the mapped target (R5_03 T-1): a
+        # consumer may want the wrench itself, and a diagnostic needs it to
+        # separate the mapping from the measurement.
+        for index, column in enumerate(WRENCH_COLUMNS):
+            frame[column] = measured_wrench[:, index]
     if signals.clean_columns:
         # The exact simulator values on the same grid.  A noisy dataset is only
         # decomposable into physics and instrument if these survive (R5_00
@@ -1429,6 +1505,8 @@ def rollout_frame(
         # tracking error is the headline difference between controller modes and
         # a diagnostic reading a written file cannot recover it otherwise.
         clean = dict(clean, q_ref=_on_grid(result["q_ref"]), dq_ref=_on_grid(result["dq_ref"]))
+        if wrench_target is not None:
+            clean = dict(clean, ft=wrench_target)
         for key, values in clean.items():
             for index in range(len(names)):
                 frame[f"{key}_clean{index}"] = values[:, index]
@@ -1459,7 +1537,9 @@ def rollout_frame(
         frame["control_natural_frequency"] = result.get("natural_frequency")
         frame["control_damping_ratio"] = result.get("damping_ratio")
     else:
-        for column, value in draw.as_dict().items():
+        # Only the gains this mode uses; see ControllerDraw.as_row on why the
+        # dataset columns and the manifest's record differ here.
+        for column, value in draw.as_row(str(result.get("controller_mode", "exact_ct"))).items():
             frame[column] = value
     if not measurement.is_ideal:
         # The per-bag calibration errors, so a consumer or a diagnostic can
@@ -1522,6 +1602,33 @@ def raise_on_control_separation_violation(
     )
 
 
+#: One force/torque cell per (asset name, target) inside a worker process.
+#: `_run_bag` runs in a process pool, so this is per-worker and never shared.
+_SENSOR_CACHE: dict[tuple[str, str], ForceTorqueSensor] = {}
+
+
+def _sensor_for(asset: AssetSpec, signals: SignalPolicy) -> ForceTorqueSensor | None:
+    """The asset's force/torque cell, built once per process.
+
+    Building it costs a Pinocchio model, and every bag of a build needs the same
+    one, so it is cached on the asset name rather than rebuilt per bag.  Returns
+    ``None`` unless the signal policy actually needs it, so nothing is built for
+    a joint-torque target.
+    """
+    if not signals.needs_sensor:
+        return None
+    key = (asset.name, signals.target)
+    if key not in _SENSOR_CACHE:
+        spec = SensorSpec.from_asset(asset)
+        if spec is None:
+            raise ValueError(
+                f"dataset.signals.target='{signals.target}' needs a force/torque cell, but asset "
+                f"{asset.name!r} declares no `force_torque_sensor: {{frame: ...}}` in its asset.yaml"
+            )
+        _SENSOR_CACHE[key] = ForceTorqueSensor(asset, spec)
+    return _SENSOR_CACHE[key]
+
+
 def _feedback_ratio(feedforward: np.ndarray, feedback: np.ndarray) -> float | None:
     """``mean|feedback| / mean|feedforward|``, or ``None`` when there is no feedforward."""
     reference = float(np.mean(np.abs(np.asarray(feedforward, dtype=float))))
@@ -1555,6 +1662,7 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
     frame = rollout_frame(asset, trajectory, result, bag=bag, tier=tier, backend=backend,
                           friction=friction, resample_step=config.sample_time_step, split=split,
                           signals=config.signals, measurement=config.measurement,
+                          sensor=_sensor_for(asset, config.signals),
                           # Keyed on the bag index, so a bag's noise is the same
                           # however many bags ran before it and whatever the
                           # worker order (R4_10 Sec 2.3's reproducibility rule).
@@ -1595,10 +1703,20 @@ def _run_bag(args: tuple) -> tuple[pd.DataFrame, dict[str, Any]]:
         "control_natural_frequency": float(natural_frequency),
         "control_damping_ratio": float(damping_ratio),
         "controller": describe_controller(config.controller, draw),
+        "control_position_gain": float(draw.position_gain),
+        "control_velocity_bandwidth": float(draw.velocity_bandwidth),
+        "control_integral_time": float(draw.integral_time),
         "plant_extras": None if extras is None or extras.is_empty or tier.is_rigid else extras.describe(),
         "viscous": friction.viscous.tolist(), "coulomb": friction.coulomb.tolist(),
         "tracking_rms": float(np.sqrt(np.mean((np.asarray(result["q_link"]) - np.asarray(result["q_ref"])) ** 2))),
         "max_deflection": float(np.abs(np.asarray(result["q_motor"]) - np.asarray(result["q_link"])).max()),
+        # Per-bag ringing measure (R5_Q Q-6): the velocity loop's range now
+        # straddles the transmission mode on purpose, so some bags ring.  The
+        # RMS -- not the peak -- is what compares across bags, and `generate()`
+        # takes the ratio to the median over bags to flag the outliers.
+        "deflection_rms": float(np.sqrt(np.mean(
+            (np.asarray(result["q_motor"]) - np.asarray(result["q_link"])) ** 2
+        ))),
         # None rather than a number divided by ~zero: a model-free PD
         # controller has no feedforward at all, and a ratio of 1e12 would read
         # as a measurement rather than as "not applicable" (R5_02 Sec 2).
@@ -1729,6 +1847,7 @@ def generate(
     config: DatasetConfig, asset: AssetSpec, *, verbose: bool = True, jobs: int = 1,
 ) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
     """Build the whole dataset and return ``(frame, manifest, backend_comparison)``."""
+    warn_if_probe_outruns_differentiation(config)
     base_friction = FrictionModel.from_asset(asset)
     rng = np.random.default_rng(config.seed)
     frictions = [base_friction] + [
@@ -1962,6 +2081,34 @@ def generate(
                 print(f"    warning: bag {record['bag']!r} peak |tau| is "
                       f"{record['peak_torque_ratio']:.0%} of the effort limit on its worst joint")
 
+    # Ringing: the bags whose deflection RMS stands far above the median for
+    # this build.  Flagged, never dropped (R5_Q Q-6): a bag that rings is where
+    # the damping ratio is observable at all, so it is the most informative bag
+    # in the set, not a failure -- but a bag that rings 10x the median is more
+    # likely an unstable loop draw than a rich one, and a build should say so.
+    ringing = [r["deflection_rms"] for r in records if not np.isnan(r.get("deflection_rms", np.nan))]
+    median_deflection = float(np.median(ringing)) if ringing else 0.0
+    for record in records:
+        value = record.get("deflection_rms")
+        record["deflection_ratio_to_median"] = (
+            None if not median_deflection or value is None else float(value / median_deflection)
+        )
+        record["diverged"] = bool(value is not None and not np.isfinite(value))
+    loud = [r for r in records if (r["deflection_ratio_to_median"] or 0.0) > 10.0]
+    if loud:
+        worst = max(loud, key=lambda r: r["deflection_ratio_to_median"])
+        message = (
+            f"{len(loud)}/{len(records)} bags' deflection RMS is more than 10x this build's median "
+            f"({median_deflection:.3g}); worst is bag {worst['bag']!r} at "
+            f"{worst['deflection_ratio_to_median']:.1f}x with loop gains "
+            f"kp={worst['control_position_gain']:.2f} omega_v={worst['control_velocity_bandwidth']:.1f}. "
+            "Flagged, not dropped: a ringing bag is where the damping ratio becomes observable "
+            "(R5_Q Q-6), but check it is ringing rather than diverging"
+        )
+        warnings.warn(message, stacklevel=2)
+        if verbose:
+            print(f"warning: {message}")
+
     below = [r for r in records if r["control_separation_min_ratio"] is not None
              and r["control_separation_min_ratio"] < config.control_separation.min_ratio]
     if below and config.controller.is_model_free:
@@ -2018,7 +2165,12 @@ def generate(
         "control_decimation": config.control_decimation,
         "controller": describe_controller(config.controller),
         "measurement": config.measurement.describe(),
+        "differentiation": differentiation_policy(config),
         "signals": config.signals.describe(),
+        "force_torque_sensor": (
+            None if not config.signals.needs_sensor
+            else _sensor_for(asset, config.signals).describe()
+        ),
         "plant_extras": None if config.plant_extras.is_empty else asdict(config.plant_extras),
         "seed": config.seed,
         "trajectories_per_robot": config.trajectories_per_robot,
@@ -2063,7 +2215,139 @@ def generate(
 _TARGET_SEMANTICS = {
     "link_torque": "link-side joint torque [Nm]",
     "motor_torque": "motor-side (commanded) joint torque [Nm]",
+    "ee_wrench_joint": (
+        "end-effector force/torque sensor wrench mapped to joint space, "
+        "tau = J(q_sensor)^T w [Nm]"
+    ),
 }
+#: What kind of instrument produces each target, for the consumer contract.
+#: The three round-5 platforms genuinely have three different ones: the iiwa's
+#: joint torque sensors, FMRR's end-effector cell, and (nothing) on the UR10
+#: (R5_03 T-1).
+_TARGET_KINDS = {
+    "link_torque": "joint_torque_sensor",
+    "motor_torque": "motor_current",
+    "ee_wrench_joint": "ee_wrench_joint",
+}
+
+#: Savitzky-Golay polynomial order the consumer uses.  Only the window is
+#: chosen per dataset; the order is a shape choice, not a bandwidth one.
+SG_POLY_ORDER = 3
+
+
+def recommended_sg_window(sample_rate: float, probe_top_hz: float, *, poly: int = SG_POLY_ORDER) -> int:
+    """Odd Savitzky-Golay window whose -3 dB point sits near 1.5x the probe top.
+
+    Answers `R5_03` T-4 / `R5_02` H-4.  The consumer differentiates a noisy
+    velocity with a Savitzky-Golay filter, and round 4's window was fixed at 11
+    samples regardless of what the probe put in the data: at a 2 ms grid that is
+    a 22 ms window, a low-pass well below the probe's top line, so the modal
+    content the probe was added for was filtered straight out again and
+    reappeared as an unexplainable residual (`R5_02` Sec 6.2 measures it at
+    89-99 % of the rigid tier's residual).
+
+    The artefact is *kept* -- on the real robot one also differentiates a noisy
+    encoder, and removing it in simulation would break the owner's "same
+    signals" rule -- but it is now explicit and consistent: the window is
+    reported in the contract so the consumer uses one that passes the band the
+    dataset actually contains.
+
+    The cutoff of a Savitzky-Golay differentiator of order 3 is approximately
+    ``f_c ~ 0.45 * rate / window`` (Schafer 2011's tabulation, close enough for
+    choosing an odd integer).  Solving for ``f_c = 1.5 * probe_top`` gives the
+    window below, clamped to at least ``poly + 2`` so the fit stays defined.
+    """
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate must be positive")
+    if probe_top_hz <= 0.0:
+        # No probe: keep the historical window, which is what every round-3/4
+        # dataset was consumed with.
+        return 11
+    window = int(round(0.45 * sample_rate / (1.5 * probe_top_hz)))
+    window = max(window, poly + 2)
+    return window if window % 2 == 1 else window + 1
+
+
+def warn_if_probe_outruns_differentiation(config: DatasetConfig) -> None:
+    """Warn when no Savitzky-Golay window can pass this config's probe band.
+
+    `R5_03` T-4 asked for a hard config-load requirement,
+    ``probe_top_hz <= 0.25 * sample_rate``.  It is a warning at *build* time
+    instead, for one reason: **both shipped round-4 configs violate it** (iiwa
+    190 Hz and UR10 150 Hz against a 500 Hz grid, 0.38 and 0.30 of the rate).
+    Raising at load would stop them loading and `R4_06 B5` asserts they load
+    warning-free, which would break the round-4 invariant this round has kept
+    everywhere else; capping their probe is a numeric-prior change, and rule 1
+    of `R4_00 Sec 7` reserves that for the architect (`R5_05` Sec 5, D-8).
+
+    So the fact is surfaced where it costs something -- when a dataset is
+    actually built -- and carried machine-readably in the contract's
+    ``differentiation.probe_resolvable`` flag.
+    """
+    policy = differentiation_policy(config)
+    if policy["probe_resolvable"]:
+        return
+    top = policy["probe_top_hz"]
+    rate = policy["sample_rate_hz"]
+    warnings.warn(
+        f"probe top frequency {top:g} Hz is above 0.25 x the {rate:g} Hz sampling rate, so no "
+        f"Savitzky-Golay window both smooths the velocity and passes the probe band: the "
+        f"recommended window is at its floor ({policy['sg_window']} samples, cutoff "
+        f"{policy['sg_cutoff_hz']:.0f} Hz) and the probe's modal content will reappear in the "
+        f"consumer's residual rather than in its ddq. Cap the top harmonic at "
+        f"{int(0.25 * rate / max(config.excitation.base_frequency, 1e-12))} or raise the sampling "
+        "rate (R5_03 T-4; contract carries differentiation.probe_resolvable=false).",
+        stacklevel=2,
+    )
+
+
+def differentiation_policy(config: DatasetConfig) -> dict[str, Any]:
+    """The `differentiation` block written into the consumer contract (T-4)."""
+    sample_rate = 1.0 / float(config.sample_time_step)
+    probe = config.excitation.probe_harmonics
+    probe_top = float(probe[-1] * config.excitation.base_frequency) if probe else 0.0
+    window = recommended_sg_window(sample_rate, probe_top)
+    cutoff = 0.45 * sample_rate / window
+    return {
+        "sample_rate_hz": sample_rate,
+        "probe_top_hz": probe_top,
+        "sg_window": window,
+        "sg_poly": SG_POLY_ORDER,
+        "sg_cutoff_hz": cutoff,
+        # False when the probe band cannot survive the differentiation at any
+        # window: the filter's floor is poly + 2 samples, so above
+        # probe_top = 0.25 * rate there is no window that both smooths and
+        # passes the band (R5_03 T-4).  A consumer seeing False should expect
+        # the probe's content in the residual, not in ddq.
+        "probe_resolvable": bool(probe_top == 0.0 or cutoff >= probe_top),
+        "rationale": (
+            "the consumer recomputes ddq with a Savitzky-Golay derivative; this window's -3 dB "
+            "point sits near 1.5x probe_top_hz, so the band the modal probe put in the data "
+            "survives the differentiation instead of becoming an unexplainable residual (R5_03 T-4)"
+        ),
+    }
+
+
+def _target_contains(manifest: Mapping[str, Any]) -> str:
+    """One sentence on what the target channel physically includes.
+
+    "whole arm" versus "the tool beyond the sensor only" is the distinction that
+    decides whether a model is being asked to explain the robot's dynamics or a
+    5 kg handle's, and it is invisible in the column names (R5_03 T-1).
+    """
+    target = str((manifest.get("signals") or {}).get("target", "link_torque"))
+    if target == "ee_wrench_joint":
+        sensor = manifest.get("force_torque_sensor") or {}
+        measures = ", ".join(sensor.get("measures", [])) or "the bodies past the sensor"
+        return (
+            f"only the bodies mounted past the {sensor.get('frame', 'sensor')} frame "
+            f"({measures}, {sensor.get('mass_kg', float('nan')):.3g} kg), plus any external "
+            "contact force; NOT the arm's own dynamics"
+        )
+    if target == "motor_torque":
+        return "the whole arm seen from the motor side, motor inertia and friction included"
+    return "the whole arm seen from the link side, transmission excluded"
+
 
 _METADATA_COLUMN_PREFIXES = (
     "viscous__", "coulomb__", "stiffness__", "damping__", "damping_ratio__", "rotor_inertia__",
@@ -2135,6 +2419,15 @@ def write_dataset(
         # (R3_14 Sec 2).
         "target_kind": "per_joint_torque",
         "target_semantics": _TARGET_SEMANTICS[str((manifest.get("signals") or {}).get("target", "link_torque"))],
+        # Which instrument the target comes from, and what it physically
+        # contains.  The three round-5 platforms have three different answers
+        # and a consumer cannot infer it from the column names (R5_03 T-1).
+        "target_instrument": str((manifest.get("signals") or {}).get("target_kind", "joint_torque_sensor")),
+        "target_contains": _target_contains(manifest),
+        "force_torque_sensor": manifest.get("force_torque_sensor"),
+        # How to differentiate this dataset's velocity (R5_03 T-4).  The
+        # consumer reads it instead of hard-coding a window.
+        "differentiation": manifest.get("differentiation"),
         # Which side of the spring each column is measured on.  A consumer
         # comparing an elastic model class against a residual one needs this:
         # on a collocated pair the link equation has no elastic term at all,

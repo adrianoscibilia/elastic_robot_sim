@@ -99,7 +99,7 @@ def test_config_survives_dataclass_replace_reconstruction():
     assert rebuilt.measurement == config.measurement
     assert rebuilt.plant_extras == config.plant_extras
     assert rebuilt.signals == config.signals
-    assert rebuilt.controller.velocity_loop.velocity_bandwidth == (20.0, 60.0)
+    assert rebuilt.controller.velocity_loop.velocity_bandwidth == (8.0, 60.0)
 
 
 def test_unknown_round5_keys_are_rejected(tmp_path):
@@ -521,10 +521,299 @@ def test_fmrr_identification_config_loads_and_is_round5(fmrr):
     assert not config.plant_extras.is_empty
     # 250 Hz, the real EtherCAT/recorder rate (R5_01 Amendment 1).
     assert config.sample_time_step == 0.004
-    # The probe must bracket the transmission mode or elasticity is
-    # unobservable whatever the signal pair (R5_01 O-5).
-    top = config.excitation.probe_harmonics[-1] * config.excitation.base_frequency
-    assert top >= 25.0
+    # The probe must bracket the transmission mode or elasticity is unobservable
+    # whatever the signal pair (R5_01 O-5).  With the CAD masses that mode is
+    # 2.25-8.27 Hz across the sampled corners, so the comb has to reach below
+    # 2.25 and above 8.27 Hz -- the pre-CAD 5-30 Hz comb missed the whole band
+    # (R5_04 Sec 1.4).
+    probe = config.excitation.probe_harmonics
+    base = config.excitation.base_frequency
+    assert probe[0] * base <= 2.0, "probe does not reach below the softest mode"
+    assert probe[-1] * base >= 12.0, "probe does not reach above the stiffest mode"
+    # The excitation stays inside the URDF's own acceleration limit (R5_Q Q-2,
+    # option (c)): the CAD masses make that sufficient.
+    assert config.excitation.max_acceleration <= 0.5
+    assert config.regime.max_acceleration[1] <= 0.5
+
+
+# ---------------------------------------------------------------------------
+# R5 pass 2 -- T-6: the FMRR URDF rebuilt from CAD
+# ---------------------------------------------------------------------------
+
+def test_fmrr_matches_the_cad_mass_properties(fmrr):
+    """R5_04 T-6 step 3: the URDF is this machine, not the placeholders.
+
+    The CAD export gives 53.2103 / 7.9491 kg for the bridge and the carriage and
+    the engineer gives 8.9 kg as-built for the vertical axis, so the cumulative
+    masses along the chain are 70.06 / 16.85 / 8.90 kg and gravity loads only
+    the vertical axis.  Before the rebuild the same numbers were 2.0 / 1.2 / 1.0
+    from placeholder inertials, which every FMRR figure in round 5 inherited.
+
+    Asserted against the *as-built* 8.9 kg, not the CAD's own 8.4898: R5_04
+    Sec 1.1 and CAD_INERTIA.md both say to build the vertical axis at the
+    engineer's figure, and Sec 1.3's `diag(69.65, 16.44, 8.49)` uses the CAD
+    one.  The two differ by 0.6 / 2.5 / 4.8 % (R5_05 Sec 5, D-7).
+    """
+    pytest.importorskip("pinocchio")
+    from elastic_sim import identification as idn
+
+    pin, model, data = idn.build_model(fmrr)
+    expected = np.array([70.0594, 16.8491, 8.9000])
+    rng = np.random.default_rng(0)
+    for _ in range(4):
+        q = rng.uniform(-1.0, 1.0, size=3)
+        mass_matrix = np.asarray(pin.crba(model, data, q), dtype=float)
+        assert np.allclose(np.diag(mass_matrix), expected, rtol=2e-3), np.diag(mass_matrix)
+        assert np.abs(mass_matrix - np.diag(np.diag(mass_matrix))).max() < 1e-8
+        gravity = np.asarray(pin.computeGeneralizedGravity(model, data, q), dtype=float)
+        assert np.allclose(gravity[:2], 0.0, atol=1e-6)
+        assert np.isclose(gravity[2], 8.9 * 9.81, rtol=2e-3)
+
+
+def test_fmrr_probe_brackets_the_cad_derived_modes(fmrr):
+    """The comb has to cover the mode band the *real* masses put it in.
+
+    With 70.06 / 16.85 / 8.90 kg moved, the legacy calibrated stiffnesses and a
+    12 kg reflected motor mass, the transmission mode is 4.21 / 4.65 / 4.37 Hz
+    nominal and 2.25-8.27 Hz over the sampled corners of the priors -- an octave
+    below where the placeholder masses put it (R5_04 Sec 1.4).
+    """
+    from elastic_sim.torque_runners import effective_inertia
+
+    config = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
+    stiffness = np.asarray(config.transmission.stiffness_nominal)
+    moved = np.array([70.0594, 16.8491, 8.9000])
+    rotor = np.asarray(config.transmission.rotor_inertia_nominal)
+    k_factor, r_factor = config.transmission.stiffness_factor, config.transmission.rotor_inertia_factor
+    soft = np.sqrt(stiffness * k_factor[0] / effective_inertia(rotor * r_factor[1], moved)) / (2 * np.pi)
+    stiff = np.sqrt(stiffness * k_factor[1] / effective_inertia(rotor * r_factor[0], moved)) / (2 * np.pi)
+    assert 2.0 < soft.min() < 3.0, soft
+    assert 8.0 < stiff.max() < 9.0, stiff
+    probe = np.asarray(config.excitation.probe_harmonics) * config.excitation.base_frequency
+    assert probe.min() <= soft.min(), "comb starts above the softest mode"
+    assert probe.max() >= stiff.max(), "comb stops below the stiffest mode"
+
+
+# ---------------------------------------------------------------------------
+# R5 pass 2 -- T-1: the end-effector force/torque target
+# ---------------------------------------------------------------------------
+
+def test_sensor_measures_only_what_is_past_it(fmrr):
+    """The cell reads the handle, not the spring and not the arm (R5_03 T-1).
+
+    This is the defect R5_01 Amendment 1 consequence 3 found in the legacy
+    simulator, which mapped the *spring force* to the wrench channel.
+    """
+    pytest.importorskip("pinocchio")
+    from elastic_sim.wrench import ForceTorqueSensor, SensorSpec, links_beyond
+
+    spec = SensorSpec.from_asset(fmrr)
+    assert spec is not None and spec.frame == "ft_link"
+    assert links_beyond(fmrr, "ft_link") == ("ee_link",)
+    sensor = ForceTorqueSensor(fmrr, spec)
+    assert np.isclose(sensor.mass, 5.0)
+    # 0.10 m below the sensor along the tool axis (R5_04 Sec 3).
+    assert np.allclose(sensor.inertia.lever, [0.0, 0.0, 0.10], atol=1e-9)
+
+
+def test_sensor_reads_the_static_weight_at_rest(fmrr):
+    """At rest the cell reads exactly the handle's weight: 5 kg * 9.81."""
+    pytest.importorskip("pinocchio")
+    from elastic_sim.wrench import ForceTorqueSensor, SensorSpec
+
+    sensor = ForceTorqueSensor(fmrr, SensorSpec.from_asset(fmrr))
+    zero = np.zeros(3)
+    wrench = sensor.wrench(zero, zero, zero)
+    assert np.isclose(np.linalg.norm(wrench[:3]), 5.0 * 9.81, rtol=1e-6)
+    # No torque: the centre of mass is on the sensor's own axis.
+    assert np.allclose(wrench[3:], 0.0, atol=1e-9)
+    # Mapped to joints, the vertical axis carries all of it.
+    torque = sensor.joint_torque(zero, wrench)
+    assert np.isclose(torque[2], 5.0 * 9.81, rtol=1e-6)
+    assert np.allclose(torque[:2], 0.0, atol=1e-6)
+
+
+def test_sensor_adds_the_handles_inertial_force(fmrr):
+    """Accelerating an axis adds exactly ``m_handle * a`` on that axis."""
+    pytest.importorskip("pinocchio")
+    from elastic_sim.wrench import ForceTorqueSensor, SensorSpec
+
+    sensor = ForceTorqueSensor(fmrr, SensorSpec.from_asset(fmrr))
+    zero = np.zeros(3)
+    for axis in range(3):
+        acceleration = np.zeros(3)
+        acceleration[axis] = 2.0
+        torque = sensor.joint_torque(zero, sensor.wrench(zero, zero, acceleration))
+        baseline = sensor.joint_torque(zero, sensor.wrench(zero, zero, zero))
+        assert np.isclose(torque[axis] - baseline[axis], 5.0 * 2.0, rtol=1e-6), (axis, torque)
+
+
+def test_wrench_target_needs_a_declared_sensor(ur10):
+    """An asset with no cell cannot carry an end-effector target."""
+    from elastic_sim.wrench import SensorSpec
+
+    assert SensorSpec.from_asset(ur10) is None
+    assert SignalPolicy("motor", "ee_wrench_joint").needs_sensor
+    assert not SignalPolicy("motor", "link_torque").needs_sensor
+    # An end-effector wrench is a link-side quantity: the cell is past every
+    # transmission, so pairing it with a motor-side position is non-collocated.
+    assert not SignalPolicy("motor", "ee_wrench_joint").is_collocated
+    assert SignalPolicy("link", "ee_wrench_joint").is_collocated
+
+
+# ---------------------------------------------------------------------------
+# R5 pass 2 -- T-4: differentiation policy
+# ---------------------------------------------------------------------------
+
+def test_recommended_window_passes_the_probe_band_where_it_can():
+    from elastic_sim.dataset import recommended_sg_window
+
+    # No probe: the historical 11-sample window every round-3/4 dataset used.
+    assert recommended_sg_window(500.0, 0.0) == 11
+    # A probe well inside the band gets a window whose cutoff clears it.
+    window = recommended_sg_window(1000.0, 20.0)
+    assert window % 2 == 1
+    assert 0.45 * 1000.0 / window >= 20.0
+    # Windows are odd and never shorter than the polynomial needs.
+    assert recommended_sg_window(250.0, 100.0) >= 5
+
+
+def test_differentiation_block_flags_an_unresolvable_probe():
+    """The number that answers Q-E / H-4 (R5_03 T-4).
+
+    The round-4 arms' combs reach 150-190 Hz on a 500 Hz grid, above the
+    0.25 x rate at which any window can both smooth and pass the band -- which
+    is why 89-99 % of their rigid-tier residual is the differentiation artefact
+    (R5_02 Sec 6.2).  The re-derived FMRR config is resolvable.
+    """
+    from elastic_sim.dataset import differentiation_policy
+
+    arms = differentiation_policy(load_config(
+        _REPO / "config" / "identification" / "kuka_lbr_iiwa_14_r820_table.yaml"))
+    assert arms["probe_top_hz"] == 190.0
+    assert arms["probe_resolvable"] is False
+    fmrr_policy = differentiation_policy(load_config(
+        _REPO / "config" / "identification" / "fmrr_tecnobody.yaml"))
+    assert fmrr_policy["probe_resolvable"] is True
+    assert fmrr_policy["sg_cutoff_hz"] >= fmrr_policy["probe_top_hz"]
+
+
+def test_shipped_round4_configs_still_load_without_warnings():
+    """R4_06 B5, re-asserted: the differentiation check warns at build time.
+
+    It cannot warn at load time without breaking this, and capping the round-4
+    probes is a numeric-prior change reserved for the architect (R5_05 Sec 5,
+    D-8).
+    """
+    import warnings
+
+    for name in ("kuka_lbr_iiwa_14_r820_table", "ur10_table"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            load_config(_REPO / "config" / "identification" / f"{name}.yaml")
+
+
+# ---------------------------------------------------------------------------
+# R5 pass 2 -- T-3: Q-C v2 statistics
+# ---------------------------------------------------------------------------
+
+def test_partial_information_is_one_for_pure_noise():
+    """rho = 1 means "nothing above the noise" (R5_03 Sec 2.1, statistic 2)."""
+    from elastic_sim.diagnostics import partial_information
+
+    rng = np.random.default_rng(0)
+    design = rng.normal(size=(500, 4))
+    noise = rng.normal(size=(500, 1))
+    assert np.isclose(partial_information(design, noise, noise), 1.0)
+    # A target that lies in the design's span has nothing left over.
+    spanned = design @ rng.normal(size=(4, 1))
+    assert partial_information(design, spanned, noise) < 0.1
+    # A target with structure the design cannot reach stands above the noise.
+    independent = rng.normal(size=(500, 1)) * 50.0
+    assert partial_information(design, independent, noise) > 10.0
+    # No clean copy in the file: NaN rather than an unscaled, incomparable value.
+    assert np.isnan(partial_information(design, independent, None))
+
+
+# ---------------------------------------------------------------------------
+# R5 pass 2 -- T-2: matched dataset pairs and the round-4 column schema
+# ---------------------------------------------------------------------------
+
+def test_only_velocity_pi_adds_its_loop_columns():
+    """The round-4 iiwa dataset keeps its exact 122-column schema.
+
+    Writing all five controller gains for every mode put three columns into a
+    round-4 dataset that no round-4 config uses, which is what `R4_06 A`'s
+    fingerprint caught -- every other column was identical on every row
+    (R5_05 Sec 1).
+    """
+    draw = ControllerDraw(25.0, 1.0, 8.0, 40.0, 0.1)
+    for mode in ("exact_ct", "nominal_ct", "pd", "pd_gravity"):
+        assert set(draw.as_row(mode)) == {"control_natural_frequency", "control_damping_ratio"}
+    assert set(draw.as_row("velocity_pi")) == {
+        "control_natural_frequency", "control_damping_ratio", "control_position_gain",
+        "control_velocity_bandwidth", "control_integral_time",
+    }
+    # The manifest keeps all five whatever the mode, so a cross-mode comparison
+    # can still read the gains from there.
+    assert len(draw.as_dict()) == 5
+
+
+def test_controller_mode_does_not_perturb_any_other_draw():
+    """Matched dataset pairs, which R5_03 T-2's cross-controller test needs.
+
+    Two builds differing only in ``controller.mode`` must share their robots,
+    payloads, trajectories, regimes and friction exactly, or the cross-mode gap
+    measures the draws rather than the controller.  Every stream but the
+    velocity loop's (7) is keyed on quantities the controller does not touch;
+    this asserts it rather than trusting it.
+    """
+    from elastic_sim.dataset import (
+        build_tiers, regime_excitation, sample_all_payloads, sample_control_gains, trajectory_seed,
+    )
+
+    base = load_config(_REPO / "config" / "identification" / "fmrr_tecnobody.yaml")
+    modes = ("exact_ct", "velocity_pi", "pd_gravity")
+    reference = None
+    for mode in modes:
+        config = replace(base, controller=replace(base.controller, mode=mode))
+        elastic = [tier for tier in config.tiers if not tier.is_rigid]
+        payload_by_tier, payload_by_key = sample_all_payloads(config, elastic)
+        fingerprint = {
+            "tiers": tuple(
+                (t.name, None if t.is_rigid else tuple(t.stiffness),
+                 None if t.is_rigid else tuple(t.damping_ratio))
+                for t in config.tiers
+            ),
+            "payloads": tuple(sorted((k, v.as_dict()["mass"]) for k, v in payload_by_tier.items())),
+            "seeds": tuple(trajectory_seed(config, t, i) for t in config.tiers for i in range(2)),
+            "regimes": tuple(
+                regime_excitation(config.excitation, config.regime, config.seed,
+                                  trajectory_seed(config, t, i)).max_acceleration
+                for t in config.tiers for i in range(2)
+            ),
+            "gains": tuple(
+                sample_control_gains(config.control_gains, config.control_frequency,
+                                     config.control_damping_ratio, config.seed,
+                                     trajectory_seed(config, t, i))
+                for t in config.tiers for i in range(2)
+            ),
+        }
+        if reference is None:
+            reference = fingerprint
+        else:
+            assert fingerprint == reference, f"mode {mode} perturbed a draw it must not touch"
+
+
+def test_linear_baselines_bracket_the_target():
+    """The baselines T-2 asks for, on synthetic data with a known answer."""
+    from elastic_sim.diagnostics import fit_r2
+
+    rng = np.random.default_rng(0)
+    design = rng.normal(size=(400, 3))
+    target = design @ np.array([1.0, -2.0, 0.5])
+    assert fit_r2(design, target) > 0.999
+    assert fit_r2(design, rng.normal(size=400)) < 0.2
 
 
 # ---------------------------------------------------------------------------

@@ -224,6 +224,7 @@ def main() -> None:
         natural_frequency = args.control_frequency
         draw = replace(draw, natural_frequency=natural_frequency)
     friction = idn.FrictionModel.from_asset(asset)
+    units = _units(asset)
     print(f"\ntier {tier.name!r} on {backend}" + (" with viewer" if run_config.visualize else ""))
     print(f"  controller   : {config.controller.mode}"
           + (" (model-free)" if config.controller.is_model_free else "")
@@ -245,7 +246,7 @@ def main() -> None:
             link_inertia = link_inertia_envelope(asset_p, n_samples=config.transmission.inertia_samples, bounds=bounds)
             worst_link_inertia = link_inertia_max(asset_p, n_samples=config.transmission.inertia_samples, bounds=bounds)
         transmission = tier.transmission(len(asset.joint_names), link_inertia)
-        _report_transmission(transmission, run_config)
+        _report_transmission(transmission, run_config, units)
         from elastic_sim.controllers import effective_bandwidth
 
         ratios = control_separation_ratio(
@@ -265,7 +266,7 @@ def main() -> None:
     result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia,
                            payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio,
                            draw=draw, extras=None if tier.is_rigid else extras)
-    _report_rollout(asset, result, friction)
+    _report_rollout(asset, result, friction, units)
 
     if not args.output:
         print("\nNothing written (pass --output to save this rollout).")
@@ -299,7 +300,7 @@ def _report_trajectory(asset, trajectory, kinematics) -> None:
     print(f"  peak |dq| / limit          : "
           f"{np.round(np.abs(trajectory.velocity).max(axis=0) / velocity, 2)}")
     print(f"  peak |ddq|                 : {np.abs(trajectory.acceleration).max():.3f} "
-          f"/ {metadata['max_acceleration']:.3f} rad/s^2")
+          f"/ {metadata['max_acceleration']:.3f} {_units(asset)['ddq']}")
     print(f"  starts and ends at rest    : "
           f"{bool(np.abs(trajectory.velocity[[0, -1]]).max() < 1e-9)}")
     inside = bool((trajectory.position >= lower - 1e-9).all() and (trajectory.position <= upper + 1e-9).all())
@@ -313,32 +314,54 @@ def _report_trajectory(asset, trajectory, kinematics) -> None:
           f"(closest {report.minimum_distance:.4f} m, {report.closest_pair})")
 
 
-def _report_transmission(transmission, config) -> None:
-    print(f"  stiffness [Nm/rad]         : {np.round(transmission.stiffness, 0)}")
-    print(f"  damping ratio              : {np.round(transmission.damping_ratio, 3)}")
-    print(f"  damping [Nm s/rad]         : {np.round(transmission.damping, 2)}")
-    print(f"  rotor inertia [kg m^2]     : {np.round(transmission.rotor_inertia, 4)}")
-    print(f"  highest mode per joint [Hz]: {np.round(transmission.natural_frequency(), 0)}")
-    print(f"  integration step           : {elastic_time_step(transmission, config):.2e} s")
+def _units(asset) -> dict[str, str]:
+    """Unit labels for this asset's joint type (R5_02 H-7, R5_03 Sec 2.4).
+
+    Every printed label was hard-coded to a revolute arm's rad/Nm, which is
+    wrong for the FMRR gantry's three prismatic axes: there the same numbers are
+    metres and newtons.  The numbers were always right; only the labels lied.
+    """
+    joints = asset.resolve_active_joints()
+    if all(joint.joint_type == "prismatic" for joint in joints):
+        return {"q": "m", "dq": "m/s", "ddq": "m/s^2", "tau": "N",
+                "stiffness": "N/m", "damping": "N s/m", "rotor": "kg"}
+    return {"q": "rad", "dq": "rad/s", "ddq": "rad/s^2", "tau": "Nm",
+            "stiffness": "Nm/rad", "damping": "Nm s/rad", "rotor": "kg m^2"}
 
 
-def _report_rollout(asset, result, friction) -> None:
+def _row(label: str, value: str) -> str:
+    """One report line, with the label column a fixed width."""
+    return f"  {label:<27}: {value}"
+
+
+def _report_transmission(transmission, config, units) -> None:
+    print(_row(f"stiffness [{units['stiffness']}]", f"{np.round(transmission.stiffness, 0)}"))
+    print(_row("damping ratio", f"{np.round(transmission.damping_ratio, 3)}"))
+    print(_row(f"damping [{units['damping']}]", f"{np.round(transmission.damping, 2)}"))
+    print(_row(f"rotor inertia [{units['rotor']}]", f"{np.round(transmission.rotor_inertia, 4)}"))
+    print(_row("highest mode per joint [Hz]", f"{np.round(transmission.natural_frequency(), 0)}"))
+    print(_row("integration step", f"{elastic_time_step(transmission, config):.2e} s"))
+
+
+def _report_rollout(asset, result, friction, units) -> None:
     q, dq, ddq = result["q_link"], result["dq_link"], result["ddq_link"]
     tau, q_ref = result["tau_motor"], result["q_ref"]
     print(f"  wall time                  : {result['wall_time']:.1f}s"
           + (f" ({result['solver']})" if "solver" in result else ""))
-    print(f"  tracking RMS |q - q_ref|   : {np.sqrt(np.mean((q - q_ref) ** 2)):.3e} rad")
-    print(f"  max |q - q_ref|            : {np.abs(q - q_ref).max():.3e} rad")
+    print(_row("tracking RMS |q - q_ref|", f"{np.sqrt(np.mean((q - q_ref) ** 2)):.3e} {units['q']}"))
+    print(_row("max |q - q_ref|", f"{np.abs(q - q_ref).max():.3e} {units['q']}"))
     ratio = np.mean(np.abs(result["tau_feedback"])) / max(np.mean(np.abs(result["tau_feedforward"])), 1e-12)
     print(f"  feedback / feedforward     : {ratio:.4f}   (small means the data is dynamics, not control)")
     limits = np.asarray([j.effort or np.inf for j in asset.resolve_active_joints()])
-    print(f"  torque RMS per joint [Nm]  : {np.round(np.sqrt(np.mean(tau ** 2, axis=0)), 2)}")
+    print(_row(f"effort RMS per joint [{units['tau']}]",
+               f"{np.round(np.sqrt(np.mean(tau ** 2, axis=0)), 2)}"))
     print(f"  peak |tau| / effort limit  : {np.round(np.abs(tau).max(axis=0) / limits, 3)}")
     if result.get("mode") == "elastic":
         deflection = np.abs(result["q_link"] - result["q_motor"])
-        print(f"  max transmission deflection: {deflection.max():.3e} rad")
-        print(f"  RMS |tau_link - tau_motor| : "
-              f"{np.sqrt(np.mean((result['tau_link'] - tau) ** 2)):.3f} Nm  (target vs input)")
+        print(_row("max transmission deflection", f"{deflection.max():.3e} {units['q']}"))
+        print(_row("RMS |tau_link - tau_motor|",
+                   f"{np.sqrt(np.mean((result['tau_link'] - tau) ** 2)):.3f} {units['tau']}"
+                   "  (target vs input)"))
         if not result.get("independent_of_mujoco", True):
             print("  note: this Newton run uses SolverMuJoCo and is not independent of MuJoCo")
     else:
@@ -349,8 +372,9 @@ def _report_rollout(asset, result, friction) -> None:
             for qi, dqi, ddqi in zip(q[stride], dq[stride], ddq[stride])
         ])
         residual = tau[stride] - predicted
-        print(f"  |tau - inverse dynamics|   : {np.sqrt(np.mean(residual ** 2)):.3e} Nm "
-              "(should be ~0: the label must match the model)")
+        print(_row("|tau - inverse dynamics|",
+                   f"{np.sqrt(np.mean(residual ** 2)):.3e} {units['tau']} "
+                   "(should be ~0: the label must match the model)"))
 
 
 if __name__ == "__main__":

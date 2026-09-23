@@ -84,6 +84,36 @@ def fit_r2(design: np.ndarray, target: np.ndarray) -> float:
     return float(1.0 - np.var(residual) / variance)
 
 
+def partial_information(design: np.ndarray, target: np.ndarray, noise: np.ndarray | None) -> float:
+    """How much of ``target`` survives projecting ``design`` out, over the noise.
+
+    ``rho = ||(I - P) tau|| / ||(I - P) tau_noise||`` with ``P`` the orthogonal
+    projector onto ``design``'s column space (`R5_03` Sec 2.1, statistic 2).
+    This is the statistic that says what the torque channel carries *that the
+    state channels do not*, which is the part an elastic model's ``tau_cmd``
+    path can actually use -- and unlike an R^2 it is not dominated by the shared
+    component.  Scaled by the noise's own unexplained part, so a value near 1
+    means "nothing above the noise" whatever the units.
+
+    ``None`` noise (a dataset without clean columns) gives NaN rather than an
+    unscaled number that would not be comparable between datasets.
+    """
+    if noise is None:
+        return float("nan")
+    design = np.asarray(design, dtype=float)
+    augmented = np.hstack([design, np.ones((len(design), 1))])
+
+    def _residual(values: np.ndarray) -> float:
+        values = np.asarray(values, dtype=float).reshape(-1)
+        solution, *_ = np.linalg.lstsq(augmented, values, rcond=None)
+        return float(np.linalg.norm(augmented @ solution - values))
+
+    reference = _residual(noise)
+    if reference <= 0.0:
+        return float("nan")
+    return float(_residual(target) / reference)
+
+
 def _condition(matrix: np.ndarray) -> float:
     singular = np.linalg.svd(np.asarray(matrix, dtype=float), compute_uv=False)
     smallest = float(singular[-1])
@@ -103,6 +133,8 @@ class BagDiagnostics:
     # Q-C.1
     tau_on_regressor_r2: float
     tau_on_reference_r2: float
+    tau_unexplained_fraction: float
+    tau_partial_information: float
     tau_vs_reference_feedforward: float
     regressor_condition: float
     augmented_condition: float
@@ -118,6 +150,12 @@ class BagDiagnostics:
     probe_band_acceleration: float
     probe_band_tau: float
     probe_band_deflection: float
+    # T-2's linear baselines: what a least-squares fit already achieves, so a
+    # trained network's number means something.
+    baseline_rms_state: float
+    baseline_rms_state_tau: float
+    baseline_rms_tau: float
+    baseline_rms_mean: float
     # Q-C.5
     deflection_rms: float
     deflection_over_noise: float
@@ -191,7 +229,8 @@ def bag_diagnostics(
         reference_regressor = idn.stack_regressor(
             pin, model, data, reference_q, reference_dq, reference_ddq,
         )
-        reference_r2 = fit_r2(reference_regressor @ basis, tau_column.reshape(-1))
+        reference_projected = reference_regressor @ basis
+        reference_r2 = fit_r2(reference_projected, tau_column.reshape(-1))
 
     # The measure that actually separates the modes, where both R^2 above do
     # not (R5_02 Sec 6.3): the *unfitted* relative disagreement between the
@@ -217,6 +256,14 @@ def bag_diagnostics(
         scale = float(np.sqrt(np.mean(expected**2)))
         if scale > 0.0:
             feedforward_gap = float(np.sqrt(np.mean((tau_cmd - expected) ** 2)) / scale)
+
+    # `1 - R^2`, which is what `R5_03` Sec 2.1 statistic 1 asks to report: the
+    # unexplained *fraction* separates modes on a log axis where the R^2 itself
+    # does not (0.973 vs 0.959 is a 1.5x difference in 2.7 % vs 4.1 %).
+    unexplained = float("nan") if np.isnan(reference_r2) else float(max(1.0 - reference_r2, 0.0))
+    clean_tau = _column_block(frame, "tau_motor_clean", n_dof)
+    tau_noise = None if clean_tau is None else (tau_cmd - clean_tau).reshape(-1, 1)
+    partial = partial_information(projected, tau_column, tau_noise)
 
     # -- Q-C.3: what the nominal rigid model does not explain -----------------
     nominal = np.asarray([
@@ -269,6 +316,29 @@ def bag_diagnostics(
         mass = float(frame["payload_mass"].to_numpy(dtype=float)[0])
         payload_mass = 0.0 if np.isnan(mass) else mass
 
+    # -- T-2: linear baselines ------------------------------------------------
+    # `R5_03` T-2: "in round 4's data a 1-parameter linear fit beat the trained
+    # residual class; without that baseline a comparison of two networks says
+    # nothing about either".  Four fits of the *target*, in RMS of the same
+    # units the target is in, so they sit directly beside a network's test RMSE:
+    #   state      least squares on the rigid base regressor alone
+    #   state+tau  the regressor plus the commanded torque -- what an elastic
+    #              class has access to, linearly
+    #   tau        the commanded torque alone, the one-column fit
+    #   mean       predicting the target's own mean, the floor any model must beat
+    target_column = target.reshape(-1)
+    ones = np.ones((len(projected), 1))
+    tau_only = np.hstack([tau_column, ones])
+
+    def _fit_rms(design: np.ndarray) -> float:
+        solution, *_ = np.linalg.lstsq(design, target_column, rcond=None)
+        return float(np.sqrt(np.mean((design @ solution - target_column) ** 2)))
+
+    baseline_state = _fit_rms(np.hstack([projected, ones]))
+    baseline_state_tau = _fit_rms(np.hstack([projected, tau_column, ones]))
+    baseline_tau = _fit_rms(tau_only)
+    baseline_mean = float(np.sqrt(np.mean((target_column - target_column.mean()) ** 2)))
+
     # -- Q-C.4: probe-band content -------------------------------------------
     def _band_energy(values: np.ndarray | None) -> float:
         if values is None:
@@ -313,6 +383,8 @@ def bag_diagnostics(
         samples=int(len(frame)),
         tau_on_regressor_r2=r2,
         tau_on_reference_r2=reference_r2,
+        tau_unexplained_fraction=unexplained,
+        tau_partial_information=partial,
         tau_vs_reference_feedforward=feedforward_gap,
         regressor_condition=condition,
         augmented_condition=augmented,
@@ -326,6 +398,10 @@ def bag_diagnostics(
         probe_band_acceleration=_band_energy(ddq_link),
         probe_band_tau=_band_energy(tau_cmd),
         probe_band_deflection=_band_energy(deflection),
+        baseline_rms_state=baseline_state,
+        baseline_rms_state_tau=baseline_state_tau,
+        baseline_rms_tau=baseline_tau,
+        baseline_rms_mean=baseline_mean,
         deflection_rms=deflection_rms,
         deflection_over_noise=deflection_over_noise,
         tracking_rms=tracking,
@@ -379,7 +455,13 @@ def summarize_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
     grouped = diagnostics.copy()
     grouped["tier_kind"] = np.where(grouped["tier"].eq("rigid"), "rigid", "elastic")
     numeric = grouped.select_dtypes(include="number").columns
-    return grouped.groupby(["controller_mode", "tier_kind"], sort=True)[list(numeric)].median().reset_index()
+    keys = ["controller_mode", "tier_kind"]
+    # The plant_extras-off control row is a separate condition, not a sample of
+    # the same one (R5_03 Sec 2.2), so it never gets averaged into its own
+    # comparison.
+    if "plant_extras" in grouped.columns:
+        keys.append("plant_extras")
+    return grouped.groupby(keys, sort=True)[list(numeric)].median().reset_index()
 
 
 def load_dataset(path: str | Path) -> tuple[pd.DataFrame, dict[str, Any]]:

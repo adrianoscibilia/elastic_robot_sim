@@ -120,7 +120,26 @@
       </geometry>
       <material name="white"/>
     </visual>
-  <inertial><mass value="0.2"/><inertia ixx="0.000333333333" ixy="0" ixz="0" iyy="0.000333333333" iyz="0" izz="0.000333333333"/></inertial>
+  <!-- CAD "red" subassembly: the whole bridge that joint_y moves, 53.2103 kg
+       (assets/robots/fmrr_tecnobody/CAD_INERTIA.md, R5_04 T-6).  link1 and
+       link1_beam are rigidly connected (joint_y_fixed), so they are one body
+       dynamically and the split between them is arbitrary; the bridge is
+       carried here and link1_beam keeps only a token mass, so the total is
+       exactly the CAD's.  The tensor is the CAD's own centre-of-mass tensor
+       rotated from world axes into this link's frame ; exact, because a
+       prismatic chain never changes a link's orientation.  The centre of mass
+       is declared at the link origin rather than at the CAD's absolute
+       coordinates: reconstructing those needs the CAD assembly's joint
+       positions, which the export does not state, and for three orthogonal
+       prismatic joints neither the centre of mass nor the rotational inertia
+       enters the joint-space dynamics (M is the constant diagonal of moved
+       masses, gravity is m g . axis, Coriolis is zero).  They matter only for
+       visualisation and for the end-effector wrench, and the wrench sees only
+       the bodies past the sensor. -->
+  <inertial>
+    <mass value="53.2093"/>
+    <inertia ixx="3.272" ixy="-0.9949" ixz="1.54" iyy="63.74" iyz="0.3294" izz="62.96"/>
+  </inertial>
   </link>
 
   <link name="link1_beam">
@@ -130,7 +149,9 @@
       </geometry>
       <material name="black"/>
     </visual>
-  <inertial><mass value="0.6"/><inertia ixx="0.8015" ixy="0" ixz="0" iyy="0.8015" iyz="0" izz="0.003"/></inertial>
+  <!-- Token mass: the bridge's inertia is on link1 (see above).  Kept
+       non-zero so no importer sees a massless body. -->
+  <inertial><mass value="0.001"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
   </link>
 
   <!-- Define link2 -->
@@ -141,7 +162,12 @@
       </geometry>
       <material name="white"/>
     </visual>
-  <inertial><mass value="0.2"/><inertia ixx="0.000333333333" ixy="0" ixz="0" iyy="0.000333333333" iyz="0" izz="0.000333333333"/></inertial>
+  <!-- CAD "blue" subassembly: the carriage that joint_x moves, 7.9491 kg.
+       Tensor rotated into this link's frame; see link1 on the centre of mass. -->
+  <inertial>
+    <mass value="7.9491"/>
+    <inertia ixx="0.2153" ixy="-0.0023" ixz="-0.0001" iyy="0.0463" iyz="-0.0031" izz="0.1946"/>
+  </inertial>
   </link>
 
   <!-- Define link3 -->
@@ -152,7 +178,20 @@
       </geometry>
       <material name="black"/>
     </visual>
-  <inertial><mass value="0.97"/><inertia ixx="0.325925" ixy="0" ixz="0" iyy="0.325925" iyz="0" izz="0.00485"/></inertial>
+  <!-- CAD "green" subassembly, structural part only.  The engineer's as-built
+       figure for the whole vertical axis is 8.9 kg "F/T sensor, carbon poles
+       and the added ballast included", of which about 5 kg is the handle
+       *below* the sensor (R5_04 Sec 3, Q-8).  The 5 kg sits on ee_link, past
+       ft_link, so the simulated sensor measures exactly the handle; the
+       remaining 3.9 kg of column structure is here.  The tensor is the CAD
+       green tensor rotated into this frame and scaled by 3.9 / 8.4898 ; the
+       export does not split the tensor at the sensor plane, and the scaling is
+       an approximation that does not enter the joint-space dynamics (see
+       link1). -->
+  <inertial>
+    <mass value="3.898"/>
+    <inertia ixx="0.576056" ixy="-4.59e-05" ixz="-0.0386334" iyy="0.604997" iyz="0" izz="0.0327534"/>
+  </inertial>
   </link>
 
   <!--Define fixed structure joints-->
@@ -249,17 +288,33 @@
     <limit lower="-${PI}" upper="${PI}" effort="1000" velocity="1"/>
   </joint>
 
-  <!-- Inertial definitions for end-effector links -->
+  <!-- End-effector links.  flange_link and ft_link are mounting interfaces
+       whose mass is already counted in link3's 3.9 kg, so they carry token
+       values; ee_link carries the handle. -->
   <link name="flange_link">
-  <inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  <inertial><mass value="0.001"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
   </link>
 
   <link name="ft_link">
-  <inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  <inertial><mass value="0.001"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
   </link>
 
+  <!-- The handle, below the F/T sensor: about 5 kg (platform engineer via the
+       owner, 2026-09-23; R5_04 Sec 3 / R5_Q Q-8, provenance C).  This is the
+       only mass past ft_link, so it is exactly what the sensor measures in
+       free motion: 49.1 N of static weight plus its own inertial force.
+       ee_link sits 0.07 m below the sensor along the tool axis and the centre
+       of mass is declared 0.03 m further, putting it 0.10 m below the sensor
+       as R5_04 Sec 3 specifies ; unknown, and cheap to revise: with three
+       prismatic joints and a locked yaw it shifts only the wrench's torque
+       channels, never the joint-space dynamics or the force channels.
+       Inertia is a 0.15 m box of that mass (5 * 2 * 0.15^2 / 12). -->
   <link name="ee_link">
-  <inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
+  <inertial>
+    <origin xyz="0 0 0.03" rpy="0 0 0"/>
+    <mass value="5.0"/>
+    <inertia ixx="0.01875" ixy="0" ixz="0" iyy="0.01875" iyz="0" izz="0.01875"/>
+  </inertial>
   </link>
 
   <joint name="ee_joint" type="fixed">
