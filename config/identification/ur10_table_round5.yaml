@@ -10,13 +10,28 @@
 #   simulation.plant_extras link-side friction, so the residual term has
 #                          something a Lagrangian cannot express
 #
-# Everything a prior lives in is *untouched* relative to ur10_table.yaml, on
-# purpose: a difference between a dataset built from that file and one built
-# from this one is a difference round 5 made, not a retune.  Diff the two files
-# to see exactly what round 5 costs.
-schema_version: 1
+# Pass 2 kept everything a prior lives in *untouched* relative to
+# ur10_table.yaml, so that a difference between the two files' datasets was a
+# difference round 5 made and not a retune.  Pass 3 breaks that deliberately in
+# three places, each derived below: the recording rate, the probe comb and the
+# target.
+#
+# Pass 3 (R5_06 T-8, R5_07 T-14) makes this the *real-compatible* UR10 config:
+# it records at the CB3's own 125 Hz RTDE rate with a probe band that survives
+# it, and its target is the flange force/torque cell the owner confirmed will be
+# fitted.  config/identification/ur10_table.yaml stays the 500 Hz / 150 Hz
+# simulation-only variant, unchanged.
+#
+# schema_version: 2 declares a config written in round 5, which makes
+# `probe_top_hz <= 0.25 * sample_rate` a load-time error instead of a
+# build-time warning (R5_06 T-8).  This file clears it: 30 <= 0.25 * 125.
+schema_version: 2
 
-asset: ur10_table
+# ur10_table with the flange cell and its calibration payload fitted; see
+# assets/robots/ur10_table_ft/asset.yaml.  The bare `ur10_table` stays exactly
+# as round 4 left it, which is what keeps that round's three bare-flange
+# invariants true (R5_08 D-14).
+asset: ur10_table_ft
 
 backends: [mujoco, newton]
 rigid_reference: true
@@ -44,12 +59,16 @@ transmission:
   inertia_samples: 512
 
 # Flange tool.  tool0 == wrist_3_link on this URDF (R4_01 Sec 4), so there
-# is no flange shift in offset_z (the iiwa needs +0.035 m).  5 kg = 50 % of
-# the 10 kg rating.  Mass floor 0 keeps the bare-flange case -- decision D1
-# (R4_00 Sec 5): a floor of 0.3 kg would enlarge the integration step.
+# is no flange shift in offset_z (the iiwa needs +0.035 m).  Mass floor 0 keeps
+# the bare-flange case -- decision D1 (R4_00 Sec 5): a floor of 0.3 kg would
+# enlarge the integration step.
+#
+# The *variable* load, on top of the URDF's permanent 5 kg calibration payload
+# (R5_07 Sec 1.2): 5 + 2 kg stays inside the UR10's 10 kg rating with margin for
+# the cell's own 0.3 kg.  Pass 2's [0, 5] would have reached the rating.
 payload:
   enabled: true
-  mass: [0.0, 5.0]
+  mass: [0.0, 2.0]
   offset_x: [-0.08, 0.08]
   offset_y: [-0.08, 0.08]
   offset_z: [0.02, 0.20]
@@ -79,21 +98,36 @@ excitation:
   position_window:
     shoulder_pan_joint: [-3.1416, 3.1416]
     shoulder_lift_joint: [-3.1416, 0.0]
-    elbow_joint: [-2.8, 2.8]
+    # T-15: pass 3 measured 13-16 % of every bag below a quarter of its own
+    # median sigma_min(J), which on a target that reaches joint space through
+    # J^T is information loss rather than a numerical problem -- but it is
+    # material, and R5_07 T-15 asks for the window to be moved when it is.  The
+    # elbow crossing zero is the stretched-arm singularity, so the window now
+    # keeps the elbow bent.  Round 4's [-2.8, 2.8] is unchanged in
+    # ur10_table.yaml, which has no wrench target and so nothing to lose here.
+    elbow_joint: [0.35, 2.8]
     wrist_1_joint: [-3.1416, 3.1416]
     wrist_2_joint: [-3.1416, 3.1416]
     wrist_3_joint: [-3.1416, 3.1416]
-  # Modal probe, 48 lines log-spaced 3-150 Hz =
-  # elastic_sim.excitation.log_spaced_probe_harmonics(3.0, 150.0, 48, 0.1).
-  # Proximal open-loop modes are 7.5-67 Hz on this arm (iiwa 50-170 Hz) and
-  # the closed-loop observable resonance sits lower still, so the iiwa's
-  # 8-190 Hz comb would miss the bottom of the band (R4_03 Sec 3).
-  # Top index 1500 < 0.4 / sample_time_step / base_frequency = 2000.
+  # Modal probe, 24 lines log-spaced 3-30 Hz =
+  # elastic_sim.excitation.log_spaced_probe_harmonics(3.0, 30.0, 24, 0.1).
+  # RE-DERIVED in pass 3 (R5_06 Sec 2.2) from the round-4 comb's 48 lines over
+  # 3-150 Hz, for two reasons that both come from the recording rate below:
+  #
+  #  1. At the CB3's 125 Hz the differentiation bound is 0.25 * 125 = 31.25 Hz.
+  #     A 150 Hz comb puts the probe's energy exactly where the consumer's
+  #     Savitzky-Golay filter removes it, which is the mechanism R5_05 Sec 6.5
+  #     measured behind the arms' 89-99 % differentiation share.
+  #  2. What is left still covers the closed-loop proximal modes round 4
+  #     measured (5-33 Hz).  The wrist modes become unobservable, which round 4
+  #     already accepted for this arm.
+  #
+  # Halving the line count is the other half of R5_06 Sec 2.1.4's argument: the
+  # per-line acceleration, not the band, is what rings the mode, so 24 lines
+  # over a 10x narrower band carry far more each.
   probe_harmonics: [
-    30, 33, 35, 39, 42, 45, 49, 54, 58, 63, 69, 75,
-    81, 89, 96, 105, 114, 123, 134, 146, 159, 172, 187, 203,
-    221, 240, 261, 284, 309, 335, 364, 396, 430, 468, 508, 552,
-    600, 653, 709, 771, 838, 910, 989, 1075, 1169, 1270, 1380, 1500,
+    30, 33, 37, 41, 45, 49, 55, 60, 67, 74, 82, 90,
+    100, 110, 122, 135, 149, 165, 182, 201, 222, 246, 271, 300,
   ]
   probe_acceleration_fraction: 0.2
   regime:
@@ -118,12 +152,29 @@ dataset:
   # The owner's signal design (R5_01 Amendment 2).  The UR10 has no link-side
   # torque sensor and no link encoder: what it reports is a motor-side position
   # and a current-derived joint torque.  The motor position is therefore the
-  # real input; the link-side torque is the target and, on this arm, is the one
-  # signal that is simulated rather than measured -- R5_Q Q-5 asks the owner
-  # what stands in for it on the real UR10.
+  # real input; Q-5 asked what stands in for the link-side target on the real
+  # arm, and R5_07 Sec 1 answers it -- a flange cell.
   signals:
     position_side: motor
-    target: link_torque
+    # R5_07 Sec 1 (owner, 2026-09-23): the real UR10 will carry an F/T cell on
+    # the flange, and the arm's own reported effort can only be read as motor
+    # torque.  A link-side quantity is therefore obtainable *only* as the flange
+    # wrench mapped through the Jacobian, so that is the target -- the same
+    # structure as FMRR's, and it must be read the same way:
+    #
+    #   it is NOT a joint torque sensor.  The cell measures only what is distal
+    #   to it (the URDF's calibration_payload, plus any external contact force).
+    #   The arm's link inertia, the gravity of links 1-6 and the joint springs
+    #   themselves are proximal and therefore invisible to it.
+    #
+    # The elastic content of this target is m_payload * (a_true - a_rigid) at
+    # the flange, which is why the payload is permanent URDF hardware and why
+    # its mass was swept rather than guessed (R5_08 Sec 3).
+    target: ee_wrench_joint
+    # Keeps `tau_link_clean*` -- the simulated link-side torque -- in the file
+    # as debug columns beside the measurable target (R5_06 T-10's treatment,
+    # applied here too), so the sim-only science question can still be asked on
+    # this arm without regenerating anything.
     clean_columns: true
 
 simulation:
@@ -174,21 +225,39 @@ simulation:
     tau_noise_rel: 0.03
     tau_noise_abs: 0.5             # Nm
     tau_gain_error: 0.05
-    delay_samples: 2               # 4 ms at the 500 Hz grid below
+    delay_samples: 1               # 8 ms at the 125 Hz grid below
+    # The flange cell is a different instrument from the drives' current-derived
+    # torque, so it gets its own figures, for the same structural reason FMRR's
+    # does: a strain-gauge cell's noise is a resolution floor, not a fraction of
+    # the reading.  CLASS E, R5_Q Q-13 (which cell, and its figures?) is open:
+    # these are a generic industrial 6-axis cell's, of the order of an Axia90's
+    # force resolution.
+    ft_noise_rel: 0.0              # N per N of reading
+    ft_noise_abs: 0.25             # N, resolution floor
   # ESTIMATES (R5_Q Q-3): output-side friction of a harmonic drive plus its
   # bearing, ~2 % of the joint's rated torque in Coulomb and ~1 Nm/(rad/s)
   # viscous.  Joint order: pan, lift, elbow, wrist 1-3.
   plant_extras:
     link_friction:
-      viscous: [2.0, 2.0, 1.0, 0.4, 0.4, 0.4]     # Nm per rad/s
-      coulomb: [6.6, 6.6, 3.0, 1.1, 1.1, 1.1]     # Nm
+      # off | fixed | per_robot (R5_07 T-16, defect D-12).  See
+      # config/identification/fmrr_tecnobody.yaml for what each tier answers;
+      # the short version is that friction is background shared by both model
+      # classes, `fixed` is the single-machine default and does not make the
+      # holdout_robots split a test of friction, and `per_robot` is the
+      # robustness tier.
+      tier: fixed
+      viscous: {nominal: [2.0, 2.0, 1.0, 0.4, 0.4, 0.4], factor: [0.5, 2.0]}  # Nm per rad/s
+      coulomb: {nominal: [6.6, 6.6, 3.0, 1.1, 1.1, 1.1], factor: [0.5, 2.0]}  # Nm
+      provenance: E
   rigid_time_step: 5.0e-4
   max_time_step: 5.0e-4
-  # Kept at the round-4 500 Hz, *not* lowered to the CB3's 125 Hz RTDE rate.
-  # At 125 Hz the Nyquist limit is 62.5 Hz and the probe comb reaches 150 Hz, so
-  # a faithful recording rate and the round-4 probe band are incompatible: one
-  # of them has to give, and which is a numeric-prior decision (R5_Q Q-4).
-  sample_time_step: 0.002
+  # 125 Hz: the rate RTDE actually runs at on a CB3 (R5_Q Q-4), so the recorded
+  # grid is the real one.  Pass 2 kept 500 Hz because the round-4 probe band and
+  # a faithful rate are incompatible -- R5_06 Sec 2.2 resolves it by moving the
+  # probe (above), not the rate, since the rate is a fact about the robot and
+  # the comb is ours.  The cost is stated in the contract: this dataset sees
+  # only the arm's proximal modes.
+  sample_time_step: 0.008
   control_decimation: 1
 
 visualization:

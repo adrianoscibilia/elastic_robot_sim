@@ -58,6 +58,7 @@ _HEADLINE = [
     "tau_unexplained_fraction", "tau_partial_information", "condition_inflation", "tracking_rms", "rigid_nominal_residual_rms", "target_rms",
     "differentiation_share", "link_friction_share", "noise_share",
     "probe_band_deflection", "deflection_rms", "deflection_over_noise",
+    "sigma_min_j_median", "sigma_min_j_fraction_below", "sg_window",
     "baseline_rms_state", "baseline_rms_state_tau", "baseline_rms_tau", "baseline_rms_mean",
 ]
 

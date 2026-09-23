@@ -46,6 +46,13 @@ import pandas as pd
 SG_WINDOW = 11
 SG_ORDER = 3
 
+#: A sample counts as near-singular when its ``sigma_min(J)`` falls below this
+#: fraction of the bag's own median (``R5_07`` T-15).  Relative, because the
+#: full 6xn frame Jacobian's smallest singular value mixes force and moment
+#: units and only compares meaningfully against the same asset's own
+#: distribution.
+SINGULARITY_FRACTION = 0.25
+
 
 def savitzky_golay_acceleration(
     velocity: np.ndarray, time_step: float, *, window: int = SG_WINDOW, order: int = SG_ORDER,
@@ -160,6 +167,15 @@ class BagDiagnostics:
     deflection_rms: float
     deflection_over_noise: float
     tracking_rms: float
+    # T-15: how much of the wrench the mapping could still carry.  NaN on a
+    # dataset whose target is not an end-effector wrench, since there is no
+    # mapping to lose information in.
+    sigma_min_j_median: float
+    sigma_min_j_fraction_below: float
+    #: The Savitzky-Golay window this row was computed with (`R5_06` T-11).
+    #: ``differentiation_share`` is not a property of the data alone -- it is
+    #: what *this* consumer setting loses -- so the setting travels with it.
+    sg_window: int
 
     def as_dict(self) -> dict[str, Any]:
         from dataclasses import asdict
@@ -175,6 +191,7 @@ def bag_diagnostics(
     time_step: float,
     probe_band_hz: tuple[float, float] = (3.0, 200.0),
     pin_model: tuple[Any, Any, Any] | None = None,
+    sg_window: int = SG_WINDOW,
 ) -> BagDiagnostics:
     """Compute Q-C's measurements for one bag's rows.
 
@@ -200,9 +217,23 @@ def bag_diagnostics(
     # The state the *target* lives on: the link side, whatever the dataset's
     # own input columns carry.  Decomposing the link-side torque against a
     # motor-side state would attribute the deflection to the model error.
-    ddq_link = savitzky_golay_acceleration(dq_link, time_step)
+    ddq_link = savitzky_golay_acceleration(dq_link, time_step, window=sg_window)
     clean_dq = _column_block(frame, "dq_link_clean", n_dof)
     clean_target = _column_block(frame, "tau_link_clean", n_dof)
+
+    # -- T-15: posture, for a target that goes through J^T ------------------
+    # Near a singularity the degenerate wrench directions map to near-zero
+    # joint torque: the target stops carrying part of what the cell measured.
+    # That is information loss, not a numerical failure, so it is scored per
+    # bag rather than guarded against.  The threshold is a fraction of the
+    # bag's own median, which makes it a statement about *this* excitation
+    # rather than a unit-mixed absolute anyone would have to calibrate.
+    sigma_min_median = float("nan")
+    sigma_min_fraction = float("nan")
+    if "sigma_min_j" in frame.columns:
+        sigma = frame["sigma_min_j"].to_numpy(dtype=float)
+        sigma_min_median = float(np.median(sigma))
+        sigma_min_fraction = float(np.mean(sigma < SINGULARITY_FRACTION * sigma_min_median))
 
     # -- Q-C.1/2: collinearity and conditioning on the achieved motion -------
     regressor = idn.stack_regressor(pin, model, data, q_link, dq_link, ddq_link)
@@ -225,7 +256,7 @@ def bag_diagnostics(
     reference_dq = _column_block(frame, "dq_ref_clean", n_dof)
     reference_r2 = float("nan")
     if reference_q is not None and reference_dq is not None:
-        reference_ddq = savitzky_golay_acceleration(reference_dq, time_step)
+        reference_ddq = savitzky_golay_acceleration(reference_dq, time_step, window=sg_window)
         reference_regressor = idn.stack_regressor(
             pin, model, data, reference_q, reference_dq, reference_ddq,
         )
@@ -405,6 +436,9 @@ def bag_diagnostics(
         deflection_rms=deflection_rms,
         deflection_over_noise=deflection_over_noise,
         tracking_rms=tracking,
+        sg_window=int(sg_window),
+        sigma_min_j_median=sigma_min_median,
+        sigma_min_j_fraction_below=sigma_min_fraction,
     )
 
 
@@ -415,11 +449,21 @@ def dataset_diagnostics(
     *,
     bags: Sequence[str] | None = None,
     probe_band_hz: tuple[float, float] | None = None,
+    sg_window: int | None = None,
 ) -> pd.DataFrame:
     """Run :func:`bag_diagnostics` over a dataset, one row per bag.
 
     The Pinocchio model is built once and reused: it is the same nominal model
     for every bag, and building it per bag dominated the runtime.
+
+    The differentiation window comes from the dataset's own
+    ``differentiation.sg_window`` (`R5_06` T-11): quoting a
+    ``differentiation_share`` computed with the historical fixed 11 samples
+    against a dataset whose contract recommends another window mixes a
+    property of the data with a consumer setting, which is exactly the caveat
+    `R5_05` Sec 6.5 attached to its own numbers.  A caller may still override
+    it -- "what would today's consumer see?" is a legitimate question -- and
+    the window used is written into every row.
     """
     from . import identification as idn
 
@@ -430,12 +474,15 @@ def dataset_diagnostics(
             [float(record.get("exc_probe_top_hz") or 0.0) for record in manifest.get("records", [])] or [0.0]
         )
         probe_band_hz = (3.0, top if top > 0.0 else 0.5 / time_step)
+    if sg_window is None:
+        declared = (manifest.get("differentiation") or {}).get("sg_window")
+        sg_window = int(declared) if declared else SG_WINDOW
     pin_model = idn.build_model(asset)
     selected = frame if bags is None else frame[frame["bag"].isin(list(bags))]
     rows = [
         bag_diagnostics(
             group.reset_index(drop=True), asset=asset, n_dof=n_dof, time_step=time_step,
-            probe_band_hz=probe_band_hz, pin_model=pin_model,
+            probe_band_hz=probe_band_hz, pin_model=pin_model, sg_window=int(sg_window),
         ).as_dict()
         for _, group in selected.groupby("bag", sort=False)
     ]

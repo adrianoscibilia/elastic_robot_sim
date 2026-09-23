@@ -191,6 +191,58 @@ class MeasurementModel:
         }
 
 
+#: The instruments a recorded channel can go through.  ``force_cell`` is the
+#: 6-axis wrench of an end-effector cell, which is the same *instrument slot*
+#: as a link-side torque sensor but a different transducer, so it carries the
+#: cell's own noise figures (:meth:`MeasurementModel.for_force_cell`).
+CHANNEL_KINDS = ("position", "velocity", "motor_torque", "link_torque", "force_cell")
+
+
+@dataclass(frozen=True)
+class MeasuredChannel:
+    """One channel after its instrument, with the gain that produced it."""
+
+    values: np.ndarray
+    gain: np.ndarray
+
+
+def measure_channel(
+    model: MeasurementModel, values: np.ndarray, kind: str, seed: int,
+) -> MeasuredChannel:
+    """Apply ``model`` to one channel of one bag (``R5_06`` Sec 3).
+
+    :func:`measure_bag` measures the six state channels of a rollout together,
+    on one stream, so that their draws stay in a fixed order.  A channel that
+    is not one of those six -- the force/torque cell's 6-axis wrench is the
+    only one so far -- needs the same instrument model without pretending to
+    be a joint channel, which is what this is for.  Passing a wrench into all
+    six ``measure_bag`` slots happened to work because ``n_dof`` is inferred
+    from the array width; it was not a contract.
+
+    ``kind`` selects the instrument.  Which channels are delayed follows
+    :func:`measure_bag`: everything that comes back over the bus is, and the
+    controller's own command (``motor_torque``) is not.
+    """
+    if kind not in CHANNEL_KINDS:
+        raise ValueError(f"measure_channel: kind must be one of {CHANNEL_KINDS}, got {kind!r}")
+    values = np.atleast_2d(np.asarray(values, dtype=float))
+    width = int(values.shape[1])
+    if kind == "force_cell":
+        model = model.for_force_cell()
+    if model.is_ideal:
+        return MeasuredChannel(values=values, gain=np.ones(width))
+    rng = np.random.default_rng((int(seed), 9, CHANNEL_KINDS.index(kind)))
+    if kind == "position":
+        return MeasuredChannel(model.delay(model.measure_position(values, rng)), np.ones(width))
+    if kind == "velocity":
+        return MeasuredChannel(model.delay(model.measure_velocity(values, rng)), np.ones(width))
+    gain = model.sample_gain(rng, width)
+    measured = model.measure_torque(values, rng, gain=gain)
+    if kind != "motor_torque":
+        measured = model.delay(measured)
+    return MeasuredChannel(values=measured, gain=gain)
+
+
 #: A perfect instrument: what every round-4 config gets.
 IDEAL_MEASUREMENT = MeasurementModel()
 

@@ -35,7 +35,7 @@ from .controllers import (
     effective_bandwidth,
     sample_velocity_loop,
 )
-from .measurement import IDEAL_MEASUREMENT, MeasurementModel, measure_bag
+from .measurement import IDEAL_MEASUREMENT, MeasurementModel, measure_bag, measure_channel
 from .payload import Payload, payload_asset
 from .plant_extras import NO_EXTRAS, PlantExtras, StiffnessNonlinearity, TorqueRipple
 from .wrench import WRENCH_COLUMNS, ForceTorqueSensor, SensorSpec
@@ -624,6 +624,23 @@ class SignalPolicy:
         }
 
 
+#: The link-friction background as a declared experimental axis (`R5_07` T-16).
+LINK_FRICTION_TIERS = ("off", "fixed", "per_robot")
+
+
+def _robot_stream(robot: str) -> int:
+    """A stable integer per robot name, so the draw survives adding robots."""
+    return int.from_bytes(hashlib.blake2b(str(robot).encode("utf-8"), digest_size=4).digest(), "big")
+
+
+def _log_uniform(rng: np.random.Generator, bracket: tuple[float, float], size: int) -> np.ndarray:
+    """One factor per joint, log-uniform over ``bracket`` (degenerate is 1.0)."""
+    low, high = float(bracket[0]), float(bracket[1])
+    if low == high:
+        return np.full(size, low)
+    return np.exp(rng.uniform(np.log(low), np.log(high), size=size))
+
+
 @dataclass(frozen=True)
 class PlantExtrasSampling:
     """Config-level description of the non-Lagrangian plant effects.
@@ -633,8 +650,37 @@ class PlantExtrasSampling:
     round 4's purely Lagrangian link side.
     """
 
+    #: ``off`` | ``fixed`` | ``per_robot`` (`R5_07` T-16, defect D-12).  The
+    #: link-friction background is an experimental axis, not an incidental
+    #: setting, because it decides what the elastic-vs-residual comparison can
+    #: even see: both model classes absorb friction, so whatever share of the
+    #: residual it occupies is shared background that the one term being moved
+    #: between them has to stand out against.
+    #:
+    #: * ``off`` -- no link friction.  The science tier: can the elastic class
+    #:   beat the residual class on **elasticity alone**?
+    #: * ``fixed`` -- one constant law for every bag of every robot, which is
+    #:   round 5's shipped behaviour and stays the default.  It is the honest
+    #:   setting for a dataset aimed at *one* machine: a real FMRR has one
+    #:   friction law and memorizing that machine is the job.  What it is not
+    #:   is a test of friction generalization, and ``split.mode:
+    #:   holdout_robots`` must not be read as one -- the held-out robots have
+    #:   exactly the friction the training ones do.
+    #: * ``per_robot`` -- drawn per robot from ``*_factor`` around the nominal
+    #:   and logged in the existing ``link_viscous__*``/``link_coulomb__*``
+    #:   columns.  The robustness tier, and the only one where a
+    #:   ``holdout_robots`` claim about friction is true.  It makes the
+    #:   comparison *harder*, not easier: a pointwise model cannot infer a
+    #:   per-robot coefficient from one sample, so the background turns from a
+    #:   learnable constant into irreducible variance.
+    link_friction_tier: str = "fixed"
     link_friction_viscous: tuple[float, ...] = ()
     link_friction_coulomb: tuple[float, ...] = ()
+    #: Multiplicative bracket around the nominals, used by ``per_robot`` only.
+    #: ``(1.0, 1.0)`` is the degenerate factor a scalar config gets, so a
+    #: round-4 or round-5-pass-2 config loads and behaves unchanged.
+    link_friction_viscous_factor: tuple[float, float] = (1.0, 1.0)
+    link_friction_coulomb_factor: tuple[float, float] = (1.0, 1.0)
     stiffness_breakpoints: tuple[float, ...] = ()
     stiffness_factors: tuple[float, ...] = ()
     ripple_amplitude: float = 0.0
@@ -642,6 +688,18 @@ class PlantExtrasSampling:
     ripple_random_phase: bool = True
 
     def __post_init__(self) -> None:
+        if self.link_friction_tier not in LINK_FRICTION_TIERS:
+            raise ValueError(
+                f"plant_extras.link_friction.tier must be one of {LINK_FRICTION_TIERS}, "
+                f"got {self.link_friction_tier!r}"
+            )
+        for name in ("link_friction_viscous_factor", "link_friction_coulomb_factor"):
+            low, high = (float(v) for v in getattr(self, name))
+            if low <= 0.0 or high < low:
+                raise ValueError(
+                    f"plant_extras.link_friction.{name.split('_')[-2]}.factor must be a positive "
+                    "[low, high] bracket with low <= high"
+                )
         viscous, coulomb = self.link_friction_viscous, self.link_friction_coulomb
         if viscous and coulomb and len(viscous) != len(coulomb) and 1 not in (len(viscous), len(coulomb)):
             raise ValueError(
@@ -657,15 +715,22 @@ class PlantExtrasSampling:
             )
 
     @property
+    def has_link_friction(self) -> bool:
+        """True when this config's tier actually puts friction on the plant."""
+        return self.link_friction_tier != "off" and bool(
+            self.link_friction_viscous or self.link_friction_coulomb
+        )
+
+    @property
     def is_empty(self) -> bool:
         return not (
-            self.link_friction_viscous or self.link_friction_coulomb
-            or self.stiffness_breakpoints or self.ripple_amplitude
+            self.has_link_friction or self.stiffness_breakpoints or self.ripple_amplitude
         )
 
 
 def plant_extras_for_bag(
     sampling: PlantExtrasSampling, n_dof: int, dataset_seed: int, trajectory_seed_value: int,
+    *, robot: str | None = None,
 ) -> PlantExtras:
     """Resolve one bag's plant extras, drawing the ripple phase.
 
@@ -674,13 +739,28 @@ def plant_extras_for_bag(
     dataset for the same reason the drive's velocity-loop gains are: a single
     fixed phase is a map a network can memorize instead of learning that a
     motor-angle-periodic disturbance exists at all.
+
+    ``robot`` is the tier name, needed only by the ``per_robot`` friction tier
+    (`R5_07` T-16), whose draw is keyed on the *robot* rather than on the bag:
+    a machine has one friction law, and drawing it per bag would make it a
+    per-sample disturbance instead of a property of the machine the split
+    holds out.  Its stream is ``(seed, 10, robot)``, again a new index.
     """
     if sampling.is_empty:
         return NO_EXTRAS
     link_friction = None
-    if sampling.link_friction_viscous or sampling.link_friction_coulomb:
+    if sampling.has_link_friction:
         viscous = _per_joint(sampling.link_friction_viscous or (0.0,), n_dof, "plant_extras.link_friction.viscous")
         coulomb = _per_joint(sampling.link_friction_coulomb or (0.0,), n_dof, "plant_extras.link_friction.coulomb")
+        if sampling.link_friction_tier == "per_robot":
+            if robot is None:
+                raise ValueError(
+                    "plant_extras.link_friction.tier: per_robot needs the robot (tier) name, so the "
+                    "draw is keyed on the machine rather than on the bag; pass robot=tier.name"
+                )
+            rng = np.random.default_rng((int(dataset_seed), 10, _robot_stream(robot)))
+            viscous = viscous * _log_uniform(rng, sampling.link_friction_viscous_factor, n_dof)
+            coulomb = coulomb * _log_uniform(rng, sampling.link_friction_coulomb_factor, n_dof)
         link_friction = FrictionModel(viscous, coulomb)
     nonlinearity = None
     if sampling.stiffness_breakpoints:
@@ -710,6 +790,12 @@ class DatasetConfig:
     ``seed``; rebuild it with :func:`build_tiers` after changing any of them.
     """
 
+    #: Config-file generation.  1 is round 3/4's schema; 2 declares a config
+    #: written in round 5 or later and, with it, the differentiation bound
+    #: `probe_top_hz <= 0.25 * sample_rate` as a *load-time error* rather than
+    #: a build-time warning (`R5_06` T-8; D-8 keeps the two round-4 files
+    #: loading).
+    schema_version: int = 1
     asset: str = "kuka_lbr_iiwa_14_r820_table"
     backends: tuple[str, ...] = ("mujoco", "newton")
     rigid_reference: bool = True
@@ -783,7 +869,7 @@ _MEASUREMENT_KEYS = {
     "tau_gain_error", "delay_samples", "ft_noise_rel", "ft_noise_abs",
 }
 _PLANT_EXTRAS_KEYS = {"link_friction", "stiffness_nonlinearity", "torque_ripple"}
-_LINK_FRICTION_KEYS = {"viscous", "coulomb"}
+_LINK_FRICTION_KEYS = {"tier", "viscous", "coulomb", "provenance"}
 _STIFFNESS_NONLINEARITY_KEYS = {"breakpoints", "factors"}
 _TORQUE_RIPPLE_KEYS = {"amplitude", "order", "random_phase"}
 _CONTROL_GAINS_KEYS = {"enabled", "natural_frequency", "damping_ratio"}
@@ -825,13 +911,35 @@ def _controller_spec(controller_cfg: Mapping[str, Any]) -> ControllerSpec:
     )
 
 
+def _friction_prior(raw: Any) -> tuple[tuple[float, ...], tuple[float, float]]:
+    """``viscous``/``coulomb`` as either a plain vector or ``{nominal, factor}``.
+
+    The plain vector is what every config before `R5_07` writes and keeps its
+    exact meaning: a nominal with the degenerate factor ``[1, 1]``, which the
+    ``per_robot`` tier then draws no spread from.  The mapping form is what
+    makes the spread explicit.
+    """
+    if raw is None:
+        return (), (1.0, 1.0)
+    if isinstance(raw, Mapping):
+        nominal = tuple(float(v) for v in np.atleast_1d(raw.get("nominal", []) or []))
+        factor = raw.get("factor", [1.0, 1.0])
+        return nominal, (float(factor[0]), float(factor[1]))
+    return tuple(float(v) for v in np.atleast_1d(raw or [])), (1.0, 1.0)
+
+
 def _plant_extras_sampling(extras_cfg: Mapping[str, Any]) -> PlantExtrasSampling:
     friction_cfg = extras_cfg.get("link_friction", {}) or {}
     spring_cfg = extras_cfg.get("stiffness_nonlinearity", {}) or {}
     ripple_cfg = extras_cfg.get("torque_ripple", {}) or {}
+    viscous_nominal, viscous_factor = _friction_prior(friction_cfg.get("viscous"))
+    coulomb_nominal, coulomb_factor = _friction_prior(friction_cfg.get("coulomb"))
     return PlantExtrasSampling(
-        link_friction_viscous=tuple(float(v) for v in np.atleast_1d(friction_cfg.get("viscous", []) or [])),
-        link_friction_coulomb=tuple(float(v) for v in np.atleast_1d(friction_cfg.get("coulomb", []) or [])),
+        link_friction_tier=str(friction_cfg.get("tier", "fixed")),
+        link_friction_viscous=viscous_nominal,
+        link_friction_coulomb=coulomb_nominal,
+        link_friction_viscous_factor=viscous_factor,
+        link_friction_coulomb_factor=coulomb_factor,
         stiffness_breakpoints=tuple(float(v) for v in spring_cfg.get("breakpoints", []) or []),
         stiffness_factors=tuple(float(v) for v in spring_cfg.get("factors", []) or []),
         ripple_amplitude=float(ripple_cfg.get("amplitude", 0.0)),
@@ -967,7 +1075,8 @@ def load_config(path: str | Path) -> DatasetConfig:
             "simulation.allow_control_decimation: true (no automatic stability guard exists yet; "
             "verify the residual stays acceptable for this asset before enabling it, see R3_12 Sec 1/2.5)"
         )
-    return DatasetConfig(
+    config = DatasetConfig(
+        schema_version=int(raw.get("schema_version", 1)),
         asset=str(raw.get("asset", "kuka_lbr_iiwa_14_r820_table")),
         backends=tuple(raw.get("backends", ["mujoco"])),
         rigid_reference=rigid_reference,
@@ -1052,6 +1161,8 @@ def load_config(path: str | Path) -> DatasetConfig:
         visualize=bool(view_cfg.get("enabled", False)),
         realtime_scale=float(view_cfg.get("realtime_scale", 1.0)),
     )
+    require_probe_within_sampling_bound(config, source=source)
+    return config
 
 
 def trajectory_seed(config: DatasetConfig, tier: Tier, index: int) -> int:
@@ -1450,20 +1561,17 @@ def rollout_frame(
     q = measured.q_link if signals.position_side == "link" else measured.q_motor
     dq = measured.dq_link if signals.position_side == "link" else measured.dq_motor
     if signals.target == "ee_wrench_joint":
-        # The cell's own noise and gain error, drawn on the link-torque channel's
-        # stream: it is the same *instrument slot* in the signal design, just a
-        # different transducer, so a config's `tau_gain_error` applies to it too.
-        cell = measurement.for_force_cell()
-        measured_wrench = measure_bag(
-            cell, seed=measurement_seed + 1,
-            q_motor=wrench, dq_motor=wrench, q_link=wrench, dq_link=wrench,
-            tau_motor=wrench, tau_link=wrench,
-        ).tau_link
-        target = measure_bag(
-            cell, seed=measurement_seed,
-            q_motor=wrench_target, dq_motor=wrench_target, q_link=wrench_target,
-            dq_link=wrench_target, tau_motor=wrench_target, tau_link=wrench_target,
-        ).tau_link
+        # One instrument, one realization (`R5_06` Sec 3).  The cell measures
+        # the 6-axis wrench -- with its own noise and gain error, since it is
+        # the same *instrument slot* as a link-side torque sensor but a
+        # different transducer -- and the Jacobian is software applied after
+        # it, at the configuration the encoders report.  Measuring the wrench
+        # and the mapped target as two draws, as pass 2 did, gave a consumer
+        # two independent realizations of one physical reading.
+        measured_wrench = measure_channel(
+            measurement, wrench, kind="force_cell", seed=measurement_seed,
+        ).values
+        target = sensor.joint_torques(q, measured_wrench)
     elif signals.target == "link_torque":
         target = measured.tau_link
     else:
@@ -1494,9 +1602,16 @@ def rollout_frame(
     if wrench is not None:
         # The raw 6-axis reading beside the mapped target (R5_03 T-1): a
         # consumer may want the wrench itself, and a diagnostic needs it to
-        # separate the mapping from the measurement.
+        # separate the mapping from the measurement.  `ft` is exactly
+        # `J(q)^T w` of these two sets of columns (`R5_06` Sec 3).
         for index, column in enumerate(WRENCH_COLUMNS):
             frame[column] = measured_wrench[:, index]
+        # How much of the wrench the mapping can still carry (`R5_07` T-15).
+        # On a 6-DoF arm `J^T` is configuration dependent and near a
+        # singularity whole wrench directions stop reaching joint space; this
+        # is the per-sample record of that, so a bag can be scored on posture
+        # instead of the excitation being assumed non-singular.
+        frame["sigma_min_j"] = sensor.smallest_singular_value(q)
     if signals.clean_columns:
         # The exact simulator values on the same grid.  A noisy dataset is only
         # decomposable into physics and instrument if these survive (R5_00
@@ -1602,9 +1717,17 @@ def raise_on_control_separation_violation(
     )
 
 
-#: One force/torque cell per (asset name, target) inside a worker process.
-#: `_run_bag` runs in a process pool, so this is per-worker and never shared.
-_SENSOR_CACHE: dict[tuple[str, str], ForceTorqueSensor] = {}
+#: One force/torque cell per (asset name, URDF path, target) inside a worker
+#: process.  `_run_bag` runs in a process pool, so this is per-worker and never
+#: shared.
+#:
+#: The URDF path is part of the key because an asset's *name* does not identify
+#: its inertias: `payload_asset` and `scripts/sweep_ft_payload.py` both yield an
+#: asset with the same name and a rewritten URDF, and keying on the name alone
+#: silently hands the second caller the first one's cell.  That cost the T-14
+#: sweep its first run -- every payload mass was measured with the 0 kg cell,
+#: which reads identically zero (`R5_08` D-13).
+_SENSOR_CACHE: dict[tuple[str, str, str], ForceTorqueSensor] = {}
 
 
 def _sensor_for(asset: AssetSpec, signals: SignalPolicy) -> ForceTorqueSensor | None:
@@ -1617,7 +1740,7 @@ def _sensor_for(asset: AssetSpec, signals: SignalPolicy) -> ForceTorqueSensor | 
     """
     if not signals.needs_sensor:
         return None
-    key = (asset.name, signals.target)
+    key = (asset.name, str(asset.urdf_path), signals.target)
     if key not in _SENSOR_CACHE:
         spec = SensorSpec.from_asset(asset)
         if spec is None:
@@ -1824,7 +1947,9 @@ def resolve_bag(
         natural_frequency=natural_frequency, damping_ratio=damping_ratio,
         position_gain=position_gain, velocity_bandwidth=velocity_bandwidth, integral_time=integral_time,
     )
-    extras = plant_extras_for_bag(config.plant_extras, len(asset.joint_names), config.seed, traj_seed)
+    extras = plant_extras_for_bag(
+        config.plant_extras, len(asset.joint_names), config.seed, traj_seed, robot=tier.name,
+    )
 
     stack = contextlib.ExitStack()
     try:
@@ -2204,6 +2329,24 @@ def generate(
                 if config.split.mode == "holdout_robots"
                 else "contiguous/no holdout: every robot appears in both train and test"
             ),
+            # What the split does *not* test, said out loud (`R5_07` T-16,
+            # defect D-12): the stiffness, damping and reflected inertia vary
+            # per robot, so the holdout tests those; the link-friction
+            # background only varies per robot on the `per_robot` tier, and on
+            # `fixed` (the default) every held-out robot carries exactly the
+            # training robots' friction law.
+            "tests": sorted(
+                ["transmission stiffness", "transmission damping", "reflected inertia"]
+                + (["link friction"] if config.plant_extras.link_friction_tier == "per_robot" else [])
+            ) if config.split.mode == "holdout_robots" else [],
+            "does_not_test": (
+                ["link friction: the same law on every robot "
+                 f"(plant_extras.link_friction.tier: {config.plant_extras.link_friction_tier})"]
+                if config.split.mode == "holdout_robots"
+                and config.plant_extras.has_link_friction
+                and config.plant_extras.link_friction_tier != "per_robot"
+                else []
+            ),
         },
         "records": records,
     }
@@ -2289,15 +2432,60 @@ def warn_if_probe_outruns_differentiation(config: DatasetConfig) -> None:
         return
     top = policy["probe_top_hz"]
     rate = policy["sample_rate_hz"]
+    # The cap that would actually make it resolvable is the *filter's* floor,
+    # 0.45 * rate / (poly + 2), not 0.25 * rate: pass 3 found the two bounds
+    # disagree and the round had been quoting the looser one (`R5_08` Sec 2).
+    resolvable_top = 0.45 * rate / (SG_POLY_ORDER + 2)
     warnings.warn(
-        f"probe top frequency {top:g} Hz is above 0.25 x the {rate:g} Hz sampling rate, so no "
-        f"Savitzky-Golay window both smooths the velocity and passes the probe band: the "
-        f"recommended window is at its floor ({policy['sg_window']} samples, cutoff "
-        f"{policy['sg_cutoff_hz']:.0f} Hz) and the probe's modal content will reappear in the "
-        f"consumer's residual rather than in its ddq. Cap the top harmonic at "
-        f"{int(0.25 * rate / max(config.excitation.base_frequency, 1e-12))} or raise the sampling "
-        "rate (R5_03 T-4; contract carries differentiation.probe_resolvable=false).",
+        f"probe top frequency {top:g} Hz is above the widest passband a Savitzky-Golay "
+        f"derivative of order {SG_POLY_ORDER} has at {rate:g} Hz ({resolvable_top:.1f} Hz, the "
+        f"filter's five-sample floor), so no window both smooths the velocity and passes the "
+        f"probe band: the recommended window is at that floor ({policy['sg_window']} samples, "
+        f"cutoff {policy['sg_cutoff_hz']:.0f} Hz) and the probe's modal content will reappear in "
+        f"the consumer's residual rather than in its ddq. Cap the top harmonic at "
+        f"{int(resolvable_top / max(config.excitation.base_frequency, 1e-12))} or raise the "
+        "sampling rate (R5_03 T-4; contract carries differentiation.probe_resolvable=false). "
+        "This is a different bound from the schema_version: 2 load-time check, which is the "
+        f"sampling one, 0.25 x rate = {0.25 * rate:g} Hz.",
         stacklevel=2,
+    )
+
+
+def require_probe_within_sampling_bound(config: DatasetConfig, *, source: Any = "config") -> None:
+    """Refuse a round-5 config whose probe outruns its own sampling rate.
+
+    `R5_03` T-4 asked for ``probe_top_hz <= 0.25 * sample_rate`` as a hard
+    requirement and `R5_05` D-8 made it a build-time warning instead, because
+    both shipped round-4 configs violate it and `R4_06 B5` asserts they load
+    warning-free.  `R5_06` T-8 settles the two halves: the bound is an error
+    for any config that declares ``schema_version: 2`` -- one written in round
+    5 or later, which has no round-4 invariant to keep -- and stays a
+    build-time warning for ``schema_version: 1``.
+
+    **This bound is not the same as** :func:`differentiation_policy`'s
+    ``probe_resolvable`` **flag, and pass 3 found that they part company**
+    (`R5_08` Sec 2).  ``0.25 * rate`` is a sampling criterion: below it the
+    probe's top line is recorded with four samples per period.  Resolvability
+    is a *differentiation* criterion: a Savitzky-Golay derivative of order 3
+    has a five-sample floor, so its widest passband is ``0.45 * rate / 5 =
+    0.09 * rate``, and a probe between 0.09 and 0.25 of the rate is recorded
+    faithfully and then filtered out again by the consumer.  Both facts matter
+    and they are reported separately: this one refuses the config, the other
+    is carried in the contract for the consumer to read.
+    """
+    if int(config.schema_version) < 2:
+        return
+    policy = differentiation_policy(config)
+    rate = policy["sample_rate_hz"]
+    top = policy["probe_top_hz"]
+    if top <= 0.25 * rate:
+        return
+    cap = int(0.25 * rate / max(config.excitation.base_frequency, 1e-12))
+    raise ValueError(
+        f"{source}: probe top frequency {top:g} Hz is above 0.25 x the {rate:g} Hz sampling rate, so "
+        f"the probe's top line is recorded with fewer than four samples per period. Cap the top "
+        f"harmonic index at {cap} or raise the sampling rate. (R5_06 T-8; this is an error rather "
+        "than a warning because the config declares schema_version: 2.)"
     )
 
 
@@ -2425,6 +2613,22 @@ def write_dataset(
         "target_instrument": str((manifest.get("signals") or {}).get("target_kind", "joint_torque_sensor")),
         "target_contains": _target_contains(manifest),
         "force_torque_sensor": manifest.get("force_torque_sensor"),
+        # Diagnostic columns beside the target, when there is a cell (T-15).
+        # `sigma_min_j` is sigma_min(J(q)) at the recorded configuration: near
+        # a singularity whole wrench directions map to near-zero joint torque,
+        # so the target stops carrying part of what the cell measured.  A
+        # consumer weighting or filtering samples by posture reads this; it is
+        # never a model input.
+        "posture_columns": (
+            None if not (manifest.get("force_torque_sensor")) else {
+                "sigma_min_j": (
+                    "smallest singular value of the 6xn frame Jacobian at the recorded "
+                    "configuration; information the J^T mapping can still carry, not a "
+                    "numerical-failure flag (R5_07 T-15)"
+                ),
+                "ft_equals": "ft = J(q)^T w on the recorded q* and w_* columns, exactly (R5_06 Sec 3)",
+            }
+        ),
         # How to differentiate this dataset's velocity (R5_03 T-4).  The
         # consumer reads it instead of hard-coding a window.
         "differentiation": manifest.get("differentiation"),
