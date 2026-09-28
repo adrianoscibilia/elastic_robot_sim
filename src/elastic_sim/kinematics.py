@@ -66,6 +66,12 @@ def kinematic_groups(asset: AssetSpec, selected: Sequence[str] | None = None) ->
     return tuple(result)
 
 
+#: ``validate_path`` refuses a segment needing more bisection levels than this.
+MAX_BISECTION_LEVELS = 12
+#: First-pass stride of an early-exit collision check (see ``collision_report``).
+_COARSE_STRIDE = 16
+
+
 class PortableKinematics:
     """Pinocchio/Pink kinematics with Coal validation for one repository asset."""
 
@@ -102,8 +108,10 @@ class PortableKinematics:
 
     def _model_q(self, q: Sequence[float]) -> np.ndarray:
         values = np.asarray(q, dtype=float)
-        if values.shape != (len(self.asset.joint_names),):
-            raise ValueError(f"Expected {len(self.asset.joint_names)} joints, got {values.shape}")
+        # len(_q_indices), not asset.joint_names: that property re-parses the
+        # URDF, once per checked configuration on this hot path.
+        if values.shape != (len(self._q_indices),):
+            raise ValueError(f"Expected {len(self._q_indices)} joints, got {values.shape}")
         if self._direct:
             return values.copy()
         model_q = self.pin.neutral(self.model)
@@ -211,10 +219,28 @@ class PortableKinematics:
             "max_orientation_error": max_rot_error, "samples": count,
         }
 
-    def collision_report(self, configurations: Iterable[Sequence[float]], margin: float = 0.0) -> CollisionReport:
+    def collision_report(self, configurations: Iterable[Sequence[float]], margin: float = 0.0,
+                         *, stop_at_first_invalid: bool = False) -> CollisionReport:
+        """Minimum clearance over ``configurations``.
+
+        ``stop_at_first_invalid`` is for callers that only read ``valid`` (a
+        candidate filter): configurations are checked coarse-first -- every
+        ``_COARSE_STRIDE``-th, then the rest -- and the check stops at the
+        first one below ``margin``.  ``valid`` is exactly what the full check
+        gives; on an invalid path ``minimum_distance`` is then only an upper
+        bound on the true minimum.  On a valid path every configuration is
+        checked either way, so the report is identical.
+        """
         if self._direct or not self.asset.self_collisions or not self.collision_model.collisionPairs:
             values = tuple(configurations)
             return CollisionReport(True, float("inf"), None, len(values))
+        if stop_at_first_invalid:
+            configurations = list(configurations)
+            order = np.concatenate([
+                np.arange(0, len(configurations), _COARSE_STRIDE),
+                np.setdiff1d(np.arange(len(configurations)), np.arange(0, len(configurations), _COARSE_STRIDE)),
+            ])
+            configurations = [configurations[int(i)] for i in order]
         minimum, closest, checked = float("inf"), None, 0
         cache: dict[bytes, tuple[float, tuple[str, str] | None]] = {}
         for q in configurations:
@@ -241,10 +267,16 @@ class PortableKinematics:
             state_minimum, state_pair = cache[key]
             if state_minimum < minimum:
                 minimum, closest = state_minimum, state_pair
+            if stop_at_first_invalid and minimum < margin:
+                break
         return CollisionReport(minimum >= margin, minimum, closest, checked)
 
-    def validate_path(self, q: np.ndarray, *, margin: float = 0.0, max_joint_step: float = 0.05) -> CollisionReport:
-        """Validate the path at a bounded joint-space arc-length resolution."""
+    def validate_path(self, q: np.ndarray, *, margin: float = 0.0, max_joint_step: float = 0.05,
+                      stop_at_first_invalid: bool = False) -> CollisionReport:
+        """Validate the path at a bounded joint-space arc-length resolution.
+
+        ``stop_at_first_invalid``: see :meth:`collision_report`.
+        """
         values = np.asarray(q, dtype=float)
         if values.ndim != 2 or values.shape[1] != len(self.asset.joint_names):
             raise ValueError("Path shape does not match asset active joints")
@@ -265,14 +297,25 @@ class PortableKinematics:
         # Include every remaining sample.  When adjacent samples are too
         # far apart, recursively bisect the segment (a power-of-two number of
         # subdivisions) until every checked increment is within the bound.
+        if not np.isfinite(values).all():
+            raise ValueError("validate_path: the path contains non-finite joint values")
         expanded: list[np.ndarray] = [values[0]]
         for first, second in zip(values[:-1], values[1:]):
             distance = float(np.max(np.abs(second - first)))
             levels = max(0, int(np.ceil(np.log2(distance / max_joint_step)))) if distance > 0.0 else 0
+            if levels > MAX_BISECTION_LEVELS:
+                # 2**12 sub-steps is a 200 rad jump at the default 0.05 rad
+                # resolution: no physical path has one between two samples.  A
+                # diverged rollout does, and without this cap the bisection ran
+                # for 17 h on one (`R5_09` F-1).
+                raise ValueError(
+                    f"validate_path: a {distance:.3g} rad jump between consecutive samples needs "
+                    f"2**{levels} sub-steps (cap 2**{MAX_BISECTION_LEVELS}); the path is not physical"
+                )
             subdivisions = 2**levels
             for step in range(1, subdivisions + 1):
                 expanded.append(first + (second - first) * (step / subdivisions))
-        return self.collision_report(expanded, margin)
+        return self.collision_report(expanded, margin, stop_at_first_invalid=stop_at_first_invalid)
 
     def _prepare_collision_pairs(self) -> None:
         self.collision_model.addAllCollisionPairs()

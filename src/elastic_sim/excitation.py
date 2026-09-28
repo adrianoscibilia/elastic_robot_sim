@@ -138,6 +138,27 @@ def project_coefficients(
     return a, b
 
 
+#: ``(sin, cos)`` of ``outer(time, scaled)``, keyed on both arrays' bytes.
+#: ``optimize_excitation`` evaluates ~6 series per candidate on the same two
+#: or three grids (the 0.1 ms probe grid is 100 k x n_probe), so the
+#: transcendentals, not the products, were most of its cost (`R5_10` T-3).
+#: The same inputs give the same arrays, so results are bit-identical.
+_BASIS_CACHE: dict[tuple[bytes, bytes], tuple[np.ndarray, np.ndarray]] = {}
+_BASIS_CACHE_SIZE = 8
+
+
+def _fourier_basis(time: np.ndarray, scaled: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    key = (time.tobytes(), scaled.tobytes())
+    hit = _BASIS_CACHE.get(key)
+    if hit is None:
+        phase = np.outer(time, scaled)
+        hit = (np.sin(phase), np.cos(phase))
+        if len(_BASIS_CACHE) >= _BASIS_CACHE_SIZE:
+            _BASIS_CACHE.pop(next(iter(_BASIS_CACHE)))
+        _BASIS_CACHE[key] = hit
+    return hit
+
+
 def evaluate_series(
     a: np.ndarray, b: np.ndarray, offset: np.ndarray, omega: float, time: np.ndarray,
     indices: np.ndarray | None = None,
@@ -149,8 +170,7 @@ def evaluate_series(
     """
     harmonics = np.arange(1, a.shape[1] + 1, dtype=float) if indices is None else np.asarray(indices, dtype=float)
     scaled = harmonics * omega
-    phase = np.outer(np.asarray(time, dtype=float), scaled)
-    sin, cos = np.sin(phase), np.cos(phase)
+    sin, cos = _fourier_basis(np.asarray(time, dtype=float), scaled)
     q = sin @ (a / scaled).T - cos @ (b / scaled).T + np.asarray(offset, dtype=float)
     dq = cos @ a.T + sin @ b.T
     ddq = -(sin @ (a * scaled).T) + cos @ (b * scaled).T
@@ -481,6 +501,9 @@ def optimize_excitation(
                 q,
                 margin=float(asset.metadata.get("collision", {}).get("margin", 0.0)),
                 max_joint_step=float(asset.metadata.get("collision", {}).get("max_joint_step", 0.05)),
+                # Only `valid` is read here, and a rejected candidate is most
+                # of this loop's collision cost (`R5_10` T-3).
+                stop_at_first_invalid=True,
             )
             if not report.valid:
                 rejected_for_collision += 1

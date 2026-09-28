@@ -44,6 +44,14 @@ calibration = [
 
 [tool.pytest.ini_options]
 markers = ["slow: needs a simulator backend and takes noticeably longer than the rest of the suite"]
+# legacy/ holds the archived pre-identification code and its tests (R5_10
+# T-6); run those explicitly with `pytest legacy/tests`.
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+# The package is src/elastic_sim only; legacy/ is never packaged.
+where = ["src"]
+include = ["elastic_sim*"]
 
 [tool.uv]
 package = false

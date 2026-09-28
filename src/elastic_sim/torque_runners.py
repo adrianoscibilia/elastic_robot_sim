@@ -46,6 +46,59 @@ class TorqueCommand:
     feedback: np.ndarray
 
 
+class RolloutDiverged(RuntimeError):
+    """A rollout went numerically unstable; the bag carries no physics.
+
+    A ``RuntimeError`` so callers that already caught the historical
+    non-finite error keep working.  ``kind`` is ``non_finite`` or the MuJoCo
+    warning name (``mjWARN_BADQACC``/``BADQPOS``/``BADQVEL``); ``dof`` is the
+    simulator's own DOF index when the backend reports one, and ``joint`` the
+    asset joint it belongs to.
+    """
+
+    def __init__(self, message: str, *, kind: str, time: float, dof: int | None = None,
+                 joint: str | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.time = float(time)
+        self.dof = dof
+        self.joint = joint
+
+    def describe(self) -> dict[str, Any]:
+        return {"kind": self.kind, "time": self.time, "mujoco_dof": self.dof, "joint": self.joint,
+                "message": str(self)}
+
+
+#: MuJoCo resets ``qacc`` (``BADQACC``) or the whole state and keeps
+#: integrating, so a diverged rollout never goes non-finite and the finite
+#: check alone never fires (`R5_09` F-1: 17 h in ``validate_path`` on a reset
+#: iiwa ``pd`` bag).  These counters are the only reliable trace.
+_MUJOCO_INSTABILITY_WARNINGS = ("mjWARN_BADQACC", "mjWARN_BADQPOS", "mjWARN_BADQVEL")
+
+
+def _mujoco_instability_indices(mujoco: Any) -> np.ndarray:
+    return np.asarray([int(getattr(mujoco.mjtWarning, name)) for name in _MUJOCO_INSTABILITY_WARNINGS])
+
+
+def _raise_on_mujoco_instability(mujoco: Any, model: Any, data: Any, indices: np.ndarray,
+                                 sample_time: float, dof_to_joint: Mapping[int, str]) -> None:
+    """Raise :class:`RolloutDiverged` if MuJoCo flagged an instability."""
+    numbers = data.warning.number[indices]
+    if not numbers.any():
+        return
+    which = int(np.flatnonzero(numbers)[0])
+    name = _MUJOCO_INSTABILITY_WARNINGS[which]
+    dof = int(data.warning.lastinfo[indices[which]])
+    joint = dof_to_joint.get(dof)
+    if joint is None and 0 <= dof < model.nv:
+        joint = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, int(model.dof_jntid[dof]))
+    raise RolloutDiverged(
+        f"MuJoCo {name} at t={sample_time:.6f}s on DOF {dof} ({joint}); the simulator reset its "
+        "state, so the rest of this rollout would be unphysical",
+        kind=name, time=sample_time, dof=dof, joint=joint,
+    )
+
+
 def joint_inertia_floor(pin: Any, model: Any, data: Any, configurations: np.ndarray) -> np.ndarray:
     """Smallest diagonal joint-space inertia seen along a path.
 
@@ -388,13 +441,20 @@ def run_mujoco_torque(
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
     command = None
+    unstable = _mujoco_instability_indices(mujoco)
+    dof_to_joint = {int(dof): name for dof, name in zip(dof_idx, asset.joint_names)}
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
+        # Checked for the step that just ended, so report the time it started at
+        # (MuJoCo's own warning prints the same).
+        _raise_on_mujoco_instability(mujoco, model, data, unstable,
+                                     float(grid[index - 1]) if index else 0.0, dof_to_joint)
         q = data.qpos[qpos_idx].copy()
         dq = data.qvel[dof_idx].copy()
         if not (np.isfinite(q).all() and np.isfinite(dq).all()):
-            raise RuntimeError(f"MuJoCo torque rollout became non-finite at t={sample_time:.6f}s")
+            raise RolloutDiverged(f"MuJoCo torque rollout became non-finite at t={sample_time:.6f}s",
+                                  kind="non_finite", time=float(sample_time))
         if index % control_decimation == 0:
             # ``command.total`` already embeds friction compensation at
             # *this* (q, dq): ``ComputedTorqueController`` computes it as
@@ -545,7 +605,8 @@ def run_newton_torque(
         q = state_q[q_idx].astype(float)
         dq = state_dq[qd_idx].astype(float)
         if not (np.isfinite(q).all() and np.isfinite(dq).all()):
-            raise RuntimeError(f"Newton torque rollout became non-finite at t={sample_time:.6f}s")
+            raise RolloutDiverged(f"Newton torque rollout became non-finite at t={sample_time:.6f}s",
+                                  kind="non_finite", time=float(sample_time))
         if index % control_decimation == 0:
             # See run_mujoco_torque: hold the friction subtraction with the
             # same (stale) command, not the current dq, or the embedded
@@ -965,16 +1026,24 @@ def run_mujoco_elastic_torque(
     pacer = _ViewerPacer(viewer, time_step, realtime_scale)
     started = _time.perf_counter()
     command = solver_torque = None
+    unstable = _mujoco_instability_indices(mujoco)
+    dof_to_joint = {int(dof): f"{name} (motor)" for dof, name in zip(motor_dof_idx, names)}
+    dof_to_joint.update({int(dof): f"{name} (elastic)" for dof, name in zip(elastic_dof_idx, names)})
     for index, sample_time in enumerate(grid):
         if not pacer.running():
             break
+        # Checked for the step that just ended, so report the time it started at
+        # (MuJoCo's own warning prints the same).
+        _raise_on_mujoco_instability(mujoco, model, data, unstable,
+                                     float(grid[index - 1]) if index else 0.0, dof_to_joint)
         motor_q = data.qpos[motor_qpos_idx].copy()
         motor_dq = data.qvel[motor_dof_idx].copy()
         elastic_q = data.qpos[elastic_qpos_idx].copy()
         elastic_dq = data.qvel[elastic_dof_idx].copy()
         link_q, link_dq = motor_q + elastic_q, motor_dq + elastic_dq
         if not (np.isfinite(link_q).all() and np.isfinite(link_dq).all()):
-            raise RuntimeError(f"MuJoCo elastic rollout became non-finite at t={sample_time:.6f}s")
+            raise RolloutDiverged(f"MuJoCo elastic rollout became non-finite at t={sample_time:.6f}s",
+                                  kind="non_finite", time=float(sample_time))
         # tau_spring is measured from the true, continuous state every step
         # regardless of decimation -- it is the recorded label, not a control
         # signal, so it must never be held.
@@ -1154,7 +1223,8 @@ def run_newton_elastic_torque(
         elastic_dq = state_dq[elastic_qd_idx]
         link_q, link_dq = motor_q + elastic_q, motor_dq + elastic_dq
         if not (np.isfinite(link_q).all() and np.isfinite(link_dq).all()):
-            raise RuntimeError(f"Newton elastic rollout became non-finite at t={sample_time:.6f}s")
+            raise RolloutDiverged(f"Newton elastic rollout became non-finite at t={sample_time:.6f}s",
+                                  kind="non_finite", time=float(sample_time))
         # tau_spring is measured every step regardless of decimation -- see
         # run_mujoco_elastic_torque.
         tau_spring = extras.spring_torque(

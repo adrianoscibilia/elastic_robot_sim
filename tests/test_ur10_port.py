@@ -448,12 +448,14 @@ def test_generate_with_error_action_never_calls_run_condition(monkeypatch):
     from dataclasses import replace
 
     import elastic_sim.dataset as dataset_module
+    import elastic_sim.dataset_bag as dataset_bag
     from elastic_sim.dataset import ControlGainSampling, ControlSeparationCheck, load_config
 
     def _never(*args, **kwargs):
         raise AssertionError("run_condition must not be called before the control_separation pre-flight check")
 
-    monkeypatch.setattr(dataset_module, "run_condition", _never)
+    # Patched where it is defined (R5_10 T-7): _run_bag holds its own reference.
+    monkeypatch.setattr(dataset_bag, "run_condition", _never)
 
     asset = AssetRegistry.for_repository(_REPO).load(UR10_ASSET)
     config = load_config(UR10_CONFIG)

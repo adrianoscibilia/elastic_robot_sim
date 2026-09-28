@@ -1,73 +1,51 @@
 # Module and script guide
 
-This page explains where to look when changing or debugging the repository.
+The live pipeline builds identification datasets (see
+[IDENTIFICATION_DATASET.md](IDENTIFICATION_DATASET.md)). Everything listed
+here is reachable from its entry points. The pre-identification
+sim-to-real/calibration stack is archived in `legacy/`; see
+`legacy/README.md`.
 
-## Primary Python modules
-
-| Module | Responsibility |
-|---|---|
-| `experiment.py` | Loads sim2real YAML, resolves assets, validates limits, generates trajectories, writes Parquet/manifests, and launches rosbag2. |
-| `materialized.py` | `MaterializedTrajectory`: exact time/position/velocity/acceleration arrays, interpolation, JSON serialization, and digest. |
-| `ros_experiment.py` | Lazy ROS imports, topic/type preflight, JointState/wrench/controller capture, FollowJointTrajectory execution, motor lifecycle, and normalized observations. |
-| `sim2real.py` | Backend-neutral simulation dispatch, rollout normalization, reference-tracking loss, experiment discovery, trajectory split, and calibration problem history. |
-| `parameter_registry.py` | Named physical parameters, bounds, linear/log scaling, normalized optimizer coordinates, and model overrides. |
-| `assets.py` | Asset YAML loading, URDF joint discovery, active-joint validation, resource checking, and the repository asset registry. |
-| `serial_trajectory.py` | URDF-limit-based trajectory support for generic serial robots and compatibility trajectory generation. |
-| `kinematics.py` | Asset groups, Pinocchio/Pink Cartesian IK, FK enrichment, and Coal self-collision validation. |
-| `visualization.py` | Common Newton ViewerGL and MuJoCo passive-viewer lifecycle with path overlays. |
-| `plotting.py` | Backend-independent joint, Cartesian tracking, and clearance figures. |
-| `moveit_validation.py` | Optional live MoveIt planning-scene validation for real runs. |
-| `generic_newton_runner.py` | URDF-backed Newton serial model with kinematic, rigid, and elastic modes; supports transmission/body overrides. |
-| `generic_mujoco_runner.py` | URDF-backed MuJoCo serial model and rollout implementation. |
-| `sim_runner.py` | Dedicated FMRR Cartesian Newton model and rollout. |
-| `mujoco_runner.py` | Dedicated FMRR Cartesian MuJoCo model and rollout. |
-| `params.py` | FMRR `RobotParams`, axis stiffness/damping, motor gains, intermediate mass, and legacy YAML/vector helpers. |
-| `rollout.py` | Legacy/general `RolloutResult` and `RolloutStore` Parquet API. The unified experiment workflow uses the wider `experiment.py` schema. |
-| `trajectory.py` | Original Cartesian trajectory classes and compatibility generators. New sim2real runs use `MaterializedTrajectory`. |
-| `compare.py` | Legacy rollout fidelity metrics and per-axis comparisons. |
-| `calibration.py` | Legacy Cartesian `SimCalibrationProblem`; retained for compatibility, while the primary command uses `sim2real.py`. |
-| `generic_calibration.py` | Legacy torque-replay calibration adapter; not used by the primary sim2real command. |
-| `elastic_settings.py` | Configuration helpers for explicit serial motor-to-link elastic transmissions. |
-| `ros_recorder.py` | Older ROS recorder retained for compatibility; new recording uses `ros_experiment.py`. |
-| `__init__.py` | Package marker and top-level package description. |
-
-## Optimizer modules
+## `src/elastic_sim/`
 
 | Module | Responsibility |
 |---|---|
-| `optimizers/base.py` | Common optimizer interface: bounded objective, initial point, evaluation budget, and history. |
-| `optimizers/cma_backend.py` | CMA-ES adapter; budget is passed to `minimize()` and not incorrectly used as a constructor option. |
-| `optimizers/bo_backend.py` | `scikit-optimize` bounded Bayesian optimization adapter. |
-| `optimizers/skrl_backend.py` | skrl PPO contextual-bandit adapter; trajectory summary context is used to propose parameter vectors. |
+| `dataset.py` | Config (`DatasetConfig`, `load_config`), robot/payload/regime/gain sampling, splits, the per-bag work list, trajectory cache, `run_condition`/`_run_bag`, the unstable-bag guard, `rollout_frame`, `generate`, `write_dataset` and the consumer contract. |
+| `torque_runners.py` | Torque-driven rigid and elastic rollouts in MuJoCo and Newton with exact labels; `RolloutDiverged` on MuJoCo instability warnings or non-finite state; link-inertia envelopes; `TransmissionSpec`. |
+| `controllers.py` | Controller modes (`exact_ct`, `nominal_ct`, `pd_gravity`, `pd`, `velocity_pi`), their per-trajectory gain draws, and the nominal model a controller is allowed to know. |
+| `excitation.py` | Fourier excitation design: limit fitting, the modal probe, regressor conditioning, collision-checked candidate selection. |
+| `identification.py` | Pinocchio inverse dynamics, base-parameter regressor and friction model: the analytic reference independent of both simulators. |
+| `measurement.py` | Sensor model applied to recorded channels: quantization, noise, gain error, delay. |
+| `plant_extras.py` | Non-Lagrangian plant effects: link friction, nonlinear spring, torque ripple. |
+| `wrench.py` | End-effector force/torque cell and its `J(q)^T` mapping to a per-joint target. |
+| `payload.py` | Flange payload injected into the URDF so every consumer sees the same plant. |
+| `diagnostics.py` | Q-C measurements per bag: collinearity, conditioning, residual decomposition, probe-band content, deflection SNR, linear baselines. |
+| `backend_comparison.py` | Per-pair MuJoCo/Newton agreement, on the clean columns when a dataset has them. |
+| `kinematics.py` | Pinocchio/Pink kinematics and Coal self-collision validation (`validate_path`, bisection-capped). |
+| `materialized.py` | `MaterializedTrajectory`: exact time/position/velocity/acceleration arrays, analytic evaluation, digests. |
+| `assets.py` | Asset YAML loading, URDF joint discovery, the repository asset registry. |
+| `scene.py` | Compose an asset and a table into a derived scene asset. |
+| `generic_mujoco_runner.py`, `generic_newton_runner.py` | URDF-backed MuJoCo/Newton model builders (elastic transmissions, mesh proxies) used by the torque runners and the viewer. |
+| `generic_calibration.py` | Torque-replay rollout container used by the Newton builder. |
+| `serial_trajectory.py` | URDF-limit helpers and standalone serial-arm trajectories. |
+| `visualization.py` | Native MuJoCo/Newton viewer adapters with path overlays (`--visualize`). |
 
-## Primary scripts
+## Scripts
 
 | Script | Use |
 |---|---|
-| `run_experiment.py` | The one command for materialization, simulation, ROS execution, recording, and manifests. |
-| `run_calibration.py` | The one command for discovering paired runs and running all configured calibration methods. |
-
-## Secondary simulation and data scripts
-
-| Script | Use |
-|---|---|
-| `run_asset_simulation.py` | Inspect or simulate one portable asset, optionally replaying a saved trajectory. |
-| `generate_serial_trajectory.py` | Generate a standalone serial-arm trajectory JSON. |
-| `run_asset_dataset_generation.py` | Produce synthetic CSV trials for generic asset experiments; not used by calibration discovery. |
-| `record_rollouts.py` | Older simulator comparison helper; prefer `run_experiment.py --sim-only`. |
-| `elastic_cart_robot_newton.py` | Older standalone FMRR Newton viewer/CSV script. |
-| `elastic_cart_robot_mujoco.py` | Older standalone FMRR MuJoCo viewer/CSV script. |
-| `elastic_cart_robot_isaacsim.py` | Optional/legacy Isaac Sim integration. It is not one of the unified calibration backends. |
-| `run_dataset_generation.py` | Older FMRR synthetic dataset sweep. It is not a sim2real input producer. |
-| `compile_urdf_from_description.py` | Convert a ROS/xacro robot description to a flat URDF with usable mesh paths. |
-| `view_urdf_mujoco.py` | Small MuJoCo URDF viewer utility. |
-| `sim_common.py` | Shared helpers for the older standalone Cartesian scripts and synthetic-data utilities. |
+| `diagnose_controller_modes.py` | **Production build**: matched datasets per controller mode (± plant extras), trajectories optimized once and reused, parallel bags, Q-C diagnostics, baselines written into each contract. |
+| `generate_identification_dataset.py` | One dataset at a config's own settings. |
+| `run_identification_simulation.py` | One rollout, viewer and diagnostics, no dataset written; reproduces any bag by `--tier/--trajectory`. |
+| `audit_backends.py` | MuJoCo vs Newton on a 3-robot build, clean columns; not part of any launch. |
+| `compare_identification_backends.py` | Re-check the backend pairs of a written dataset. |
+| `report_parameter_bounds.py`, `run_range_sensitivity.py`, `sweep_ft_payload.py` | Studies behind the priors. |
+| `compose_scene_urdf.py`, `compile_urdf_from_description.py`, `view_urdf_mujoco.py`, `generate_serial_trajectory.py` | Asset preparation and inspection. |
+| `round5_weekend.sh`, `launch_helpers.py` | Unattended doctor → preflight → launch runner and its helpers (probe check, dataset stems, stage timeouts). |
 
 ## Where to implement common changes
 
-- Add a new trajectory type: `experiment.py`, `MaterializedTrajectory` tests, and `docs/CONFIGURATION.md`.
-- Add a new asset: asset YAML/URDF under `assets/robots/`, a `*_sim2real.yaml`, and asset tests.
-- Add a tunable physical parameter: `parameter_registry.py`, the relevant backend adapter, and a model application test.
-- Add a signal to real capture: `ros_experiment.py`, the normalized schema documentation, and a ROS-independent capture test using message doubles.
-- Add a simulator backend: implement the exact-trajectory rollout contract and dispatch it in `sim2real.py`; do not regenerate trajectories in the backend.
-- Change calibration metrics: update `ReferenceTrajectoryCalibrationProblem`, configuration docs, and validation tests.
+- A new controller mode: `controllers.py` (`CONTROLLER_MODES`, `build_controller`) and its gain draw; tests in `tests/test_round5_controller.py`.
+- A new dataset column or contract field: `rollout_frame`/`write_dataset` in `dataset.py`, `docs/IDENTIFICATION_DATASET.md`, and the consumer in `dynamic_model_nn/dataset.py`.
+- A new platform: an asset under `assets/robots/`, a scene via `compose_scene_urdf.py`, a config under `config/identification/`, and an entry in the launcher's `CONFIG` table.
+- A new prior: the config, with its provenance class in `docs/PARAMETER_PROVENANCE.md`.

@@ -49,7 +49,9 @@ import pandas as pd
 
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.controllers import CONTROLLER_MODES
-from elastic_sim.dataset import PlantExtrasSampling, build_tiers, generate, load_config, write_dataset
+from elastic_sim.dataset import (
+    PlantExtrasSampling, build_tiers, default_jobs, generate, load_config, write_dataset,
+)
 from elastic_sim.diagnostics import dataset_diagnostics, load_dataset, summarize_diagnostics
 
 #: The columns worth putting in front of a reader; the CSV keeps all of them.
@@ -79,12 +81,15 @@ def _shrink(config, *, trajectories: int, robots: int, backends: tuple[str, ...]
     """
     sampling = replace(config.transmission, robots=robots)
     split = config.split
-    if split.mode == "holdout_robots" and split.test_robots + split.val_robots > robots:
+    if split.mode == "holdout_robots" and split.test_robots + split.val_robots >= robots:
         # A Q-C run has a handful of robots, far fewer than a production
-        # config holds out.  The split is irrelevant here -- nothing is
-        # trained -- so fall back rather than force the caller to copy the
-        # config, the same fallback generate_identification_dataset.py makes.
-        split = replace(split, mode="contiguous")
+        # config holds out.  Keep the smallest holdout that still leaves a
+        # training robot -- one test robot, and one validation robot from
+        # three up -- because the launcher's preflight trains, selects and
+        # evaluates on these files (R5_10 T-8) and needs every split to exist.
+        # Below two robots there is nothing to hold out.
+        split = (replace(split, test_robots=1, val_robots=1 if robots >= 3 else 0) if robots >= 2
+                 else replace(split, mode="contiguous"))
     shrunk = replace(
         config, transmission=sampling, n_trajectories=trajectories, backends=backends,
         n_friction_samples=1, split=split,
@@ -94,7 +99,7 @@ def _shrink(config, *, trajectories: int, robots: int, backends: tuple[str, ...]
 
 
 def _generate_for_mode(config, asset, mode: str, output: Path, jobs: int, verbose: bool,
-                       *, plant_extras: bool = True):
+                       *, plant_extras: bool = True, trajectory_cache: dict | None = None):
     spec = replace(config.controller, mode=mode)
     if mode == "exact_ct":
         # `exact_ct` with a non-exact nominal block is a contradiction the
@@ -114,9 +119,59 @@ def _generate_for_mode(config, asset, mode: str, output: Path, jobs: int, verbos
         # class that only wins where friction dominates shows up as a win here
         # and nowhere else (R5_Q Q-3's answer).
         mode_config = replace(mode_config, plant_extras=PlantExtrasSampling())
-    frame, manifest, comparison = generate(mode_config, asset, verbose=verbose, jobs=jobs)
+    frame, manifest, comparison = generate(mode_config, asset, verbose=verbose, jobs=jobs,
+                                           trajectory_cache=trajectory_cache)
     write_dataset(frame, manifest, output, comparison, metadata_columns=mode_config.metadata_columns)
     return frame, manifest
+
+
+#: The per-bag diagnostics a trained model's error is read against
+#: (`R5_09` Sec 8: every error figure next to `baseline_rms_tau` and the
+#: friction share), summarized per split into the contract for the consumer's
+#: evaluator (`R5_10` T-5.5).
+_CONTRACT_BASELINES = (
+    "target_rms", "baseline_rms_mean", "baseline_rms_tau", "baseline_rms_state", "baseline_rms_state_tau",
+    "link_friction_share", "noise_share", "differentiation_share",
+)
+
+
+def add_baselines_to_contract(output: Path, frame: pd.DataFrame, table: pd.DataFrame) -> None:
+    """Write the per-split medians of the linear baselines into the contract."""
+    contract_path = output.with_suffix(".contract.json")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    splits = frame.groupby("bag", sort=False)["split"].first() if "split" in frame.columns else None
+    rows = table.set_index("bag")
+    baselines: dict[str, dict[str, float | int | None]] = {}
+    for split in (["all"] + sorted(set(splits))) if splits is not None else ["all"]:
+        bags = rows.index if split == "all" else [b for b in rows.index if splits.get(b) == split]
+        subset = rows.loc[list(bags)]
+        entry: dict[str, float | int | None] = {"n_bags": int(len(subset))}
+        for column in _CONTRACT_BASELINES:
+            if column in subset.columns:
+                value = float(np.nanmedian(subset[column].to_numpy(dtype=float))) if len(subset) else float("nan")
+                entry[column] = value if np.isfinite(value) else None
+        baselines[split] = entry
+    contract["baselines"] = {
+        "statistic": "median over bags of the per-bag value (elastic_sim.diagnostics.bag_diagnostics)",
+        "units": "same units as the target, RMS over every joint and sample of a bag",
+        "splits": baselines,
+    }
+    contract_path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
+
+
+def check_trajectory_digests(manifests: dict[str, dict]) -> dict[str, str]:
+    """Assert every matched row of this build ran the same trajectories."""
+    reference_name, reference = None, None
+    for name, manifest in manifests.items():
+        digests = manifest.get("trajectory_digests") or {}
+        if reference is None:
+            reference_name, reference = name, digests
+        elif digests != reference:
+            raise AssertionError(
+                f"trajectory digests differ between {reference_name} and {name}: the matched rows of "
+                "one platform must share their trajectories (R5_10 T-3.3)"
+            )
+    return reference or {}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,8 +188,12 @@ def main(argv: list[str] | None = None) -> int:
                              "draw but the controller's is keyed on streams the controller does not "
                              "touch, so two --generate runs differing only in --modes share their "
                              "robots, payloads, trajectories and friction exactly")
-    parser.add_argument("--backends", nargs="+", default=["mujoco"])
-    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--backends", nargs="+", default=["mujoco"],
+                        help="Simulator backends. Applied to --full builds as well: production is "
+                             "MuJoCo only, and Newton is the separate scripts/audit_backends.py (R5_10 T-3.2)")
+    parser.add_argument("--jobs", type=int, default=None,
+                        help="Worker processes for trajectory optimization and bags; default nproc - 1, "
+                             "forced to 1 when Newton is a backend (R5_10 T-3.4)")
     parser.add_argument("--out", default="reports/round5/qc", help="output prefix for the CSVs written")
     parser.add_argument("--data-dir", default="data/identification/round5_qc",
                         help="where --generate writes its datasets")
@@ -156,12 +215,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.generate:
         config = load_config(args.config)
         asset = _load_asset(config.asset)
-        shrunk = config if args.full else _shrink(
+        shrunk = replace(config, backends=tuple(args.backends)) if args.full else _shrink(
             config, trajectories=args.trajectories, robots=args.robots, backends=tuple(args.backends),
         )
+        jobs = default_jobs(shrunk.backends) if args.jobs is None else args.jobs
+        if "newton" in shrunk.backends:
+            jobs = 1
+        if verbose:
+            print(f"backends {list(shrunk.backends)}, jobs {jobs}")
         data_dir = Path(args.data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         variants = [(True, "")] if args.no_extras_control else [(True, ""), (False, "_noextras")]
+        # One optimization per trajectory for the whole platform: every mode x
+        # extras row reuses it (R5_10 T-3.3), which check_trajectory_digests
+        # asserts below.
+        trajectory_cache: dict = {}
+        manifests: dict[str, dict] = {}
         for mode in args.modes:
             for with_extras, suffix in variants:
                 if not with_extras and config.plant_extras.is_empty:
@@ -170,11 +239,17 @@ def main(argv: list[str] | None = None) -> int:
                 if verbose:
                     print(f"\n=== {mode}{suffix} -> {output} ===")
                 frame, manifest = _generate_for_mode(
-                    shrunk, asset, mode, output, args.jobs, verbose, plant_extras=with_extras,
+                    shrunk, asset, mode, output, jobs, verbose, plant_extras=with_extras,
+                    trajectory_cache=trajectory_cache,
                 )
+                manifests[output.name] = manifest
                 table = dataset_diagnostics(frame, manifest, asset)
                 table["plant_extras"] = with_extras
+                add_baselines_to_contract(output, frame, table)
                 diagnostics.append(table)
+        digests = check_trajectory_digests(manifests)
+        if verbose:
+            print(f"\ntrajectory digests identical across {len(manifests)} rows ({len(digests)} trajectories)")
 
     for reference in args.dataset:
         frame, manifest = load_dataset(reference)

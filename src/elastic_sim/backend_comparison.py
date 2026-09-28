@@ -9,6 +9,22 @@ A pair is only a genuine cross-check when Newton ran its own solver.  On
 elastic bags Newton falls back to ``SolverMuJoCo`` (see the torque runners),
 and the report says so rather than presenting agreement as independent
 confirmation.
+
+The comparison reads the **clean** columns when the dataset has them
+(``signals.clean_columns``): the simulator's own link position, transmission
+torque and motor command.  The measured columns carry a noise realization
+seeded per bag index, so the two backends of a pair draw *independent* noise,
+and wherever the noise dominates a channel their difference is ~sqrt(2) x its
+RMS whatever the physics does -- which is exactly the 141.75 % every round-5
+build reported on the rigid Featherstone pair (`R5_09` Sec 2, `R5_10` T-4).
+A dataset without clean columns falls back to the measured ones and says so
+in the ``columns`` field.
+
+``target_clean_relative_rms`` compares the clean *target* (``ft_clean``) as
+well, for information only.  For an end-effector wrench target it is a
+function of the recorded link acceleration, which the two backends record by
+different conventions (MuJoCo's ``qacc``; Newton's runner differentiates
+``dq``), so it disagrees on elastic bags even when the motion agrees to 1e-6.
 """
 
 from __future__ import annotations
@@ -37,6 +53,15 @@ class ComparisonThresholds:
         if unknown:
             raise ValueError(f"unknown comparison thresholds: {', '.join(unknown)}")
         return cls(**{key: float(value) for key, value in raw.items()})
+
+
+#: metric prefix -> dataset column prefix.  ``ft`` is the link-side
+#: (transmission) torque and ``tau`` the motor command in both sets.
+CLEAN_COLUMNS = {
+    "q": "q_link_clean", "dq": "dq_link_clean", "q_motor": "q_motor_clean",
+    "ft": "tau_link_clean", "tau": "tau_motor_clean",
+}
+MEASURED_COLUMNS = {"q": "q", "dq": "dq", "q_motor": "q_motor", "ft": "ft", "tau": "tau"}
 
 
 def _pair_key(bag: str, backend: str) -> str:
@@ -104,8 +129,9 @@ def _compare_pair(
     if not np.allclose(base["t"].to_numpy(float), other["t"].to_numpy(float), atol=1e-9):
         raise ValueError(f"bags of pair {key!r} are not on the same time grid")
 
-    first = {prefix: _block(base, prefix, n_dof) for prefix in ("q", "dq", "q_motor", "ft", "tau")}
-    second = {prefix: _block(other, prefix, n_dof) for prefix in first}
+    columns = CLEAN_COLUMNS if all(f"{c}0" in base.columns for c in CLEAN_COLUMNS.values()) else MEASURED_COLUMNS
+    first = {prefix: _block(base, column, n_dof) for prefix, column in columns.items()}
+    second = {prefix: _block(other, column, n_dof) for prefix, column in columns.items()}
     delta = {prefix: first[prefix] - second[prefix] for prefix in first}
     deflection = first["q_motor"] - first["q"]
     deflection_diff = delta["q_motor"] - delta["q"]
@@ -123,6 +149,9 @@ def _compare_pair(
         "deflection_relative_rms": (_rms(deflection_diff) / np.maximum(_rms(deflection), 1e-12)
                                     if elastic else np.full(n_dof, np.nan)),
     }
+    if columns is CLEAN_COLUMNS and "ft_clean0" in base.columns:
+        target_a, target_b = _block(base, "ft_clean", n_dof), _block(other, "ft_clean", n_dof)
+        metrics["target_clean_relative_rms"] = _rms(target_a - target_b) / np.maximum(_rms(target_a), 1e-9)
     other_bag = str(other["bag"].iloc[0])
     solver = solvers.get(other_bag)
     row: dict[str, Any] = {
@@ -132,6 +161,7 @@ def _compare_pair(
         # SolverMuJoCo runs MuJoCo's engine; unknown when no manifest is given.
         "independent": None if solver is None else solver != "SolverMuJoCo",
         "samples": length,
+        "columns": "clean" if columns is CLEAN_COLUMNS else "measured",
     }
     for name, values in metrics.items():
         row[name] = float(np.nanmax(values)) if np.isfinite(values).any() else float("nan")

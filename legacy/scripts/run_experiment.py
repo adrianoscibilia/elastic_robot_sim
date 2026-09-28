@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Validate, simulate, and/or record one asset-based experiment."""
+
+from __future__ import annotations
+
+import os as _os, sys as _sys  # R5_10 T-6: archived modules live in legacy/src
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
+import argparse
+import importlib.metadata
+import platform
+import sys
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+_REPO = Path(__file__).resolve().parents[2]
+_SRC = _REPO / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from elastic_sim_legacy.experiment import (  # noqa: E402
+    ExperimentStore,
+    artifact_root,
+    config_digest,
+    generate_materialized_trajectory,
+    load_experiment_config,
+    resolve_asset,
+    rollout_to_frame,
+)
+from elastic_sim_legacy.sim2real import run_simulation  # noqa: E402
+
+
+def _args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--config", required=True, help="sim-to-real asset YAML")
+    parser.add_argument("--sim-only", action="store_true", help="simulate without ROS; add --save to persist")
+    parser.add_argument("--real-only", action="store_true", help="write only below data/recorded/<robot>")
+    parser.add_argument("--dry-run", action="store_true", help="validate without creating artifacts or contacting ROS")
+    parser.add_argument("--preflight-only", action="store_true", help="validate ROS topics, samples, services, and rosbag2 without motion or artifacts")
+    parser.add_argument("--backends", nargs="+", choices=("newton", "mujoco"), default=None)
+    parser.add_argument("--headless", action="store_true", help="disable simulator and plot windows")
+    parser.add_argument("--plot", action="store_true", help="show post-run joint, Cartesian, and clearance plots")
+    parser.add_argument("--save", action="store_true", help="persist simulation artifacts (real runs always persist)")
+    parser.add_argument("--csv", dest="save", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--visualize", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--realtime-scale", type=float, default=1.0, help="interactive playback speed multiplier")
+    parser.add_argument("--moveit-validate", action="store_true", help="validate real commands with a live MoveIt planning scene")
+    parser.add_argument("--no-motor-control", action="store_true", help="skip configured motor lifecycle services")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--run-id", default=None, help="shared run directory name")
+    parser.add_argument("--simulated-root", default=None, help="override root; final component must be simulated")
+    parser.add_argument("--recorded-root", default=None, help="override root; final component must be recorded")
+    return parser.parse_args()
+
+
+def _validate(config: dict, asset) -> None:
+    asset.resolve_active_joints()
+    asset.validate_resources()
+    trajectory = config.get("trajectory", {}) or {}
+    if float(trajectory.get("duration", 0.0)) <= 0.0:
+        raise ValueError("trajectory.duration must be positive")
+    if float(trajectory.get("time_step", 0.01)) <= 0.0:
+        raise ValueError("trajectory.time_step must be positive")
+    if int(trajectory.get("num_trajectories", 1)) < 1:
+        raise ValueError("trajectory.num_trajectories must be positive")
+    speed_scale = float(trajectory.get("speed_scale", 1.0))
+    if not 0.0 < speed_scale <= 1.0:
+        raise ValueError("trajectory.speed_scale must be in (0, 1]")
+
+
+def _save_trajectories(store: ExperimentStore, trajectories) -> None:
+    store.save_trajectory(trajectories[0])
+    if len(trajectories) > 1:
+        for index, trajectory in enumerate(trajectories):
+            store.save_trajectory(trajectory, f"trajectories/trajectory_{index:03d}.json")
+
+
+def _manifest(config: dict, asset, trajectories, backends, digest: str, kind: str) -> dict:
+    return {
+        "schema_version": 2,
+        "artifact_kind": kind,
+        "asset": asset.name,
+        "asset_urdf": str(asset.urdf_path),
+        "config_path": str(Path(config["_config_path"]).resolve()),
+        "config_hash": digest,
+        "trajectory": {"count": len(trajectories), "joint_names": list(asset.joint_names), "digests": [item.digest() for item in trajectories]},
+        "execution": {
+            "requested_velocity_limit": trajectories[0].metadata.get("requested_speed"),
+            "requested_acceleration_limit": trajectories[0].metadata.get("requested_acceleration"),
+            "speed_scale": trajectories[0].metadata.get("speed_scale"),
+            "effective_velocity": trajectories[0].metadata.get("effective_speed"),
+            "effective_acceleration": trajectories[0].metadata.get("effective_acceleration"),
+            "effective_velocity_limit": trajectories[0].metadata.get("effective_velocity_limit"),
+            "effective_acceleration_limit": trajectories[0].metadata.get("effective_acceleration_limit"),
+        },
+        "safety": {
+            "joint_workspace": trajectories[0].metadata.get("workspace"),
+            "cartesian_workspace": trajectories[0].metadata.get("cartesian_workspace", {}),
+            "collision": trajectories[0].metadata.get("collision", {}),
+        },
+        "backends": list(backends),
+        "parameters": config.get("model", {}),
+        "software": {
+            "python": platform.python_version(), "platform": platform.platform(),
+            "packages": {name: _package_version(name) for name in ("newton", "mujoco", "pin", "pin-pink", "coal", "proxsuite")},
+        },
+        "kinematic_groups": asset.metadata.get("kinematic_groups", {}),
+        "collision_policy": asset.metadata.get("collision", {}),
+        "start_timestamp": datetime.now(timezone.utc).isoformat(),
+        "completion_status": "incomplete",
+        "visualization": {"enabled": kind == "simulated", "realtime_scale": 1.0},
+    }
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def main() -> int:
+    args = _args()
+    if args.sim_only and args.real_only:
+        raise SystemExit("--sim-only and --real-only are mutually exclusive")
+    if args.dry_run and getattr(args, "preflight_only", False):
+        raise SystemExit("--dry-run and --preflight-only are mutually exclusive")
+    if getattr(args, "preflight_only", False) and args.sim_only:
+        raise SystemExit("--preflight-only cannot be combined with --sim-only")
+    if args.realtime_scale <= 0.0:
+        raise SystemExit("--realtime-scale must be positive")
+    config = load_experiment_config(args.config)
+    asset = resolve_asset(config, args.config)
+    _validate(config, asset)
+    backends = tuple(args.backends or config.get("simulation", {}).get("backends", ("newton", "mujoco")))
+    seed = int(args.seed if args.seed is not None else config.get("trajectory", {}).get("seed", 0))
+    count = max(1, int(config.get("trajectory", {}).get("num_trajectories", 1)))
+    digest = config_digest(config)
+    trajectories = []
+    for index in range(count):
+        trajectory = generate_materialized_trajectory(asset, config, seed + index)
+        trajectories.append(replace(trajectory, metadata=trajectory.metadata | {"config_hash": digest}))
+    if args.dry_run:
+        print(f"asset={asset.name} joints={list(asset.joint_names)}")
+        print(f"trajectories={count} samples={[len(item.time) for item in trajectories]} backends={list(backends)}")
+        print(f"config_hash={digest}")
+        return 0
+    if getattr(args, "preflight_only", False):
+        from elastic_sim_legacy.ros_experiment import preflight_ros
+        report = preflight_ros(config, asset.joint_names, check_motor_services=not args.no_motor_control)
+        print(f"ROS preflight complete: asset={asset.name} joints={list(asset.joint_names)}")
+        print(f"validated_topics={sorted(report['topics'])}")
+        print(f"action_servers={report['action_servers']} rosbag_available={report['rosbag_available']}")
+        return 0
+
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Simulation-only inspection is deliberately ephemeral.  A real run (or
+    # combined run) is always persisted for traceability.
+    persist_simulation = bool(args.save or not args.sim_only)
+    sim_store = None if args.real_only or not persist_simulation else ExperimentStore(artifact_root(config, "simulated", _REPO, args.simulated_root), asset.name, run_id)
+    real_store = None if args.sim_only else ExperimentStore(artifact_root(config, "recorded", _REPO, args.recorded_root), asset.name, run_id)
+    simulation_requested = not args.real_only
+    sim_manifest = _manifest(config, asset, trajectories, backends, digest, "simulated") if sim_store else None
+    real_manifest = _manifest(config, asset, trajectories, (), digest, "recorded") if real_store else None
+    if sim_manifest is not None and real_store is not None:
+        sim_manifest["recorded_counterpart"] = str(real_store.path)
+    if real_manifest is not None and sim_store is not None:
+        real_manifest["simulated_counterpart"] = str(sim_store.path)
+
+    try:
+        plot_frames: dict[str, pd.DataFrame] = {}
+        if simulation_requested:
+            if sim_store is not None:
+                _save_trajectories(sim_store, trajectories)
+            for backend in backends:
+                frames = []
+                for index, trajectory in enumerate(trajectories):
+                    result = run_simulation(
+                        asset, config, trajectory, backend,
+                        visualize=not args.headless, realtime_scale=args.realtime_scale,
+                    )
+                    if len(np.asarray(result.time if hasattr(result, "time") else result["time"])) < len(trajectory.time):
+                        raise RuntimeError(f"{backend} visualization was closed before trajectory {index} completed")
+                    frame = rollout_to_frame(trajectory, result, source=f"sim_{backend}")
+                    from elastic_sim.kinematics import enrich_rollout_frame
+                    frame = enrich_rollout_frame(frame, trajectory, asset)
+                    if not np.isfinite(frame.select_dtypes(include=[np.number]).to_numpy(float)).all():
+                        finite_columns = [column for column in frame.select_dtypes(include=[np.number]) if column != "self_collision_clearance"]
+                        if not np.isfinite(frame[finite_columns].to_numpy(float)).all():
+                            raise RuntimeError(f"{backend} produced non-finite output for trajectory {index}")
+                    frame.insert(0, "trajectory_id", index)
+                    frames.append(frame)
+                combined = pd.concat(frames, ignore_index=True)
+                plot_frames[backend] = combined
+                if sim_store is not None:
+                    sim_store.save_frame(combined, f"sim_{backend}.parquet")
+            if args.plot:
+                from elastic_sim_legacy.plotting import plot_rollouts
+                plot_rollouts(
+                    plot_frames, asset,
+                    output_dir=None if sim_store is None else sim_store.path / "plots",
+                    show=not args.headless,
+                )
+            if sim_manifest is not None:
+                sim_manifest["visualization"] = {"enabled": not args.headless, "realtime_scale": args.realtime_scale}
+                sim_manifest["planner"] = trajectories[0].metadata.get("ik", {})
+                sim_manifest["collision_validation"] = [item.metadata.get("collision", {}) for item in trajectories]
+                sim_manifest["completion_status"] = "simulation_complete"
+                sim_manifest["end_timestamp"] = datetime.now(timezone.utc).isoformat()
+                sim_store.save_manifest(sim_manifest)
+
+        if real_store is not None:
+            _save_trajectories(real_store, trajectories)
+            if args.moveit_validate:
+                from elastic_sim_legacy.moveit_validation import validate_with_moveit
+                real_manifest["moveit_validation"] = [validate_with_moveit(config, item) for item in trajectories]
+            from elastic_sim_legacy.ros_experiment import execute_real_trajectories
+            real, ros_manifest = execute_real_trajectories(config, trajectories, real_store.path / "raw", no_motor_control=args.no_motor_control)
+            real_store.save_frame(real, "observations.parquet")
+            real_store.save_frame(real, "real.parquet")
+            real_manifest["ros"] = ros_manifest
+            real_manifest["raw_bag_path"] = ros_manifest.get("bag_path", str(real_store.path / "raw" / "rosbag2"))
+            real_manifest["completion_status"] = "complete"
+            real_manifest["end_timestamp"] = datetime.now(timezone.utc).isoformat()
+            real_store.save_manifest(real_manifest)
+        locations = [str(store.path) for store in (sim_store, real_store) if store is not None]
+        print("Experiment complete: " + (", ".join(locations) if locations else "ephemeral simulation (no artifacts written)"))
+        return 0
+    except Exception as exc:
+        for store, manifest in ((sim_store, sim_manifest), (real_store, real_manifest)):
+            if store is not None and manifest is not None and manifest.get("completion_status") == "incomplete":
+                manifest["error"] = f"{type(exc).__name__}: {exc}"
+                manifest["end_timestamp"] = datetime.now(timezone.utc).isoformat()
+                store.save_manifest(manifest)
+        raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

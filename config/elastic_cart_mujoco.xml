@@ -7,7 +7,7 @@
       python -m mujoco.viewer --mjcf=config/elastic_cart_mujoco.xml
 
   elastic_cart_robot_mujoco.py reads this file via str.format_map(); to override
-  a value at runtime, replace its literal with a {placeholder} token and add the
+  a value at runtime, replace its literal with a {{placeholder}} token and add the
   corresponding key to the params dict in _load_mjcf_xml().
 
   Default values (from settings.yaml / sim_common.py)

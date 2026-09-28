@@ -32,7 +32,7 @@ from elastic_sim.dataset import DEFAULT_CONFIG, comparison_report_path, load_con
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("dataset", help="Dataset CSV written by generate_identification_dataset.py")
+    parser.add_argument("dataset", help="Dataset (.parquet or .csv) written by the generator")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML providing the comparison limits")
     parser.add_argument("--q-link-rms", type=float, default=None, help="Limit on link position RMS [rad]")
     parser.add_argument("--ft-relative-rms", type=float, default=None, help="Limit on relative link torque RMS")
@@ -48,7 +48,7 @@ def main() -> None:
     thresholds = replace(thresholds, **{name: value for name, value in overrides.items() if value is not None})
 
     csv_path = Path(args.dataset).expanduser().resolve()
-    frame = pd.read_csv(csv_path)
+    frame = pd.read_parquet(csv_path) if csv_path.suffix.lower() == ".parquet" else pd.read_csv(csv_path)
     manifest_path = csv_path.with_suffix(".manifest.json")
     records = []
     if manifest_path.is_file():
