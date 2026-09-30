@@ -163,6 +163,11 @@ class BagDiagnostics:
     baseline_rms_state_tau: float
     baseline_rms_tau: float
     baseline_rms_mean: float
+    #: The rigid-only baseline (`R6_04` Sec 4 step 9): the nominal
+    #: (payload-free) rigid model on the recorded ``q``/``dq`` inputs and their
+    #: Savitzky-Golay acceleration -- what a model with no elastic or friction
+    #: term predicts from what it is given.
+    baseline_rms_rigid: float
     # Q-C.5
     deflection_rms: float
     deflection_over_noise: float
@@ -369,6 +374,14 @@ def bag_diagnostics(
     baseline_state_tau = _fit_rms(np.hstack([projected, tau_column, ones]))
     baseline_tau = _fit_rms(tau_only)
     baseline_mean = float(np.sqrt(np.mean((target_column - target_column.mean()) ** 2)))
+    baseline_rigid = float("nan")
+    input_q = _column_block(frame, "q", n_dof)
+    input_dq = _column_block(frame, "dq", n_dof)
+    if input_q is not None and input_dq is not None:
+        input_ddq = savitzky_golay_acceleration(input_dq, time_step, window=sg_window)
+        rigid = np.asarray([idn.inverse_dynamics(pin, model, data, input_q[i], input_dq[i], input_ddq[i])
+                            for i in range(len(input_q))])
+        baseline_rigid = float(np.sqrt(np.mean((target - rigid) ** 2)))
 
     # -- Q-C.4: probe-band content -------------------------------------------
     def _band_energy(values: np.ndarray | None) -> float:
@@ -433,6 +446,7 @@ def bag_diagnostics(
         baseline_rms_state_tau=baseline_state_tau,
         baseline_rms_tau=baseline_tau,
         baseline_rms_mean=baseline_mean,
+        baseline_rms_rigid=baseline_rigid,
         deflection_rms=deflection_rms,
         deflection_over_noise=deflection_over_noise,
         tracking_rms=tracking,

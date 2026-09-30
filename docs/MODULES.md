@@ -15,8 +15,11 @@ sim-to-real/calibration stack is archived in `legacy/`; see
 | `controllers.py` | Controller modes (`exact_ct`, `nominal_ct`, `pd_gravity`, `pd`, `velocity_pi`), their per-trajectory gain draws, and the nominal model a controller is allowed to know. |
 | `excitation.py` | Fourier excitation design: limit fitting, the modal probe, regressor conditioning, collision-checked candidate selection. |
 | `identification.py` | Pinocchio inverse dynamics, base-parameter regressor and friction model: the analytic reference independent of both simulators. |
-| `measurement.py` | Sensor model applied to recorded channels: quantization, noise, gain error, delay. |
-| `plant_extras.py` | Non-Lagrangian plant effects: link friction, nonlinear spring, torque ripple. |
+| `measurement.py` | Sensor model applied to recorded channels: quantization, noise, gain error, delay; round 6's percentage `NoiseModel` and the in-loop `LoopInstrument` the controller reads. |
+| `plant_extras.py` | Non-Lagrangian plant effects: link friction, nonlinear spring (deflection or torque knees), torque ripple, the harmonic drive's transmission error. |
+| `dataset_bounds.py` | Round 6's load-time explicit-integration bound, `(b + c/eps + d) h / M_eff <= 1` per DOF, and the `auto` physics steps derived from it. |
+| `link_modes.py` | Round 6's link-side mode table `f_link = sqrt(K / M_link) / 2 pi`, the elastically observable joints, and the probe comb aimed at them. |
+| `round6_checks.py` | Round 6's controller-influence gates and per-file hard checks, run on a written dataset. |
 | `wrench.py` | End-effector force/torque cell and its `J(q)^T` mapping to a per-joint target. |
 | `payload.py` | Flange payload injected into the URDF so every consumer sees the same plant. |
 | `diagnostics.py` | Q-C measurements per bag: collinearity, conditioning, residual decomposition, probe-band content, deflection SNR, linear baselines. |
@@ -34,7 +37,10 @@ sim-to-real/calibration stack is archived in `legacy/`; see
 
 | Script | Use |
 |---|---|
-| `diagnose_controller_modes.py` | **Production build**: matched datasets per controller mode (± plant extras), trajectories optimized once and reused, parallel bags, Q-C diagnostics, baselines written into each contract. |
+| `build_round6.py` | **Round-6 build**: production, gain-shift and ablation files from one schema-3 config, gated; a failing file is written `*.refused.parquet`. |
+| `round6_budget.py` | Round 6's contribution budget: every plant effect toggled once on 2 robots, variance shares of `tau_s`, gated on the elastically observable joints (`R6_02` P2-2). |
+| `round6_probe_fraction.py` | Chooses a round-6 platform's probe acceleration fraction: raised from 0.2 until peak `|tau|/effort` reaches 0.8, capped at 0.7. |
+| `diagnose_controller_modes.py` | **Round-5 production build**: matched datasets per controller mode (± plant extras), trajectories optimized once and reused, parallel bags, Q-C diagnostics, baselines written into each contract. |
 | `generate_identification_dataset.py` | One dataset at a config's own settings. |
 | `run_identification_simulation.py` | One rollout, viewer and diagnostics, no dataset written; reproduces any bag by `--tier/--trajectory`. |
 | `audit_backends.py` | MuJoCo vs Newton on a 3-robot build, clean columns; not part of any launch. |

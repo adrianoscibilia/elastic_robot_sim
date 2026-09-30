@@ -314,3 +314,344 @@ def measure_bag(
         tau_link=model.delay(model.measure_torque(tau_link, rng, gain=gain_link)),
         gain_motor=gain_motor, gain_link=gain_link,
     )
+
+
+# ---------------------------------------------------------------------------
+# Round 6: percentage noise on every recorded signal (`R6_00` Sec 6)
+# ---------------------------------------------------------------------------
+
+#: The rng stream index of the round-6 instruments, one sub-stream per channel.
+#: New index, so it perturbs no round-5 draw.
+_NOISE_STREAM = 13
+_NOISE_CHANNELS = ("q", "dq", "ft", "wrench")
+
+
+def _per_joint_values(values: Any, n_dof: int, name: str) -> np.ndarray:
+    array = np.atleast_1d(np.asarray(values, dtype=float)).reshape(-1)
+    if len(array) not in (1, n_dof):
+        raise ValueError(f"simulation.noise.{name} has {len(array)} values; expected 1 or {n_dof}")
+    return np.broadcast_to(array, (n_dof,)).copy()
+
+
+@dataclass(frozen=True)
+class ChannelNoise:
+    """One recorded channel's instrument (`R6_00` Sec 6, "Definition").
+
+    For joint ``j`` of a bag the chain is
+
+    1. white Gaussian noise of
+       ``sigma_j = p * RMS(x_j - mean(x_j)) (+) sigma (+) sigma_quanta * quantization_j``,
+       fixed for the bag (``(+)`` is a root-sum-square; the absolute floor
+       ``sigma`` is the end-effector cell's, ``sigma_quanta`` the encoders':
+       a percentage of RMS is the wrong convention for a position, `R6_02` Sec 3);
+    2. a per-bag gain ``1 + g``, ``g ~ U(-gain, gain)``;
+    3. a per-bag offset ``o ~ U(-offset, offset) * effort_j`` (torque channels);
+    4. quantization to ``quantization`` (one value, or one per joint);
+    5. the bag's ``delay_samples``.
+
+    The levels are a modelling-error-class choice, not a claim about the real
+    sensor (`R6_00` Sec 6, "Principle"); where an interface's resolution is
+    known, the quantization is exact.
+    """
+
+    p: float = 0.0
+    sigma: float = 0.0
+    gain: float = 0.0
+    offset: float = 0.0
+    quantization: tuple[float, ...] = (0.0,)
+    sigma_quanta: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("p", "sigma", "gain", "offset", "sigma_quanta"):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"simulation.noise.*.{name} must be non-negative")
+        if float(self.gain) >= 1.0:
+            raise ValueError("simulation.noise.*.gain is a relative half-width and must be < 1")
+        quantization = tuple(float(v) for v in np.atleast_1d(self.quantization))
+        if any(v < 0.0 for v in quantization):
+            raise ValueError("simulation.noise.*.quantization must be non-negative")
+        object.__setattr__(self, "quantization", quantization)
+
+    @property
+    def is_ideal(self) -> bool:
+        return (self.p == 0.0 and self.sigma == 0.0 and self.gain == 0.0 and self.offset == 0.0
+                and self.sigma_quanta == 0.0 and all(v == 0.0 for v in self.quantization))
+
+    def sigma_for(self, basis: np.ndarray) -> np.ndarray:
+        """Per-joint noise std for a bag whose signal (or reference) is ``basis``."""
+        basis = np.atleast_2d(np.asarray(basis, dtype=float))
+        rms = np.sqrt(np.mean((basis - basis.mean(axis=0)) ** 2, axis=0))
+        quanta = float(self.sigma_quanta) * _per_joint_values(self.quantization, basis.shape[-1], "quantization")
+        return np.sqrt((float(self.p) * rms) ** 2 + float(self.sigma) ** 2 + quanta ** 2)
+
+    def quantize(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        step = _per_joint_values(self.quantization, values.shape[-1], "quantization")
+        return np.where(step > 0.0, np.round(values / np.where(step > 0.0, step, 1.0)) * step, values)
+
+    def draw_calibration(self, rng: np.random.Generator, effort: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The bag's ``(gain, offset)`` per joint: ``1 + g`` and ``o * effort``."""
+        effort = np.asarray(effort, dtype=float)
+        n = len(effort)
+        gain = 1.0 + (rng.uniform(-self.gain, self.gain, size=n) if self.gain else np.zeros(n))
+        finite = np.where(np.isfinite(effort), effort, 0.0)
+        offset = (rng.uniform(-self.offset, self.offset, size=n) * finite) if self.offset else np.zeros(n)
+        return gain, offset
+
+    def measure_sample(self, value: np.ndarray, rng: np.random.Generator, sigma: np.ndarray,
+                       gain: np.ndarray, offset: np.ndarray) -> np.ndarray:
+        """Steps 1-4 on one sample (the delay is the caller's, it spans samples)."""
+        value = np.asarray(value, dtype=float)
+        if np.any(sigma > 0.0):
+            value = value + rng.normal(0.0, 1.0, size=value.shape) * sigma
+        return self.quantize(gain * value + offset)
+
+    def describe(self) -> dict[str, Any]:
+        return {"p": float(self.p), "sigma": float(self.sigma), "gain": float(self.gain),
+                "offset": float(self.offset), "quantization": list(self.quantization),
+                "sigma_quanta": float(self.sigma_quanta)}
+
+
+#: How the recorded motor velocity is produced.  ``sensor``: the drive's own
+#: estimate (UR10 RTDE, FMRR ``0x606C``), i.e. the true velocity through the
+#: channel's instrument.  ``position_derivative``: the interface has no
+#: velocity at all (the iiwa's FRI), so it is the consumer's own
+#: Savitzky-Golay derivative of the recorded position.
+DQ_SOURCES = ("sensor", "position_derivative")
+
+
+@dataclass(frozen=True)
+class NoiseModel:
+    """The ``simulation.noise`` block: every recorded signal's instrument.
+
+    ``enabled: false`` is the ideal instrument *including* the delay: the
+    recorder and the loop then see the true state at the sample instants.
+    That is the noise ablation (`R6_00` Sec 6), which asks how much of a
+    model's error is instrument rather than physics.
+    """
+
+    enabled: bool = True
+    q: ChannelNoise = None  # type: ignore[assignment]
+    dq: ChannelNoise = None  # type: ignore[assignment]
+    ft: ChannelNoise = None  # type: ignore[assignment]
+    wrench: ChannelNoise = None  # type: ignore[assignment]
+    dq_source: str = "sensor"
+    delay_samples: int = 1
+    tag: str = "modelling_error"
+    provenance: str = "E"
+
+    def __post_init__(self) -> None:
+        for name in _NOISE_CHANNELS:
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, ChannelNoise())
+        if self.dq_source not in DQ_SOURCES:
+            raise ValueError(f"simulation.noise.dq.source must be one of {DQ_SOURCES}")
+        if int(self.delay_samples) < 0:
+            raise ValueError("simulation.noise.delay_samples must be non-negative")
+        object.__setattr__(self, "delay_samples", int(self.delay_samples))
+        if self.dq_source == "position_derivative" and not self.dq.is_ideal:
+            raise ValueError(
+                "simulation.noise.dq: a velocity derived from the recorded position carries that "
+                "position's noise and nothing else; give it no p/gain/offset/quantization of its own"
+            )
+
+    @property
+    def effective_delay(self) -> int:
+        return self.delay_samples if self.enabled else 0
+
+    def channel(self, name: str) -> ChannelNoise:
+        return getattr(self, name) if self.enabled else ChannelNoise()
+
+    def seed_for(self, seed: int, channel: str) -> tuple[int, int, int]:
+        return (int(seed), _NOISE_STREAM, _NOISE_CHANNELS.index(channel))
+
+    def delay(self, values: np.ndarray) -> np.ndarray:
+        return MeasurementModel(delay_samples=self.effective_delay).delay(values)
+
+    def measure(self, name: str, clean: np.ndarray, seed: int, *, effort: np.ndarray,
+                basis: np.ndarray | None = None) -> "NoisyChannel":
+        """A whole recorded channel, after the fact (``ft``, the wrench)."""
+        clean = np.atleast_2d(np.asarray(clean, dtype=float))
+        channel = self.channel(name)
+        n = clean.shape[1]
+        rng = np.random.default_rng(self.seed_for(seed, name))
+        sigma = channel.sigma_for(clean if basis is None else basis)
+        gain, offset = channel.draw_calibration(rng, np.broadcast_to(np.asarray(effort, dtype=float), (n,)))
+        if channel.is_ideal:
+            values = clean
+        else:
+            values = channel.measure_sample(clean, rng, sigma[None, :], gain[None, :], offset[None, :])
+        return NoisyChannel(values=self.delay(values), sigma=sigma, gain=gain, offset=offset)
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "definition": (
+                "per bag and joint: x + N(0, sigma^2) with sigma = p * RMS(x - mean(x)) (root-sum-square "
+                "with the absolute sigma and with sigma_quanta quantization steps where given; positions "
+                "use quantization steps only, R6_02 Sec 3), then gain (1 + g), g ~ U(-gain, gain), then offset "
+                "o ~ U(-offset, offset) * effort limit, then quantization, then delay_samples. For the "
+                "channels the controller reads in the loop (q, and dq when it is a sensor) x is the "
+                "bag's reference trajectory, the only signal known before the bag runs; for ft it is "
+                "the clean target itself (R6_00 Sec 6)"
+            ),
+            "q": self.q.describe(), "dq": {**self.dq.describe(), "source": self.dq_source},
+            "ft": self.ft.describe(), "wrench": self.wrench.describe(),
+            "delay_samples": int(self.delay_samples),
+            "tag": self.tag, "provenance": self.provenance,
+        }
+
+
+@dataclass(frozen=True)
+class NoisyChannel:
+    values: np.ndarray
+    sigma: np.ndarray
+    gain: np.ndarray
+    offset: np.ndarray
+
+
+class LoopInstrument:
+    """The motor-side encoder and velocity the controller reads (`R6_00` Sec 2.1).
+
+    Called once per sample period with the true motor state, it records the
+    measured, delayed channels exactly as they are written to ``q*``/``dq*``,
+    and returns what the controller may use at that instant: the latest
+    recorded position, and either the latest recorded velocity (a drive's
+    estimate) or, where the interface has no velocity, a *causal*
+    Savitzky-Golay derivative of the last ``window`` recorded positions.
+
+    ``sigma_q``/``sigma_dq`` are fixed for the bag by the caller from the
+    reference trajectory (:meth:`ChannelNoise.sigma_for`), since the clean
+    signal they would otherwise be scaled by does not exist yet.
+    """
+
+    def __init__(
+        self, noise: NoiseModel, *, n_dof: int, seed: int, sigma_q: np.ndarray, sigma_dq: np.ndarray,
+        sample_time: float, sg_window: int = 5, sg_poly: int = 3,
+    ) -> None:
+        self.noise = noise
+        self.n_dof = int(n_dof)
+        self.delay = noise.effective_delay
+        self._q_channel, self._dq_channel = noise.channel("q"), noise.channel("dq")
+        self._rng_q = np.random.default_rng(noise.seed_for(seed, "q"))
+        self._rng_dq = np.random.default_rng(noise.seed_for(seed, "dq"))
+        self.sigma_q = np.broadcast_to(np.asarray(sigma_q, dtype=float), (self.n_dof,)).copy()
+        self.sigma_dq = np.broadcast_to(np.asarray(sigma_dq, dtype=float), (self.n_dof,)).copy()
+        if not noise.enabled:
+            self.sigma_q[:] = 0.0
+            self.sigma_dq[:] = 0.0
+        ones, zeros = np.ones(self.n_dof), np.zeros(self.n_dof)
+        self._unit = (ones, zeros)
+        self.derivative = noise.dq_source == "position_derivative"
+        self.sample_time = float(sample_time)
+        self.sg_window, self.sg_poly = int(sg_window), int(sg_poly)
+        if self.derivative:
+            from scipy.signal import savgol_coeffs
+
+            if self.sg_window <= self.sg_poly or self.sg_window % 2 == 0:
+                raise ValueError("the causal velocity needs an odd sg_window > sg_poly")
+            self._causal = savgol_coeffs(self.sg_window, self.sg_poly, deriv=1, delta=self.sample_time,
+                                         pos=self.sg_window - 1, use="dot")
+        self._q_raw: list[np.ndarray] = []
+        self._dq_raw: list[np.ndarray] = []
+        self.q_recorded: list[np.ndarray] = []
+        self.dq_recorded: list[np.ndarray] = []
+        self.dq_loop: list[np.ndarray] = []
+
+    def read_q(self, q: np.ndarray) -> np.ndarray:
+        """One undelayed encoder reading."""
+        gain, offset = self._unit
+        return self._q_channel.measure_sample(q, self._rng_q, self.sigma_q, gain, offset)
+
+    def measure_dq(self, dq: np.ndarray) -> np.ndarray:
+        """A velocity through the recorded ``dq`` channel's instrument."""
+        gain, offset = self._unit
+        return self._dq_channel.measure_sample(dq, self._rng_dq, self.sigma_dq, gain, offset)
+
+    def read(self, q: np.ndarray, dq: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+        """One undelayed reading of the encoder (and the velocity sensor, when there is one)."""
+        q_now = self.read_q(q)
+        if self.derivative:
+            return q_now, None
+        return q_now, self.measure_dq(dq)
+
+    def sample(self, q: np.ndarray, dq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return self.record(*self.read(q, dq))
+
+    def record(self, q_read: np.ndarray, dq_read: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+        """Record one reading on the bus, delayed; return what a bus-side controller would use."""
+        self._q_raw.append(np.asarray(q_read, dtype=float))
+        index = len(self._q_raw) - 1
+        source = max(index - self.delay, 0)
+        q_now = self._q_raw[source]
+        self.q_recorded.append(q_now)
+        if self.derivative:
+            window = [self.q_recorded[max(index - offset_, 0)] for offset_ in range(self.sg_window - 1, -1, -1)]
+            dq_now = self._causal @ np.asarray(window)
+        else:
+            self._dq_raw.append(np.asarray(dq_read, dtype=float))
+            dq_now = self._dq_raw[source]
+            self.dq_recorded.append(dq_now)
+        self.dq_loop.append(dq_now)
+        return q_now, dq_now
+
+    def history(self) -> dict[str, np.ndarray]:
+        record = {
+            "q_motor_measured": np.asarray(self.q_recorded, dtype=float),
+            "dq_motor_loop": np.asarray(self.dq_loop, dtype=float),
+            "noise_sigma_q": self.sigma_q, "noise_sigma_dq": self.sigma_dq,
+        }
+        if not self.derivative:
+            record["dq_motor_measured"] = np.asarray(self.dq_recorded, dtype=float)
+        return record
+
+
+class DriveInstrument:
+    """A PD that lives inside the drive (`R6_02` Sec 7 amended, `R6_04` A-4).
+
+    Every drive tick the drive reads its own encoder -- the joint encoder of
+    Sec 6: quantization plus ``sigma_quanta`` counts, no bus delay -- and
+    computes its velocity the way a real drive does: the difference of two
+    consecutive readings over the drive period, through a first-order
+    low-pass at ``cutoff_hz`` (``drive_rate / 10``).  Those two signals close
+    the loop.  The Sec 6 percentage noise is a *recorded-channel* modelling
+    error, so it is applied only to the copy the bus records, never fed back:
+    every ``ticks_per_sample``-th tick the recorder (a :class:`LoopInstrument`
+    at the sample rate, which applies the recording delay) stores the
+    drive's encoder reading and its velocity estimate through the ``dq``
+    channel (or, on an interface with no velocity, the recorder's own
+    Savitzky-Golay derivative of the recorded position).
+    """
+
+    def __init__(self, recorder: LoopInstrument, ticks_per_sample: int, *, drive_period: float,
+                 cutoff_hz: float) -> None:
+        if int(ticks_per_sample) < 1:
+            raise ValueError("ticks_per_sample must be >= 1")
+        if drive_period <= 0.0 or cutoff_hz <= 0.0:
+            raise ValueError("drive_period and cutoff_hz must be positive")
+        self.recorder = recorder
+        self.ticks_per_sample = int(ticks_per_sample)
+        self.drive_period = float(drive_period)
+        self.cutoff_hz = float(cutoff_hz)
+        self.alpha = 1.0 - float(np.exp(-2.0 * np.pi * self.cutoff_hz * self.drive_period))
+        self._tick = 0
+        self._q_last: np.ndarray | None = None
+        self._velocity: np.ndarray | None = None
+
+    def sample(self, q: np.ndarray, dq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        q_read = self.recorder.read_q(q)
+        if self._q_last is None:
+            # A drive enabled on a moving axis starts from its true speed.
+            self._velocity = np.asarray(dq, dtype=float).copy()
+        else:
+            raw = (q_read - self._q_last) / self.drive_period
+            self._velocity = self._velocity + self.alpha * (raw - self._velocity)
+        self._q_last = q_read
+        if self._tick % self.ticks_per_sample == 0:
+            dq_record = None if self.recorder.derivative else self.recorder.measure_dq(self._velocity)
+            self.recorder.record(q_read, dq_record)
+        self._tick += 1
+        return q_read, self._velocity.copy()
+
+    def history(self) -> dict[str, np.ndarray]:
+        return self.recorder.history()

@@ -25,7 +25,7 @@ from .identification import FrictionModel
 from .kinematics import PortableKinematics
 from .materialized import MaterializedTrajectory
 from .payload import Payload, payload_asset
-from .plant_extras import NO_EXTRAS, PlantExtras, StiffnessNonlinearity, TorqueRipple
+from .plant_extras import NO_EXTRAS, PlantExtras, StiffnessNonlinearity, TorqueRipple, TransmissionError
 from .torque_runners import control_separation_ratio, link_inertia_envelope, link_inertia_max
 from .dataset_bag import (
     _inertia_envelope_bounds,
@@ -36,6 +36,7 @@ from .dataset_bag import (
 )
 from .dataset_config import (
     ControlGainSampling,
+    MotorFrictionPrior,
     DatasetConfig,
     LinkInertia,
     PayloadSampling,
@@ -129,7 +130,7 @@ def _robot_stream(robot: str) -> int:
 
 def plant_extras_for_bag(
     sampling: PlantExtrasSampling, n_dof: int, dataset_seed: int, trajectory_seed_value: int,
-    *, robot: str | None = None,
+    *, robot: str | None = None, stiffness: np.ndarray | None = None, effort: np.ndarray | None = None,
 ) -> PlantExtras:
     """Resolve one bag's plant extras, drawing the ripple phase.
 
@@ -144,6 +145,13 @@ def plant_extras_for_bag(
     a machine has one friction law, and drawing it per bag would make it a
     per-sample disturbance instead of a property of the machine the split
     holds out.  Its stream is ``(seed, 10, robot)``, again a new index.
+
+    Round 6: ``stiffness`` (the robot's sampled ``k``) converts torque knees
+    into deflection breakpoints, and ``effort`` (the URDF limits) turns
+    effort-fraction knees into torques (`R6_00` Sec 5.2).  Without a
+    stiffness -- the rigid tier -- there is no spring to bend.  The
+    transmission error's phase is drawn per bag from stream
+    ``(seed, 12, trajectory_seed)`` (Sec 5.3).
     """
     if sampling.is_empty:
         return NO_EXTRAS
@@ -166,15 +174,57 @@ def plant_extras_for_bag(
         nonlinearity = StiffnessNonlinearity(
             breakpoints=tuple(sampling.stiffness_breakpoints), factors=tuple(sampling.stiffness_factors),
         )
+    elif (sampling.stiffness_breakpoints_torque or sampling.stiffness_breakpoints_effort_fraction) \
+            and stiffness is not None:
+        if sampling.stiffness_breakpoints_torque:
+            knees = np.asarray(sampling.stiffness_breakpoints_torque, dtype=float)
+        else:
+            if effort is None:
+                raise ValueError("breakpoints_effort_fraction needs the joints' effort limits")
+            knees = np.outer(np.asarray(effort, dtype=float),
+                             np.asarray(sampling.stiffness_breakpoints_effort_fraction, dtype=float))
+        nonlinearity = StiffnessNonlinearity.from_torque_knees(
+            np.asarray(sampling.stiffness_factors, dtype=float), knees,
+            _per_joint(stiffness, n_dof, "stiffness"),
+        )
     ripple = None
     if sampling.ripple_amplitude:
-        ripple = TorqueRipple(amplitude=float(sampling.ripple_amplitude), order=float(sampling.ripple_order))
+        ripple = TorqueRipple(amplitude=float(sampling.ripple_amplitude), order=sampling.ripple_order)
         if sampling.ripple_random_phase:
             rng = np.random.default_rng((int(dataset_seed), 9, int(trajectory_seed_value)))
             ripple = ripple.with_phase(rng, n_dof)
+    transmission_error = None
+    if sampling.has_transmission_error and stiffness is not None:
+        transmission_error = TransmissionError(
+            amplitude=tuple(_per_joint(sampling.transmission_error_amplitude, n_dof, "transmission_error.amplitude")),
+            order=tuple(_per_joint(sampling.transmission_error_order, n_dof, "transmission_error.order")),
+        )
+        if sampling.transmission_error_random_phase:
+            rng = np.random.default_rng((int(dataset_seed), 12, int(trajectory_seed_value)))
+            transmission_error = transmission_error.with_phase(rng, n_dof)
     return PlantExtras(
         link_friction=link_friction, stiffness_nonlinearity=nonlinearity, torque_ripple=ripple,
+        transmission_error=transmission_error,
     )
+
+
+def motor_friction_for(config: DatasetConfig, asset: AssetSpec, tier: Tier) -> FrictionModel:
+    """The round-6 motor friction of one robot (`R6_00` Sec 5.4).
+
+    The nominal rule (:class:`MotorFrictionPrior`) scaled per joint and per
+    coefficient, log-uniformly over ``dataset.friction_scale``, from stream
+    ``(seed, 11, robot)`` -- keyed on the robot's name, so a robot keeps its
+    friction whatever else the build contains.  The rigid reference keeps the
+    nominal: it is the stiff limit of the *nominal* robot.
+    """
+    prior = config.motor_friction
+    base = prior.nominal(asset)
+    if tier.is_rigid or not prior.per_robot:
+        return base
+    rng = np.random.default_rng((int(config.seed), 11, _robot_stream(tier.name)))
+    low, high = np.log(config.friction_scale_range[0]), np.log(config.friction_scale_range[1])
+    return base.scaled(np.exp(rng.uniform(low, high, size=base.n_dof)),
+                       np.exp(rng.uniform(low, high, size=base.n_dof)))
 
 
 def trajectory_seed(config: DatasetConfig, tier: Tier, index: int) -> int:
@@ -226,11 +276,31 @@ def sample_control_gains(
     if not sampling.enabled:
         return base_frequency, base_damping_ratio
     rng = np.random.default_rng((int(dataset_seed), 6, int(trajectory_seed_value)))
-    natural_frequency = float(np.exp(
-        rng.uniform(np.log(sampling.natural_frequency[0]), np.log(sampling.natural_frequency[1]))
-    ))
+    if sampling.bands:
+        natural_frequency = _log_uniform_union(rng.uniform(), sampling.bands)
+    else:
+        natural_frequency = float(np.exp(
+            rng.uniform(np.log(sampling.natural_frequency[0]), np.log(sampling.natural_frequency[1]))
+        ))
     damping_ratio = float(rng.uniform(sampling.damping_ratio[0], sampling.damping_ratio[1]))
     return natural_frequency, damping_ratio
+
+
+def _log_uniform_union(unit: float, bands: Sequence[tuple[float, float]]) -> float:
+    """Map one ``U(0, 1)`` draw log-uniformly onto a union of ``(low, high)`` bands.
+
+    One uniform number, as the single-band draw consumes, so the damping-ratio
+    draw after it lands on the same stream position whichever bands a build
+    uses: the gain-shift file then shares its bags' damping ratios with the
+    production file (`R6_00` Sec 7 item 4, "same seeds").
+    """
+    widths = np.asarray([np.log(high) - np.log(low) for low, high in bands], dtype=float)
+    position = float(unit) * float(widths.sum())
+    for (low, high), width in zip(bands, widths):
+        if position <= width or (low, high) == tuple(bands[-1]):
+            return float(np.exp(np.log(low) + min(position, width)))
+        position -= width
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def sample_friction(base: FrictionModel, rng: np.random.Generator, scale_range: tuple[float, float]) -> FrictionModel:
@@ -238,7 +308,7 @@ def sample_friction(base: FrictionModel, rng: np.random.Generator, scale_range: 
     low, high = np.log(scale_range[0]), np.log(scale_range[1])
     viscous = base.viscous * np.exp(rng.uniform(low, high, size=base.n_dof))
     coulomb = base.coulomb * np.exp(rng.uniform(low, high, size=base.n_dof))
-    return FrictionModel(viscous, coulomb)
+    return FrictionModel(viscous, coulomb, base.epsilon)
 
 
 def _log_span_coverage(values: np.ndarray, declared_span: np.ndarray) -> dict[str, list[float]]:
@@ -320,6 +390,8 @@ def iter_conditions(config: DatasetConfig) -> Iterator[tuple[int, Tier, int, str
     for trajectory_index in range(config.n_trajectories):
         for friction_index in range(config.n_friction_samples):
             for tier in config.tiers:
+                if config.only_tiers is not None and tier.name not in config.only_tiers:
+                    continue
                 for backend in config.backends:
                     yield trajectory_index, tier, friction_index, backend
 
@@ -469,6 +541,8 @@ def resolve_bag(
     )
     extras = plant_extras_for_bag(
         config.plant_extras, len(asset.joint_names), config.seed, traj_seed, robot=tier.name,
+        stiffness=None if tier.is_rigid else np.asarray(tier.stiffness, dtype=float),
+        effort=np.asarray([np.inf if j.effort is None else j.effort for j in asset.resolve_active_joints()]),
     )
 
     if trajectory is None:
@@ -512,6 +586,89 @@ def _optimize_trajectory(args: tuple) -> MaterializedTrajectory:
     return resolve_bag(config, asset, tier, index, payload).trajectory
 
 
+#: The round-6 target and inputs, as the manifest and the contract state them (`R6_00` Sec 1).
+ROUND6_TARGET_SEMANTICS = "transmission output torque applied to the link [N·m | N]"
+ROUND6_INPUT_SEMANTICS = (
+    "q0..q{{n-1}} = motor-side position as the encoder reports it (quantized, noisy, delay_samples old); "
+    "dq0..dq{{n-1}} = motor-side velocity as the interface provides it: {dq}; "
+    "tau0..tau{{n-1}} = commanded motor torque exactly as the model-free PD sent it, noise-free (not a "
+    "sensor: the torque the plant receives differs from it by motor friction and ripple, which is physics)"
+)
+
+
+def _round6_manifest(config: DatasetConfig, asset: AssetSpec) -> dict[str, Any]:
+    """What a round-6 file adds to its manifest (`R6_00` Secs 2, 5, 6; `R6_02` Secs 2, 7)."""
+    from .dataset_config import gain_bound
+    from .link_modes import link_mode_table
+
+    modes = link_mode_table(config, asset)
+    return {
+        "schema_version": int(config.schema_version),
+        # R6_02 P2-1: each joint's link-side mode band over the prior, and
+        # which joints the budget gate may count as elastically observable.
+        "link_modes": {
+            "definition": ("f_link = sqrt(K / M_link) / (2 pi), K over the stiffness prior, M_link = M_jj(q) from "
+                           "the bare arm's smallest to the largest with the heaviest payload; resolvable band "
+                           "0.09 x sample rate (the SG derivative's five-sample passband)"),
+            "joints": [mode.as_dict() for mode in modes],
+            "observable_joints": [mode.joint for mode in modes if mode.observable],
+            "mostly_observable_joints": [mode.joint for mode in modes if mode.mostly_observable],
+        },
+        "probe_design": None if config.probe_design is None else {
+            **config.probe_design.as_dict(),
+            "harmonics": list(config.excitation.probe_harmonics),
+            "frequencies_hz": [h * config.excitation.base_frequency for h in config.excitation.probe_harmonics],
+            "probe_acceleration_fraction": float(config.excitation.probe_acceleration_fraction),
+        },
+        "noise": config.noise.describe(),
+        "motor_friction": {**config.motor_friction.describe(),
+                           "nominal": {"viscous": config.motor_friction.nominal(asset).viscous.tolist(),
+                                       "coulomb": config.motor_friction.nominal(asset).coulomb.tolist()},
+                           "friction_scale": list(config.friction_scale_range)},
+        "control_timing": {
+            "location": config.controller.location,
+            "control_period": config.control_period,
+            "sample_period": float(config.sample_time_step),
+            "delay_samples": int(config.control_delay),
+            "recording_delay_samples": int(config.loop_delay),
+            "zero_order_hold": True,
+            "controller_reads": (
+                "measured motor-side q/dq, delay_samples old: the recorded q*/dq* channels"
+                if config.controller.location == "bus" else
+                "the drive's own encoder (quantization + sigma_quanta counts) every drive period, undelayed, and "
+                "its velocity = encoder difference through a first-order low-pass at "
+                f"{config.controller.velocity_cutoff_fraction:g} x drive rate; setpoints from the bus, held, "
+                f"{config.controller.setpoint_delay} sample(s) late; the bus records every "
+                f"{config.drive_ticks}th reading, recording_delay_samples old, with the Sec 6 dq percentage on "
+                "the recorded copy only (R6_02 Sec 7 amended, R6_04 A-4)"
+            ),
+            "tau": ("the command held over the sample period" if config.controller.location == "bus" else
+                    "the drive's torque demand at the sample instant (0x6074 / target_current x k_t)"),
+        },
+        "gain_sizing": {
+            "rule": ("kp_j = J_j,nom omega^2, kd_j = 2 zeta J_j,nom omega (nominal rotor inertia)"
+                     if config.controller.gain_sizing == "motor_inertia" else
+                     "kp_j = (J_j,nom + m_j,nom) omega_j^2, kd_j = 2 zeta (J_j,nom + m_j,nom) omega_j, "
+                     "m_j,nom the nominal link inertia's mean diagonal along the reference (per bag: "
+                     "records[].drive_load_inertia); omega_j = omega x J_j / (J_j + m_j,nom), the rotor-referred "
+                     "bound 2 zeta omega_j T (1 + d) (J + m) / J <= 0.5 (R6_04 A-2)"),
+            **({} if config.controller.location != "drive" else {"drive_bound": config.controller.drive_bound}),
+            "nominal_rotor_inertia": config.nominal_rotor_inertia(len(asset.joint_names)).tolist(),
+            "omega_max": config.omega_max(),
+            "natural_frequency_fraction": [list(b) for b in config.control_gains.natural_frequency_fraction],
+            "natural_frequency_bands": [list(b) for b in config.control_gains.bands],
+            "bound": gain_bound(config),
+        },
+        "rigid_tier": (
+            "stiff limit of the same robot: nominal rotor inertia as armature, motor friction on the same "
+            "DOF, link friction and motor ripple; target rnea_link(q, dq, ddq) + f_link" if config.rigid_reference
+            else None
+        ),
+        "gates": config.gates.describe(),
+        "only_tiers": None if config.only_tiers is None else list(config.only_tiers),
+    }
+
+
 def default_jobs(backends: Sequence[str]) -> int:
     """``nproc - 1``, or 1 when Newton is a backend (`R5_10` T-3.4).
 
@@ -540,7 +697,11 @@ def generate(
         jobs = 1
     trajectory_cache = {} if trajectory_cache is None else trajectory_cache
     warn_if_probe_outruns_differentiation(config)
-    base_friction = FrictionModel.from_asset(asset)
+    base_friction = FrictionModel.from_asset(asset) if config.motor_friction is None else (
+        config.motor_friction.nominal(asset)
+    )
+    if config.motor_friction is not None and config.n_friction_samples != 1:
+        raise ValueError("simulation.motor_friction draws friction per robot; set dataset.friction_samples: 1")
     rng = np.random.default_rng(config.seed)
     frictions = [base_friction] + [
         sample_friction(base_friction, rng, config.friction_scale_range)
@@ -653,6 +814,8 @@ def generate(
         # Optimize every trajectory this build does not already have, in
         # parallel when there is a pool: it is most of a build's wall time.
         resolve_tiers = config.tiers if config.trajectories_per_robot else config.tiers[:1]
+        if config.only_tiers is not None and config.trajectories_per_robot:
+            resolve_tiers = tuple(t for t in resolve_tiers if t.name in config.only_tiers)
         pending: dict[tuple, tuple] = {}
         for tier in resolve_tiers:
             for index in range(config.n_trajectories):
@@ -721,7 +884,8 @@ def generate(
         offending: list[tuple[str, float, str]] = []
         for bag_index, (traj_index, tier, friction_index, backend) in enumerate(iter_conditions(config)):
             trajectory = trajectories[(tier.name if config.trajectories_per_robot else "", traj_index)]
-            friction = frictions[friction_index]
+            friction = (frictions[friction_index] if config.motor_friction is None
+                        else motor_friction_for(config, asset, tier))
             bag = f"t{traj_index}_{tier.name}_f{friction_index}_{backend}"
             split = split_labels[tier.name]
             payload = _payload_for(tier, traj_index)
@@ -908,10 +1072,11 @@ def generate(
         "control_decimation": config.control_decimation,
         "controller": describe_controller(config.controller),
         "measurement": config.measurement.describe(),
+        **(_round6_manifest(config, asset) if config.is_round6 else {}),
         "differentiation": differentiation_policy(config),
         "signals": config.signals.describe(),
         "force_torque_sensor": (
-            None if not config.signals.needs_sensor
+            None if not config.signals.needs_cell
             else _sensor_for(asset, config.signals).describe()
         ),
         "plant_extras": None if config.plant_extras.is_empty else asdict(config.plant_extras),
@@ -936,10 +1101,17 @@ def generate(
             "stiffness": list(config.transmission.stiffness_provenance) or None,
             "rotor_inertia": list(config.transmission.rotor_inertia_provenance) or None,
         },
-        "target": f"ft0..ft{{n-1}} = {_TARGET_SEMANTICS[config.signals.target]}",
+        "target": (f"ft0..ft{{n-1}} = {_TARGET_SEMANTICS[config.signals.target]}" if not config.is_round6
+                   else f"ft0..ft{{n-1}} = {ROUND6_TARGET_SEMANTICS}, "
+                        + ("through the platform's torque-measurement model (simulation.noise.ft)"
+                           if config.signals.target_source == "measured" and config.noise.enabled
+                           else "noise-free")),
         "input": (
             f"q0..q{{n-1}}, dq0..dq{{n-1}} = {config.signals.position_side}-side position and velocity; "
             "tau0..tau{n-1} = commanded motor torque (motor effort)"
+        ) if not config.is_round6 else ROUND6_INPUT_SEMANTICS.format(
+            dq=("the consumer's Savitzky-Golay derivative of the recorded q (the interface gives no velocity)"
+                if config.noise.dq_source == "position_derivative" else "the drive's velocity estimate"),
         ),
         "split": {
             "mode": config.split.mode,

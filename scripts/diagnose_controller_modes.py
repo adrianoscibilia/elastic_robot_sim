@@ -131,6 +131,7 @@ def _generate_for_mode(config, asset, mode: str, output: Path, jobs: int, verbos
 #: evaluator (`R5_10` T-5.5).
 _CONTRACT_BASELINES = (
     "target_rms", "baseline_rms_mean", "baseline_rms_tau", "baseline_rms_state", "baseline_rms_state_tau",
+    "baseline_rms_rigid",
     "link_friction_share", "noise_share", "differentiation_share",
 )
 

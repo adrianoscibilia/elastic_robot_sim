@@ -17,9 +17,10 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .backend_comparison import ComparisonThresholds
-from .controllers import ControllerSpec, NominalModelSpec, VelocityLoopSpec
+from .controllers import ControllerSpec, IntegralSpec, NominalModelSpec, VelocityLoopSpec
 from .excitation import FourierExcitationConfig
-from .measurement import MeasurementModel
+from .identification import FrictionModel
+from .measurement import DQ_SOURCES, ChannelNoise, MeasurementModel, NoiseModel
 from .torque_runners import TransmissionSpec
 
 
@@ -336,6 +337,30 @@ class SplitPolicy:
 
 
 @dataclass(frozen=True)
+class ProbeDesign:
+    """A probe comb aimed at the link-side modes (`R6_02` P2-1).
+
+    Log-spaced lines from ``min(lowest_hz, span[0] x f_link_low)`` up to
+    ``span[1] x f_link_high`` of every joint whose band reaches into the
+    resolvable band, capped at that band (:mod:`elastic_sim.link_modes`).
+    """
+
+    source: str = "link_modes"
+    lowest_hz: float = 2.0
+    lines: int = 30
+    span: tuple[float, float] = (0.5, 1.5)
+
+    def __post_init__(self) -> None:
+        if self.source != "link_modes":
+            raise ValueError("excitation.probe_design.source must be 'link_modes'")
+        if self.lowest_hz <= 0.0 or self.lines < 2 or not 0.0 < self.span[0] < 1.0 < self.span[1]:
+            raise ValueError("excitation.probe_design needs lowest_hz > 0, lines >= 2 and span [lo < 1 < hi]")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"source": self.source, "lowest_hz": self.lowest_hz, "lines": self.lines, "span": list(self.span)}
+
+
+@dataclass(frozen=True)
 class PayloadSampling:
     """Randomized tool/payload rigidly attached to the flange.
 
@@ -413,12 +438,45 @@ class ControlGainSampling:
     enabled: bool = False
     natural_frequency: tuple[float, float] = (25.0, 25.0)
     damping_ratio: tuple[float, float] = (1.0, 1.0)
+    #: Round 6 (`R6_00` Sec 2.2): the natural frequency as *fractions* of the
+    #: discrete-time limit ``omega_max`` instead of absolute values, one or
+    #: more ``(low, high)`` bands drawn log-uniformly over their union.  The
+    #: production draw is one band, ``[0.5, 0.9]``; the gain-shift test file
+    #: is the two outside it, ``[0.3, 0.5) U (0.9, 1.0]`` (Sec 7 item 4).
+    #: Resolved at load time into :attr:`bands` (rad/s), which is what draws.
+    natural_frequency_fraction: tuple[tuple[float, float], ...] = ()
+    bands: tuple[tuple[float, float], ...] = ()
+    omega_max: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("natural_frequency", "damping_ratio"):
             low, high = getattr(self, name)
             if low <= 0.0 or high < low:
                 raise ValueError(f"control_gains.{name} must satisfy 0 < min <= max")
+        for name in ("natural_frequency_fraction", "bands"):
+            rows = tuple((float(lo), float(hi)) for lo, hi in getattr(self, name))
+            for low, high in rows:
+                if low <= 0.0 or high < low:
+                    raise ValueError(f"control_gains.{name} bands must satisfy 0 < min <= max")
+            object.__setattr__(self, name, rows)
+
+    def resolved(self, omega_max: float) -> "ControlGainSampling":
+        """These gains with :attr:`natural_frequency_fraction` turned into rad/s."""
+        from dataclasses import replace
+
+        if not self.natural_frequency_fraction:
+            return self
+        bands = tuple((lo * omega_max, hi * omega_max) for lo, hi in self.natural_frequency_fraction)
+        return replace(self, bands=bands, omega_max=float(omega_max),
+                       natural_frequency=(min(b[0] for b in bands), max(b[1] for b in bands)))
+
+    def with_fraction_bands(self, bands: Sequence[tuple[float, float]]) -> "ControlGainSampling":
+        """The same sampling over other fractions of the same ``omega_max``."""
+        from dataclasses import replace
+
+        if self.omega_max is None:
+            raise ValueError("with_fraction_bands needs gains resolved against omega_max first")
+        return replace(self, natural_frequency_fraction=tuple(bands)).resolved(self.omega_max)
 
 
 _CONTROL_SEPARATION_ACTIONS = ("warn", "error")
@@ -458,6 +516,9 @@ _POSITION_SIDES = ("link", "motor")
 _TARGET_SIDES = ("link_torque", "motor_torque", "ee_wrench_joint")
 
 
+_TARGET_SOURCES = ("measured", "clean")
+
+
 #: Which side of the spring each target is measured on, for the collocation
 #: test.  An end-effector wrench is a link-side quantity: the cell sits past
 #: every transmission in the chain.
@@ -495,12 +556,22 @@ class SignalPolicy:
     position_side: str = "link"
     target: str = "link_torque"
     clean_columns: bool = False
+    #: Round 6 (`R6_00` Sec 1): ``measured`` routes the target through the
+    #: platform's torque-measurement model (``simulation.noise.ft``), ``clean``
+    #: writes the simulator's own ``tau_s``.  Only read when the config has a
+    #: ``simulation.noise`` block; the noise ablation is the ``clean`` one.
+    target_source: str = "measured"
+    #: Keep the end-effector cell's ``w_*``/``sigma_min_j`` columns beside a
+    #: joint-torque target (FMRR, for the post-training chain, Sec 5.5).
+    wrench_columns: bool = False
 
     def __post_init__(self) -> None:
         if self.position_side not in _POSITION_SIDES:
             raise ValueError(f"dataset.signals.position_side must be one of {_POSITION_SIDES}")
         if self.target not in _TARGET_SIDES:
             raise ValueError(f"dataset.signals.target must be one of {_TARGET_SIDES}")
+        if self.target_source not in _TARGET_SOURCES:
+            raise ValueError(f"dataset.signals.target_source must be one of {_TARGET_SOURCES}")
 
     @property
     def is_collocated(self) -> bool:
@@ -516,6 +587,11 @@ class SignalPolicy:
         """True when the target comes from a force/torque cell, not a joint."""
         return self.target == "ee_wrench_joint"
 
+    @property
+    def needs_cell(self) -> bool:
+        """True when the file carries the cell's wrench, as target or beside it."""
+        return self.needs_sensor or self.wrench_columns
+
     def describe(self) -> dict[str, Any]:
         return {
             "position_side": self.position_side,
@@ -523,6 +599,8 @@ class SignalPolicy:
             "target_kind": _TARGET_KINDS[self.target],
             "collocated": self.is_collocated,
             "clean_columns": bool(self.clean_columns),
+            "target_source": self.target_source,
+            "wrench_columns": bool(self.wrench_columns),
         }
 
 
@@ -579,10 +657,25 @@ class PlantExtrasSampling:
     link_friction_viscous_factor: tuple[float, float] = (1.0, 1.0)
     link_friction_coulomb_factor: tuple[float, float] = (1.0, 1.0)
     stiffness_breakpoints: tuple[float, ...] = ()
-    stiffness_factors: tuple[float, ...] = ()
+    #: One shared ``[K1/K2, 1, K3/K2]`` row, or one per joint (`R6_00` Sec 5.2).
+    stiffness_factors: tuple = ()
+    #: The knees in torque instead of deflection -- one shared ``[T1, T2]``
+    #: row or one per joint -- converted per robot with its sampled stiffness
+    #: (`StiffnessNonlinearity.from_torque_knees`).  Or as fractions of each
+    #: joint's URDF effort limit (the iiwa: 20 % and 75 %).  At most one of the
+    #: three breakpoint forms.
+    stiffness_breakpoints_torque: tuple = ()
+    stiffness_breakpoints_effort_fraction: tuple[float, ...] = ()
     ripple_amplitude: float = 0.0
-    ripple_order: float = 24.0
+    ripple_order: float | tuple[float, ...] = 24.0
     ripple_random_phase: bool = True
+    #: The harmonic drive's kinematic error inside the spring (Sec 5.3).
+    transmission_error_amplitude: tuple[float, ...] = ()
+    transmission_error_order: tuple[float, ...] = (1.0,)
+    transmission_error_random_phase: bool = True
+    #: ``explicit`` (rounds 4-5) or ``implicit`` (`R6_00` Sec 3; see
+    #: ``torque_runners._ImplicitLinkFriction``).  Same law, same magnitudes.
+    link_friction_integration: str = "explicit"
 
     def __post_init__(self) -> None:
         if self.link_friction_tier not in LINK_FRICTION_TIERS:
@@ -605,11 +698,22 @@ class PlantExtrasSampling:
             )
         if any(float(v) < 0.0 for v in viscous + coulomb):
             raise ValueError("plant_extras.link_friction coefficients must be non-negative")
-        if bool(self.stiffness_breakpoints) != bool(self.stiffness_factors):
+        forms = [bool(self.stiffness_breakpoints), bool(self.stiffness_breakpoints_torque),
+                 bool(self.stiffness_breakpoints_effort_fraction)]
+        if sum(forms) > 1:
+            raise ValueError(
+                "plant_extras.stiffness_nonlinearity: give one of breakpoints, breakpoints_torque or "
+                "breakpoints_effort_fraction"
+            )
+        if any(forms) != bool(self.stiffness_factors):
             raise ValueError(
                 "plant_extras.stiffness_nonlinearity needs both breakpoints and factors "
                 "(factors one longer than breakpoints)"
             )
+        if self.link_friction_integration not in ("explicit", "implicit"):
+            raise ValueError("plant_extras.link_friction.integration must be 'explicit' or 'implicit'")
+        if any(float(v) < 0.0 for v in self.transmission_error_amplitude):
+            raise ValueError("plant_extras.transmission_error.amplitude must be non-negative")
 
     @property
     def has_link_friction(self) -> bool:
@@ -619,10 +723,109 @@ class PlantExtrasSampling:
         )
 
     @property
+    def has_nonlinear_spring(self) -> bool:
+        return bool(self.stiffness_breakpoints or self.stiffness_breakpoints_torque
+                    or self.stiffness_breakpoints_effort_fraction)
+
+    @property
+    def has_transmission_error(self) -> bool:
+        return any(float(v) > 0.0 for v in self.transmission_error_amplitude)
+
+    @property
+    def max_stiffness_factor(self) -> float:
+        """The stiffest spring region's factor (1 for a linear spring)."""
+        if not self.has_nonlinear_spring:
+            return 1.0
+        return float(max(1.0, np.max(np.asarray(self.stiffness_factors, dtype=float))))
+
+    @property
     def is_empty(self) -> bool:
         return not (
-            self.has_link_friction or self.stiffness_breakpoints or self.ripple_amplitude
+            self.has_link_friction or self.has_nonlinear_spring or self.ripple_amplitude
+            or self.has_transmission_error
         )
+
+
+@dataclass(frozen=True)
+class MotorFrictionPrior:
+    """Motor-side friction re-derived per joint from the URDF (`R6_00` Sec 5.4).
+
+    ``b_j = viscous_fraction * effort_j / velocity_j`` and ``c_j =
+    coulomb_fraction * effort_j``, at the Coulomb smoothing ``epsilon``,
+    replacing whatever ``<dynamics damping/friction>`` the URDF declares (the
+    iiwa asset's blanket 10 Nm s/rad and 0.1 Nm was an asset artefact, not a
+    prior; `R5_12` Sec 2).  It acts *before* the spring, so it lands in
+    ``tau_cmd - tau_s`` and not in the target.  ``per_robot`` draws each
+    robot's coefficients from ``dataset.friction_scale`` around these,
+    independently per joint and coefficient, on its own stream; the rigid
+    reference keeps the nominal.  Class E.
+    """
+
+    viscous_fraction: float = 0.05
+    coulomb_fraction: float = 0.02
+    epsilon: float = 1.0e-2
+    per_robot: bool = True
+    provenance: str = "E"
+
+    def __post_init__(self) -> None:
+        for name in ("viscous_fraction", "coulomb_fraction"):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"simulation.motor_friction.{name} must be non-negative")
+        if float(self.epsilon) <= 0.0:
+            raise ValueError("simulation.motor_friction.epsilon must be positive")
+        if self.provenance not in _PROVENANCE_CLASSES:
+            raise ValueError(f"simulation.motor_friction.provenance must be one of {sorted(_PROVENANCE_CLASSES)}")
+
+    def nominal(self, asset: Any) -> FrictionModel:
+        joints = asset.resolve_active_joints()
+        effort = np.asarray([np.nan if j.effort is None else float(j.effort) for j in joints])
+        velocity = np.asarray([np.nan if j.velocity is None else float(j.velocity) for j in joints])
+        if not (np.all(np.isfinite(effort)) and np.all(np.isfinite(velocity)) and np.all(velocity > 0.0)):
+            raise ValueError(
+                f"simulation.motor_friction needs a finite effort and velocity limit on every joint of "
+                f"{asset.name!r}"
+            )
+        return FrictionModel(self.viscous_fraction * effort / velocity, self.coulomb_fraction * effort,
+                             float(self.epsilon))
+
+    def describe(self) -> dict[str, Any]:
+        return {"viscous_fraction": float(self.viscous_fraction), "coulomb_fraction": float(self.coulomb_fraction),
+                "epsilon": float(self.epsilon), "per_robot": bool(self.per_robot),
+                "provenance": self.provenance,
+                "rule": "b_j = viscous_fraction * effort_j / velocity_j, c_j = coulomb_fraction * effort_j (URDF limits)"}
+
+
+@dataclass(frozen=True)
+class GateSpec:
+    """The controller-influence gates and hard checks a round-6 build must pass (`R6_00` Secs 7, 9)."""
+
+    #: Sec 2.2: achieved-path RMS deviation over each joint's excitation span.
+    sag_max_fraction: float = 0.05
+    #: ``gate`` refuses a file over the limit; ``report`` records the sag and
+    #: passes (`R6_02` Sec 7: FMRR on the bus, where the lag is real physics).
+    sag_mode: str = "gate"
+    sag_reason: str = ""
+    #: Sec 7 item 3: round 5's ``pd`` level of the Q-C v2 statistic on the same
+    #: platform, per tier kind; ``None`` where round 5 has none (the iiwa).
+    qc_v2_reference_elastic: float | None = None
+    qc_v2_reference_rigid: float | None = None
+    qc_v2_reference_source: str = ""
+    #: Sec 9: unstable bags allowed before a file is refused.
+    unstable_max_fraction: float = 0.02
+    #: Sec 7 item 4: the gain-shift file's bands, as fractions of omega_max.
+    gainshift_fraction: tuple[tuple[float, float], ...] = ((0.3, 0.5), (0.9, 1.0))
+    gainshift_max_ratio: float = 1.3
+
+    def __post_init__(self) -> None:
+        if self.sag_mode not in ("gate", "report"):
+            raise ValueError("gates.sag_mode must be 'gate' or 'report'")
+        if self.sag_mode == "report" and not self.sag_reason:
+            raise ValueError("gates.sag_mode: report needs a sag_reason")
+
+    def describe(self) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        return asdict(self)
 
 
 DEFAULT_CONFIG_DIR = "config/identification"
@@ -686,6 +889,63 @@ class DatasetConfig:
     metadata_columns: str = "inline"  # "inline" | "sidecar", see write_dataset
     visualize: bool = False
     realtime_scale: float = 1.0
+    # Round 6 (`R6_00`, schema_version 3).  ``None`` keeps rounds 4-5 exactly.
+    motor_friction: MotorFrictionPrior | None = None
+    noise: NoiseModel | None = None
+    # ``max_time_step: auto`` / ``rigid_time_step: auto`` (`R6_02` Sec 6): the
+    # step is derived at load from the Sec 3 bound table rather than hand-set.
+    auto_time_steps: tuple[str, ...] = ()
+    # ``excitation.probe_design`` (`R6_02` P2-1): the probe comb is derived at
+    # load from the link-side mode table instead of listed by hand.
+    probe_design: ProbeDesign | None = None
+    gates: GateSpec = field(default_factory=GateSpec)
+    #: Build only these tiers' bags while every draw (payloads, splits, seeds)
+    #: is still made over the whole tier list, so a bag here is the bag of the
+    #: full build.  The gain-shift file is the test robots this way (Sec 7).
+    only_tiers: tuple[str, ...] | None = None
+
+    @property
+    def is_round6(self) -> bool:
+        """``schema_version: 3``: the round-6 loop, plant and instruments."""
+        return int(self.schema_version) >= 3
+
+    @property
+    def loop_delay(self) -> int:
+        """Samples between a measurement and the command that uses it (Sec 2.1)."""
+        if self.noise is not None:
+            return int(self.noise.delay_samples)
+        return int(self.measurement.delay_samples)
+
+    @property
+    def control_period(self) -> float:
+        """The PD's period: the sample period on the bus, the drive's own inside a drive (`R6_02` Sec 7)."""
+        if self.controller.location == "drive":
+            return 1.0 / float(self.controller.drive_rate)
+        return float(self.sample_time_step)
+
+    @property
+    def control_delay(self) -> int:
+        """Periods between a reading and the command that uses it: the bus delay, or 0 inside a drive."""
+        return 0 if self.controller.location == "drive" else self.loop_delay
+
+    @property
+    def drive_ticks(self) -> int:
+        """Drive periods per sample period (1 on the bus)."""
+        return int(round(float(self.sample_time_step) / self.control_period))
+
+    def omega_max(self) -> float:
+        """``0.5 / (2 zeta_max T_c (1 + d))``, the Sec 2.2 limit, at the loop's own period and delay.
+
+        On a drive loop with ``drive.bound: rotor`` this is the reference each
+        axis's ``omega_max,j = omega_max J_j / (J_j + m_j)`` scales down from.
+        """
+        zeta_max = float(self.control_gains.damping_ratio[1])
+        return 0.5 / (2.0 * zeta_max * self.control_period * (1.0 + self.control_delay))
+
+    def nominal_rotor_inertia(self, n_dof: int) -> np.ndarray:
+        """The nominal reflected rotor inertia per joint: what the controller and the rigid tier use."""
+        values = self.transmission.rotor_inertia_nominal or self.transmission.rotor_inertia
+        return _per_joint(values, n_dof, "rotor_inertia_nominal")
 
 
 _TRANSMISSION_KEYS = {
@@ -698,6 +958,7 @@ _TRANSMISSION_KEYS = {
 _EXCITATION_KEYS = {
     "n_harmonics", "base_frequency", "n_periods", "limit_margin", "max_acceleration", "velocity_fraction",
     "centre_jitter", "probe_harmonics", "probe_acceleration_fraction", "candidates", "regime", "position_window",
+    "probe_design", "probe_budget",
 }
 
 
@@ -713,7 +974,7 @@ _DATASET_KEYS = {
 }
 
 
-_SIGNALS_KEYS = {"position_side", "target", "clean_columns"}
+_SIGNALS_KEYS = {"position_side", "target", "clean_columns", "target_source", "wrench_columns"}
 
 
 _SPLIT_KEYS = {"mode", "test_robots", "val_robots", "test_trajectories", "val_trajectories"}
@@ -722,11 +983,12 @@ _SPLIT_KEYS = {"mode", "test_robots", "val_robots", "test_trajectories", "val_tr
 _SIMULATION_KEYS = {
     "control_frequency", "control_damping_ratio", "control_gains", "control_decimation",
     "allow_control_decimation", "rigid_time_step", "max_time_step", "sample_time_step", "control_separation",
-    "controller", "measurement", "plant_extras",
+    "controller", "measurement", "plant_extras", "motor_friction", "noise",
 }
 
 
-_CONTROLLER_KEYS = {"mode", "randomize", "nominal", "velocity_loop"}
+_CONTROLLER_KEYS = {"mode", "randomize", "nominal", "velocity_loop", "gain_sizing", "loop", "integral",
+                    "location", "drive"}
 
 
 _NOMINAL_KEYS = {"knows_payload", "friction_scale", "rotor_inertia_scale", "inertia_scale"}
@@ -741,19 +1003,39 @@ _MEASUREMENT_KEYS = {
 }
 
 
-_PLANT_EXTRAS_KEYS = {"link_friction", "stiffness_nonlinearity", "torque_ripple"}
+_PLANT_EXTRAS_KEYS = {"link_friction", "stiffness_nonlinearity", "torque_ripple", "transmission_error"}
 
 
-_LINK_FRICTION_KEYS = {"tier", "viscous", "coulomb", "provenance"}
+_LINK_FRICTION_KEYS = {"tier", "viscous", "coulomb", "provenance", "integration"}
 
 
-_STIFFNESS_NONLINEARITY_KEYS = {"breakpoints", "factors"}
+_STIFFNESS_NONLINEARITY_KEYS = {
+    "breakpoints", "factors", "breakpoints_torque", "breakpoints_effort_fraction", "provenance",
+}
 
 
-_TORQUE_RIPPLE_KEYS = {"amplitude", "order", "random_phase"}
+_TORQUE_RIPPLE_KEYS = {"amplitude", "order", "random_phase", "provenance"}
 
 
-_CONTROL_GAINS_KEYS = {"enabled", "natural_frequency", "damping_ratio"}
+_TRANSMISSION_ERROR_KEYS = {"amplitude", "order", "random_phase", "provenance"}
+
+
+_MOTOR_FRICTION_KEYS = {"viscous_fraction", "coulomb_fraction", "epsilon", "per_robot", "provenance"}
+
+
+_NOISE_KEYS = {"enabled", "delay_samples", "q", "dq", "ft", "wrench", "tag", "provenance"}
+
+
+_NOISE_CHANNEL_KEYS = {"p", "sigma", "gain", "offset", "quantization", "sigma_quanta", "source"}
+
+
+_GATES_KEYS = {
+    "sag_max_fraction", "qc_v2_reference", "unstable_max_fraction", "gainshift_fraction", "gainshift_max_ratio",
+    "sag_mode", "sag_reason",
+}
+
+
+_CONTROL_GAINS_KEYS = {"enabled", "natural_frequency", "damping_ratio", "natural_frequency_fraction"}
 
 
 _CONTROL_SEPARATION_KEYS = {"min_ratio", "action"}
@@ -793,6 +1075,18 @@ def _controller_spec(controller_cfg: Mapping[str, Any]) -> ControllerSpec:
             integral_time=_pair(loop_cfg, "integral_time", (0.05, 0.05)),
         ),
         randomize=bool(controller_cfg.get("randomize", False)),
+        gain_sizing=str(controller_cfg.get("gain_sizing", "link_plus_rotor")),
+        loop=str(controller_cfg.get("loop", "physics_step")),
+        integral=IntegralSpec(
+            enabled=bool((controller_cfg.get("integral") or {}).get("enabled", False)),
+            time_factor=float((controller_cfg.get("integral") or {}).get("time_factor", 10.0)),
+            reason=str((controller_cfg.get("integral") or {}).get("reason", "")),
+        ),
+        location=str(controller_cfg.get("location", "bus")),
+        drive_rate=float((controller_cfg.get("drive") or {}).get("rate", 0.0)),
+        drive_bound=str((controller_cfg.get("drive") or {}).get("bound", "rotor")),
+        setpoint_delay=int((controller_cfg.get("drive") or {}).get("setpoint_delay", 1)),
+        velocity_cutoff_fraction=float((controller_cfg.get("drive") or {}).get("velocity_cutoff_fraction", 0.1)),
     )
 
 
@@ -813,12 +1107,22 @@ def _friction_prior(raw: Any) -> tuple[tuple[float, ...], tuple[float, float]]:
     return tuple(float(v) for v in np.atleast_1d(raw or [])), (1.0, 1.0)
 
 
-def _plant_extras_sampling(extras_cfg: Mapping[str, Any]) -> PlantExtrasSampling:
+def _float_rows(raw: Any) -> tuple:
+    """A flat float tuple, or a tuple of float tuples for a per-joint table."""
+    values = list(raw or [])
+    if values and isinstance(values[0], (list, tuple)):
+        return tuple(tuple(float(v) for v in row) for row in values)
+    return tuple(float(v) for v in values)
+
+
+def _plant_extras_sampling(extras_cfg: Mapping[str, Any], *, round6: bool = False) -> PlantExtrasSampling:
     friction_cfg = extras_cfg.get("link_friction", {}) or {}
     spring_cfg = extras_cfg.get("stiffness_nonlinearity", {}) or {}
     ripple_cfg = extras_cfg.get("torque_ripple", {}) or {}
+    error_cfg = extras_cfg.get("transmission_error", {}) or {}
     viscous_nominal, viscous_factor = _friction_prior(friction_cfg.get("viscous"))
     coulomb_nominal, coulomb_factor = _friction_prior(friction_cfg.get("coulomb"))
+    order = ripple_cfg.get("order", 24.0)
     return PlantExtrasSampling(
         link_friction_tier=str(friction_cfg.get("tier", "fixed")),
         link_friction_viscous=viscous_nominal,
@@ -826,15 +1130,80 @@ def _plant_extras_sampling(extras_cfg: Mapping[str, Any]) -> PlantExtrasSampling
         link_friction_viscous_factor=viscous_factor,
         link_friction_coulomb_factor=coulomb_factor,
         stiffness_breakpoints=tuple(float(v) for v in spring_cfg.get("breakpoints", []) or []),
-        stiffness_factors=tuple(float(v) for v in spring_cfg.get("factors", []) or []),
+        stiffness_factors=_float_rows(spring_cfg.get("factors")),
+        stiffness_breakpoints_torque=_float_rows(spring_cfg.get("breakpoints_torque")),
+        stiffness_breakpoints_effort_fraction=tuple(
+            float(v) for v in spring_cfg.get("breakpoints_effort_fraction", []) or []
+        ),
         ripple_amplitude=float(ripple_cfg.get("amplitude", 0.0)),
-        ripple_order=float(ripple_cfg.get("order", 24.0)),
+        ripple_order=tuple(float(v) for v in order) if isinstance(order, (list, tuple)) else float(order),
         ripple_random_phase=bool(ripple_cfg.get("random_phase", True)),
+        transmission_error_amplitude=tuple(float(v) for v in np.atleast_1d(error_cfg.get("amplitude", []) or [])),
+        transmission_error_order=tuple(float(v) for v in np.atleast_1d(error_cfg.get("order", 1.0))),
+        transmission_error_random_phase=bool(error_cfg.get("random_phase", True)),
+        link_friction_integration=str(friction_cfg.get("integration", "implicit" if round6 else "explicit")),
     )
 
 
-def load_config(path: str | Path) -> DatasetConfig:
-    """Read a YAML identification config into a :class:`DatasetConfig`."""
+def _noise_channel(raw: Any, name: str, source: Path) -> ChannelNoise:
+    raw = raw or {}
+    _check_keys(raw, _NOISE_CHANNEL_KEYS, f"simulation.noise.{name}", source)
+    return ChannelNoise(
+        p=float(raw.get("p", 0.0)), sigma=float(raw.get("sigma", 0.0)), gain=float(raw.get("gain", 0.0)),
+        offset=float(raw.get("offset", 0.0)),
+        quantization=tuple(float(v) for v in np.atleast_1d(raw.get("quantization", 0.0))),
+        sigma_quanta=float(raw.get("sigma_quanta", 0.0)),
+    )
+
+
+def _noise_model(noise_cfg: Mapping[str, Any] | None, source: Path) -> NoiseModel | None:
+    if noise_cfg is None:
+        return None
+    _check_keys(noise_cfg, _NOISE_KEYS, "simulation.noise", source)
+    dq_cfg = dict(noise_cfg.get("dq", {}) or {})
+    dq_source = str(dq_cfg.pop("source", "sensor"))
+    if dq_source not in DQ_SOURCES:
+        raise ValueError(f"{source}: simulation.noise.dq.source must be one of {DQ_SOURCES}")
+    return NoiseModel(
+        enabled=bool(noise_cfg.get("enabled", True)),
+        q=_noise_channel(noise_cfg.get("q"), "q", source),
+        dq=_noise_channel(dq_cfg, "dq", source),
+        ft=_noise_channel(noise_cfg.get("ft"), "ft", source),
+        wrench=_noise_channel(noise_cfg.get("wrench"), "wrench", source),
+        dq_source=dq_source,
+        delay_samples=int(noise_cfg.get("delay_samples", 1)),
+        tag=str(noise_cfg.get("tag", "modelling_error")),
+        provenance=str(noise_cfg.get("provenance", "E")),
+    )
+
+
+def _gate_spec(raw: Mapping[str, Any] | None, source: Path) -> GateSpec:
+    raw = raw or {}
+    _check_keys(raw, _GATES_KEYS, "gates", source)
+    reference = raw.get("qc_v2_reference") or {}
+    _check_keys(reference, {"elastic", "rigid", "source"}, "gates.qc_v2_reference", source)
+    shift = raw.get("gainshift_fraction", [[0.3, 0.5], [0.9, 1.0]])
+    return GateSpec(
+        sag_max_fraction=float(raw.get("sag_max_fraction", 0.05)),
+        sag_mode=str(raw.get("sag_mode", "gate")),
+        sag_reason=str(raw.get("sag_reason", "")),
+        qc_v2_reference_elastic=None if reference.get("elastic") is None else float(reference["elastic"]),
+        qc_v2_reference_rigid=None if reference.get("rigid") is None else float(reference["rigid"]),
+        qc_v2_reference_source=str(reference.get("source", "")),
+        unstable_max_fraction=float(raw.get("unstable_max_fraction", 0.02)),
+        gainshift_fraction=tuple((float(lo), float(hi)) for lo, hi in shift),
+        gainshift_max_ratio=float(raw.get("gainshift_max_ratio", 1.3)),
+    )
+
+
+def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig:
+    """Read a YAML identification config into a :class:`DatasetConfig`.
+
+    A ``schema_version: 3`` config is also held to round 6's load-time
+    requirements (:func:`require_round6`); ``check_bounds`` includes the
+    asset-dependent explicit-term bound, which needs the asset's inertia
+    envelope and costs about a second.
+    """
     import yaml
 
     source = Path(path).expanduser()
@@ -847,7 +1216,7 @@ def load_config(path: str | Path) -> DatasetConfig:
             "`transmission` block (see config/identification/kuka_lbr_iiwa_14_r820_table.yaml)"
         )
     known = {"schema_version", "asset", "backends", "rigid_reference", "transmission", "comparison",
-             "excitation", "dataset", "simulation", "visualization", "payload"}
+             "excitation", "dataset", "simulation", "visualization", "payload", "gates"}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown keys in {source}: {', '.join(unknown)}")
@@ -892,6 +1261,8 @@ def load_config(path: str | Path) -> DatasetConfig:
                 "simulation.control_separation", source)
     controller_cfg = sim_cfg.get("controller", {}) or {}
     _check_keys(controller_cfg, _CONTROLLER_KEYS, "simulation.controller", source)
+    _check_keys(controller_cfg.get("drive", {}) or {}, {"rate", "bound", "setpoint_delay", "velocity_cutoff_fraction"},
+                "simulation.controller.drive", source)
     _check_keys(controller_cfg.get("nominal", {}) or {}, _NOMINAL_KEYS, "simulation.controller.nominal", source)
     _check_keys(controller_cfg.get("velocity_loop", {}) or {}, _VELOCITY_LOOP_KEYS,
                 "simulation.controller.velocity_loop", source)
@@ -905,6 +1276,12 @@ def load_config(path: str | Path) -> DatasetConfig:
                 "simulation.plant_extras.stiffness_nonlinearity", source)
     _check_keys(extras_cfg.get("torque_ripple", {}) or {}, _TORQUE_RIPPLE_KEYS,
                 "simulation.plant_extras.torque_ripple", source)
+    _check_keys(extras_cfg.get("transmission_error", {}) or {}, _TRANSMISSION_ERROR_KEYS,
+                "simulation.plant_extras.transmission_error", source)
+    motor_friction_cfg = sim_cfg.get("motor_friction")
+    if motor_friction_cfg is not None:
+        _check_keys(motor_friction_cfg, _MOTOR_FRICTION_KEYS, "simulation.motor_friction", source)
+    round6 = int(raw.get("schema_version", 1)) >= 3
     signals_cfg = data_cfg.get("signals", {}) or {}
     _check_keys(signals_cfg, _SIGNALS_KEYS, "dataset.signals", source)
     _check_keys(view_cfg, _VISUALIZATION_KEYS, "visualization", source)
@@ -947,6 +1324,11 @@ def load_config(path: str | Path) -> DatasetConfig:
     except ValueError as exc:
         raise ValueError(f"{source}: {exc}") from exc
     control_decimation = int(sim_cfg.get("control_decimation", 1))
+    if round6 and "control_decimation" in sim_cfg:
+        raise ValueError(
+            f"{source}: schema_version 3 derives the control decimation from sample_time_step "
+            "(one command per sample period, R6_00 Sec 2.1); remove simulation.control_decimation"
+        )
     if control_decimation > 1 and not bool(sim_cfg.get("allow_control_decimation", False)):
         # A decimated command still cancels friction exactly (the applied
         # torque is held whole, subtraction included, for the window -- see
@@ -986,6 +1368,7 @@ def load_config(path: str | Path) -> DatasetConfig:
             centre_jitter=float(exc_cfg.get("centre_jitter", 0.0)),
             probe_harmonics=tuple(int(v) for v in exc_cfg.get("probe_harmonics", []) or []),
             probe_acceleration_fraction=float(exc_cfg.get("probe_acceleration_fraction", 0.2)),
+            probe_budget=str(exc_cfg.get("probe_budget", "split")),
             position_window=position_window,
         ),
         regime=RegimeSampling(
@@ -1009,6 +1392,9 @@ def load_config(path: str | Path) -> DatasetConfig:
                     "damping_ratio", [sim_cfg.get("control_damping_ratio", 1.0)] * 2
                 )
             ),
+            natural_frequency_fraction=_fraction_bands(
+                (sim_cfg.get("control_gains", {}) or {}).get("natural_frequency_fraction")
+            ),
         ),
         control_separation=ControlSeparationCheck(
             min_ratio=float((sim_cfg.get("control_separation", {}) or {}).get("min_ratio", 5.0)),
@@ -1028,26 +1414,175 @@ def load_config(path: str | Path) -> DatasetConfig:
             ft_noise_abs=(None if measurement_cfg.get("ft_noise_abs") is None
                           else float(measurement_cfg["ft_noise_abs"])),
         ),
-        plant_extras=_plant_extras_sampling(extras_cfg),
+        plant_extras=_plant_extras_sampling(extras_cfg, round6=round6),
         signals=SignalPolicy(
             position_side=str(signals_cfg.get("position_side", "link")),
             target=str(signals_cfg.get("target", "link_torque")),
             clean_columns=bool(signals_cfg.get("clean_columns", False)),
+            target_source=str(signals_cfg.get("target_source", "measured")),
+            wrench_columns=bool(signals_cfg.get("wrench_columns", False)),
         ),
         candidates=int(exc_cfg.get("candidates", 48)),
         control_frequency=float(sim_cfg.get("control_frequency", 25.0)),
         control_damping_ratio=float(sim_cfg.get("control_damping_ratio", 1.0)),
-        rigid_time_step=float(sim_cfg.get("rigid_time_step", 5.0e-4)),
+        rigid_time_step=_time_step(sim_cfg.get("rigid_time_step"), "rigid_time_step", source),
         sample_time_step=float(sim_cfg.get("sample_time_step", 0.002)),
-        max_time_step=float(sim_cfg.get("max_time_step", 5.0e-4)),
+        max_time_step=_time_step(sim_cfg.get("max_time_step"), "max_time_step", source),
         control_decimation=int(sim_cfg.get("control_decimation", 1)),
         output=str(data_cfg.get("output", "data/identification/dataset.csv")),
         metadata_columns=str(data_cfg.get("metadata_columns", "inline")),
         visualize=bool(view_cfg.get("enabled", False)),
         realtime_scale=float(view_cfg.get("realtime_scale", 1.0)),
+        motor_friction=None if motor_friction_cfg is None else MotorFrictionPrior(
+            viscous_fraction=float(motor_friction_cfg.get("viscous_fraction", 0.05)),
+            coulomb_fraction=float(motor_friction_cfg.get("coulomb_fraction", 0.02)),
+            epsilon=float(motor_friction_cfg.get("epsilon", 1.0e-2)),
+            per_robot=bool(motor_friction_cfg.get("per_robot", True)),
+            provenance=str(motor_friction_cfg.get("provenance", "E")),
+        ),
+        noise=_noise_model(sim_cfg.get("noise"), source),
+        gates=_gate_spec(raw.get("gates"), source),
+        probe_design=_probe_design(exc_cfg.get("probe_design"), exc_cfg, source),
+        auto_time_steps=tuple(key for key in ("max_time_step", "rigid_time_step")
+                              if str(sim_cfg.get(key, "")).strip().lower() == "auto"),
     )
+    if config.control_gains.natural_frequency_fraction:
+        from dataclasses import replace
+
+        config = replace(config, control_gains=config.control_gains.resolved(config.omega_max()))
+    if config.probe_design is not None:
+        from .link_modes import resolve_probe_design
+
+        config = resolve_probe_design(config)
     require_probe_within_sampling_bound(config, source=source)
+    require_round6(config, source=source)
+    if config.auto_time_steps:
+        from .dataset_bounds import resolve_auto_time_steps
+
+        config = resolve_auto_time_steps(config, source=source)
+    if check_bounds and config.is_round6:
+        from .dataset_bounds import require_explicit_term_bound
+
+        require_explicit_term_bound(config, source=source)
     return config
+
+
+#: Ceiling for a step derived from the bound (``auto``): the schema default,
+#: so a bound that allows more still steps no coarser than rounds 4-5 did.
+AUTO_TIME_STEP_CEILING = 5.0e-4
+
+
+def _probe_design(raw: Any, exc_cfg: Mapping[str, Any], source: Any) -> ProbeDesign | None:
+    if raw is None:
+        return None
+    _check_keys(raw, {"source", "lowest_hz", "lines", "span"}, "excitation.probe_design", source)
+    if exc_cfg.get("probe_harmonics"):
+        raise ValueError(f"{source}: excitation.probe_harmonics and probe_design are exclusive")
+    span = raw.get("span", [0.5, 1.5])
+    return ProbeDesign(source=str(raw.get("source", "link_modes")), lowest_hz=float(raw.get("lowest_hz", 2.0)),
+                       lines=int(raw.get("lines", 30)), span=(float(span[0]), float(span[1])))
+
+
+def _time_step(raw: Any, key: str, source: Any) -> float:
+    """A physics-step entry: a number, or ``auto`` (placeholder, resolved from the bound after load)."""
+    if raw is None:
+        return 5.0e-4
+    if isinstance(raw, str):
+        if raw.strip().lower() != "auto":
+            raise ValueError(f"{source}: simulation.{key} must be a number or 'auto', got {raw!r}")
+        return AUTO_TIME_STEP_CEILING
+    return float(raw)
+
+
+def _fraction_bands(raw: Any) -> tuple[tuple[float, float], ...]:
+    """``[lo, hi]`` or ``[[lo, hi], ...]`` fractions of omega_max."""
+    if not raw:
+        return ()
+    if isinstance(raw[0], (list, tuple)):
+        return tuple((float(lo), float(hi)) for lo, hi in raw)
+    return ((float(raw[0]), float(raw[1])),)
+
+
+def physics_step(required: float, period: float) -> float:
+    """The largest step no coarser than ``required`` that divides ``period`` exactly.
+
+    Round 6 holds the command for one sample period (`R6_00` Sec 2.1), so a
+    control instant has to land on a physics step: ``period / N`` with the
+    smallest integer ``N`` that is fine enough.
+    """
+    if required <= 0.0 or period <= 0.0:
+        raise ValueError("physics_step needs positive steps")
+    count = int(np.ceil(period / required - 1e-9))
+    return float(period) / max(count, 1)
+
+
+def gain_bound(config: DatasetConfig) -> dict[str, Any]:
+    """The Sec 2.2 discrete-time bound ``2 zeta omega T_c (1 + d) <= 0.5`` at the declared corner."""
+    zeta = float(config.control_gains.damping_ratio[1])
+    omega = float(config.control_gains.natural_frequency[1])
+    period = config.control_period
+    delay = config.control_delay
+    value = 2.0 * zeta * omega * period * (1.0 + delay)
+    return {"zeta_max": zeta, "omega_max_drawn": omega, "omega_max": config.omega_max(),
+            "control_period": period, "delay_samples": delay, "value": value, "limit": 0.5,
+            "ok": bool(value <= 0.5 * (1.0 + 1e-9))}
+
+
+def require_round6(config: DatasetConfig, *, source: Any = "config") -> None:
+    """Refuse a ``schema_version: 3`` config that breaks a round-6 rule (`R6_00` Sec 4).
+
+    Every item of the list is an error, reported together: an unresolvable
+    probe, a controller other than the model-free PD on the sampled loop and
+    motor-inertia gains, no ``simulation.noise`` block (or a round-5
+    ``measurement`` one), and a violated Sec 2.2 gain bound.  The Sec 3
+    explicit-term bound needs the asset and is checked by
+    :func:`elastic_sim.dataset_bounds.require_explicit_term_bound`.
+    """
+    if not config.is_round6:
+        return
+    errors: list[str] = []
+    policy = differentiation_policy(config)
+    if not policy["probe_resolvable"]:
+        errors.append(
+            f"probe top {policy['probe_top_hz']:g} Hz is above the {policy['sg_cutoff_hz']:.1f} Hz passband of "
+            f"the consumer's Savitzky-Golay derivative at {policy['sample_rate_hz']:g} Hz "
+            "(probe_resolvable: false)"
+        )
+    if config.controller.mode != "pd":
+        errors.append(f"simulation.controller.mode is {config.controller.mode!r}; round 6 production is 'pd'")
+    if config.controller.location == "bus" and config.controller.gain_sizing != "motor_inertia":
+        errors.append("simulation.controller.gain_sizing must be 'motor_inertia' on the bus (Sec 2.2)")
+    if config.controller.location == "drive":
+        if config.controller.gain_sizing != "motor_plus_load":
+            errors.append("simulation.controller.gain_sizing must be 'motor_plus_load' in a drive (R6_02 Sec 7)")
+        ticks = float(config.sample_time_step) * float(config.controller.drive_rate)
+        if abs(ticks - round(ticks)) > 1e-9 or round(ticks) < 1:
+            errors.append(f"simulation.controller.drive.rate {config.controller.drive_rate:g} Hz is not an integer "
+                          f"multiple of the {1.0 / config.sample_time_step:g} Hz sample rate")
+
+    if config.controller.loop != "sample_rate":
+        errors.append("simulation.controller.loop must be 'sample_rate' (Sec 2.1)")
+    if config.noise is None:
+        errors.append("simulation.noise is required (Sec 6)")
+    elif config.noise.q.p > 0.0 or not any(v > 0.0 for v in config.noise.q.quantization):
+        errors.append("simulation.noise.q must be quantization plus sigma_quanta steps, no percentage "
+                      "of RMS (R6_02 Sec 3)")
+    if not config.measurement.is_ideal:
+        errors.append("simulation.measurement is the round-5 instrument; use simulation.noise")
+    if config.motor_friction is None:
+        errors.append("simulation.motor_friction is required (Sec 5.4)")
+    if not config.control_gains.enabled or not config.control_gains.natural_frequency_fraction:
+        errors.append("simulation.control_gains needs enabled: true and natural_frequency_fraction (Sec 2.2)")
+    else:
+        bound = gain_bound(config)
+        if not bound["ok"]:
+            errors.append(
+                f"2 zeta omega T_c (1 + d) = {bound['value']:.3f} > 0.5 at zeta={bound['zeta_max']:g}, "
+                f"omega={bound['omega_max_drawn']:.2f} rad/s, T_c={bound['control_period']:g} s, "
+                f"d={bound['delay_samples']} (Sec 2.2; omega_max = {bound['omega_max']:.2f} rad/s)"
+            )
+    if errors:
+        raise ValueError(f"{source}: schema_version 3 config refused:\n  - " + "\n  - ".join(errors))
 
 
 #: Physical meaning of each ``dataset.signals.target`` choice, for the

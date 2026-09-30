@@ -6,6 +6,9 @@
     launch_helpers.py bags DIR                     # bags a data stage built (manifests)
     launch_helpers.py rows DATASET [SPLIT]         # rows of one split of a written dataset
     launch_helpers.py timeouts PREFLIGHT_RUN PLAN_JSON > timeouts.tsv
+    launch_helpers.py fullbags CONFIG [ABLATIONS]   # round 6: bags a full build of CONFIG makes
+    launch_helpers.py bounds CONFIG TAG             # round 6: Sec 2.2 / Sec 3 bounds, PASS/FAIL
+    launch_helpers.py timeouts6 PREFLIGHT_RUN PLAN_JSON > timeouts.tsv   # round 6 (scripts/round6_run.sh)
 
 Timeouts come from the preflight's measured rates, times three (never a flat
 18 h, `R5_09` F-1): a data stage is budgeted per bag, an NN stage per
@@ -141,6 +144,116 @@ def timeouts(preflight_run: str, plan_path: str) -> int:
     return 0
 
 
+def fullbags(config_path: str, ablations: str = "0") -> int:
+    """Production + gain-shift (+ both ablations) bags of a full round-6 build."""
+    import warnings
+
+    from elastic_sim.dataset import load_config
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        config = load_config(config_path, check_bounds=False)
+    trajectories = int(config.n_trajectories)
+    production = (int(config.transmission.robots) + (1 if config.rigid_reference else 0)) * trajectories
+    gainshift = int(config.split.test_robots) * trajectories
+    return production + gainshift + (2 * production if ablations not in ("", "0", "false") else 0)
+
+
+def bounds(config_path: str, tag: str) -> int:
+    """Round 6's doctor line: the config loads (which enforces both bounds) and their values.
+
+    ``load_config`` refuses a schema-3 config whose Sec 2.2 gain bound or Sec 3
+    explicit-term bound is violated; this prints what they are, so the doctor
+    shows the margin and not only the verdict.
+    """
+    import warnings
+
+    from elastic_sim.assets import AssetRegistry
+    from elastic_sim.dataset import load_config
+    from elastic_sim.dataset_bounds import dof_totals, explicit_term_table
+    from elastic_sim.dataset_config import differentiation_policy, gain_bound
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            config = load_config(config_path)
+    except ValueError as error:
+        print(f"FAIL {tag}: {str(error).splitlines()[0]} ...")
+        return 1
+    asset = AssetRegistry.for_repository(_REPO).load(config.asset)
+    worst = max(dof_totals(explicit_term_table(config, asset)).values())
+    gain = gain_bound(config)
+    policy = differentiation_policy(config)
+    ok = gain["ok"] and worst <= 1.0 and policy["probe_resolvable"]
+    print(f"{'PASS' if ok else 'FAIL'} {tag}: {config.controller.location} loop, gain bound {gain['value']:.3f} <= 0.5, "
+          f"explicit terms max {worst:.2f} <= 1 (h = {config.max_time_step:.3g} / {config.rigid_time_step:.3g} s), "
+          f"probe top {policy['probe_top_hz']:g} Hz resolvable {policy['probe_resolvable']}")
+    return 0 if ok else 1
+
+
+def timeouts6(preflight_run: str, plan_path: str) -> int:
+    """Round 6's stage timeouts from a preflight that ran the NN stages at two epoch counts.
+
+    ``plan`` (JSON)::
+
+        {"preflight": {"robots", "traj", "trials", "screen", "top", "refine", "models"},
+         "epochs": [e_low, e_high], "full": {..., "epochs"}, "screen_rows", "cap_s",
+         "variants": {tag: {"data_dir", "full_bags", "dataset"}}}
+
+    A data stage is budgeted per bag (``full_bags`` from the full config).  An
+    NN stage ran twice in the preflight, at ``e_low`` and ``e_high`` epochs;
+    the difference is the per-epoch-row rate without the fixed start-up cost
+    (interpreter, CUDA, dataset load), and the low run's time minus its epochs
+    is that fixed cost.  Full = SAFETY x (fixed + rate x full epoch-rows).
+    """
+    run = Path(preflight_run)
+    plan = json.loads(Path(plan_path).read_text())
+    measured = _stage_seconds(run)
+    pre, full = plan["preflight"], plan["full"]
+    low, high = plan["epochs"]
+    screen_rows = int(plan.get("screen_rows", 100_000))
+    cap = int(plan.get("cap_s", 10**9))
+    out = []
+
+    def clamp(seconds: float) -> int:
+        return min(cap, max(FLOOR_S, int(math.ceil(SAFETY * seconds))))
+
+    for tag, variant in plan["variants"].items():
+        name = f"10-data-{tag}"
+        pre_bags = bags(variant["data_dir"])
+        if name in measured and pre_bags:
+            out.append((name, clamp(measured[name] / pre_bags * float(variant["full_bags"]))))
+        scale = float(variant["full_bags"]) / max(pre_bags, 1)
+        train = rows(variant["dataset"], "train") if Path(variant["dataset"]).is_file() else 0
+        full_train = train * scale
+
+        def optuna_units(size: dict, screen: float, refine: float, n: float) -> float:
+            return size["models"] * (size["trials"] * screen * min(n, screen_rows) + size["top"] * refine * n)
+
+        # Epoch-rows of each NN stage: the preflight at e epochs (screen = refine = e), and the full run.
+        stages = {
+            "20-optuna": (lambda e: optuna_units(pre, e, e, train),
+                          optuna_units(full, full["screen"], full["refine"], full_train)),
+            "40-train": (lambda e: pre["models"] * e * train, full["models"] * full["epochs"] * full_train),
+        }
+        for stage, (pre_units, full_units) in stages.items():
+            a, b = measured.get(f"{stage}-{tag}-e{low}"), measured.get(f"{stage}-{tag}-e{high}")
+            if a is None or b is None or not train:
+                continue
+            ua, ub = pre_units(low), pre_units(high)
+            rate = max((b - a) / max(ub - ua, 1e-9), 0.0)
+            fixed = max(a - rate * ua, 0.0)
+            out.append((f"{stage}-{tag}", clamp(fixed + rate * full_units)))
+        # Export and evaluation: the high-epoch preflight time of each stage, scaled by the data.
+        suffix = f"-e{high}"
+        for key, seconds in measured.items():
+            if (key.startswith(f"30-export-{tag}-") or key.startswith(f"50-eval-{tag}-")) and key.endswith(suffix):
+                out.append((key[: -len(suffix)], clamp(seconds * max(scale, 1.0))))
+    for stage, seconds in out:
+        print(f"{stage}\t{seconds}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     command, *args = argv
     if command == "stem":
@@ -156,6 +269,13 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "timeouts":
         return timeouts(*args)
+    if command == "bounds":
+        return bounds(*args)
+    if command == "fullbags":
+        print(fullbags(*args))
+        return 0
+    if command == "timeouts6":
+        return timeouts6(*args)
     raise SystemExit(f"unknown command {command!r}")
 
 

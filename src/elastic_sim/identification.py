@@ -34,10 +34,18 @@ COULOMB_EPSILON = 1.0e-3
 
 @dataclass(frozen=True)
 class FrictionModel:
-    """Per-joint viscous and Coulomb friction coefficients."""
+    """Per-joint viscous and Coulomb friction coefficients.
+
+    ``epsilon`` is the Coulomb smoothing velocity this law is evaluated with
+    when a caller does not pass one.  It defaults to :data:`COULOMB_EPSILON`,
+    so every model built before round 6 behaves exactly as it did; the
+    round-6 motor-friction prior carries its own ``1e-2`` (`R6_00` Sec 5.4),
+    which keeps ``c / epsilon`` bounded for the explicit-term check (Sec 3).
+    """
 
     viscous: np.ndarray
     coulomb: np.ndarray
+    epsilon: float = COULOMB_EPSILON
 
     def __post_init__(self) -> None:
         viscous = np.asarray(self.viscous, dtype=float).reshape(-1)
@@ -46,16 +54,35 @@ class FrictionModel:
             raise ValueError("viscous and coulomb must have the same length")
         if np.any(viscous < 0.0) or np.any(coulomb < 0.0):
             raise ValueError("friction coefficients must be non-negative")
+        if float(self.epsilon) <= 0.0:
+            raise ValueError("friction epsilon must be positive")
         object.__setattr__(self, "viscous", viscous)
         object.__setattr__(self, "coulomb", coulomb)
+        object.__setattr__(self, "epsilon", float(self.epsilon))
 
     @property
     def n_dof(self) -> int:
         return int(self.viscous.size)
 
-    def torque(self, dq: np.ndarray, *, epsilon: float = COULOMB_EPSILON) -> np.ndarray:
+    def torque(self, dq: np.ndarray, *, epsilon: float | None = None) -> np.ndarray:
         dq = np.asarray(dq, dtype=float)
+        epsilon = self.epsilon if epsilon is None else float(epsilon)
         return self.viscous * dq + self.coulomb * np.tanh(dq / epsilon)
+
+    def slope(self, dq: np.ndarray, *, epsilon: float | None = None) -> np.ndarray:
+        """``d torque / d dq`` per joint, the linearization an implicit step uses."""
+        dq = np.asarray(dq, dtype=float)
+        epsilon = self.epsilon if epsilon is None else float(epsilon)
+        # sech^2 written as 1 - tanh^2: cosh overflows far from zero velocity.
+        return self.viscous + self.coulomb / epsilon * (1.0 - np.tanh(dq / epsilon) ** 2)
+
+    def max_slope(self, *, epsilon: float | None = None) -> np.ndarray:
+        """``b + c / epsilon``: the steepest the law gets, at zero velocity."""
+        epsilon = self.epsilon if epsilon is None else float(epsilon)
+        return self.viscous + self.coulomb / epsilon
+
+    def scaled(self, viscous_scale: np.ndarray | float, coulomb_scale: np.ndarray | float) -> "FrictionModel":
+        return FrictionModel(self.viscous * viscous_scale, self.coulomb * coulomb_scale, self.epsilon)
 
     @classmethod
     def from_asset(cls, asset: AssetSpec) -> "FrictionModel":
@@ -155,9 +182,12 @@ def inverse_dynamics(
     ddq: np.ndarray,
     *,
     friction: FrictionModel | None = None,
-    epsilon: float = COULOMB_EPSILON,
+    epsilon: float | None = None,
 ) -> np.ndarray:
-    """Return the joint torque implied by the rigid-body model plus friction."""
+    """Return the joint torque implied by the rigid-body model plus friction.
+
+    ``epsilon`` defaults to the friction model's own smoothing velocity.
+    """
     tau = np.asarray(pin.rnea(model, data, np.asarray(q, dtype=float),
                               np.asarray(dq, dtype=float), np.asarray(ddq, dtype=float)), dtype=float)
     if friction is not None:

@@ -645,6 +645,68 @@ Plant extras are rejected on the **rigid reference tier**: that tier's torque
 has to keep satisfying `rnea(achieved state)` for the Pinocchio cross-check and
 the MuJoCo/Newton-Featherstone comparison to mean anything.
 
+### Round 6: one model-free PD, ground-truth `tau_s`, three platforms
+
+`schema_version: 3` configs (`*_round6.yaml`, one per platform) share one
+design:
+
+| | What it is |
+|---|---|
+| target `ft0..` | the torque the transmission applies to the link, `tau_s = K_nl(theta + e(theta) - q) + D(...)`, through the platform's torque-measurement model; `ft_clean0..` is the simulator's own, bit-identical to `tau_link_clean0..` |
+| inputs | motor-side `q`, `dq` as the interface reports them (the iiwa's `dq` is the contract's Savitzky-Golay derivative of the recorded `q`: FRI gives no velocity); `tau` = the commanded torque, noise-free |
+| controller | `pd`, model-free, at one of two locations (`controller.location`, R6_02 §7 amended, R6_04 A-1). **`drive`** (UR10 and FMRR production; iiwa variant `_drive`): the PD runs inside the drive at `drive.rate` (UR10 2 kHz, FMRR and iiwa 4 kHz), `d = 0`, zero-order hold at the drive rate, on the drive's own encoder (quantization + 1 count) and its own velocity (encoder difference, first-order low-pass at `drive_rate / 10`, R6_04 A-4); setpoints come from the bus at the sample rate, held, one sample late. `gain_sizing: motor_plus_load` sizes on `J_nom + m_nom`, `m_nom` the nominal `M_jj` averaged along the reference; each axis gets `omega_j = omega J / (J + m)`, so the rotor's own loop `2 zeta omega_j T (1 + d) (J + m) / J <= 0.5` (R6_04 A-2). The bus records every N-th drive reading with its delay; the §6 `dq` percentage goes on that recorded copy only; `tau` is the drive's torque demand at the sample instant. **`bus`** (iiwa variant `_bus`; a smoke-tested code path on UR10/FMRR): `gain_sizing: motor_inertia` (`kp = J_nom omega^2`, `kd = 2 zeta J_nom omega`), `loop: sample_rate`: one command per sample period, held, computed from the *recorded* (quantized, noisy, `delay_samples`-old) motor channels; the iiwa `_bus` variant carries the slow integral `T_i = 30/omega` for its quasi-static gravity sag (R6_04 A-5). `omega` is drawn per bag from `natural_frequency_fraction` of `omega_max = 0.5 / (2 zeta_max T (1 + d))` at the loop's own period and delay |
+| rigid tier | the stiff limit of the same robot: nominal rotor inertia as armature, motor friction on the same DOF, link friction and motor ripple; target `rnea_link(q, dq, ddq) + f_link`, so `tau_s = tau_applied - J ddq - f_motor` holds to solver tolerance |
+| plant | `simulation.motor_friction` (a per-joint rule from the URDF limits, drawn per robot), link friction, a nonlinear spring with torque knees, the harmonic drive's transmission error inside the spring (arms) or motor torque ripple (FMRR). **Link friction is integrated velocity-implicitly: `plant_extras.link_friction.integration: implicit` is the schema-3 default** (same law and magnitudes; explicitly it chattered on 21-49 % of physics steps, R6_01 §3). Round-4/5 files integrated it explicitly and are superseded for training (R6_02 §4) |
+| instrument | `simulation.noise`: per bag, `sigma = p * RMS(signal)` for velocities and torques, gain, offset, exact quantization where the interface's is known, one sample of delay. **Positions are quantization plus `sigma_quanta` (= 1) counts of white noise, never a percentage of RMS** (R6_02 §3; schema 3 refuses `q.p`) |
+| probe | `excitation.probe_design` (R6_02 P2-1): log-spaced lines from `min(lowest_hz, 0.5 f_link,low)` to `min(1.5 f_link,high, 0.09 x rate)`, aimed at the link-side modes `f_link = sqrt(K / M_link) / 2 pi` (`elastic_sim.link_modes`); the table, the observable joints and the resolved lines are in the manifest's `link_modes` / `probe_design`. `probe_budget: additive` (R6_04 D-1): the main trajectory keeps its full acceleration budget and the probe gets `probe_acceleration_fraction` of it on top, sized by `scripts/round6_probe_fraction.py` |
+
+A schema-3 config is refused at load time for an unresolvable probe, any
+controller but this PD, a violated gain bound `2 zeta omega T_c (1 + d) <= 0.5`,
+or a violated explicit-integration bound `(b + c / eps + d) h / M_eff <= 1` on
+any DOF (`elastic_sim.dataset_bounds`; the table prints with
+`explicit_term_table`).  The physics step is rounded to divide the control
+period, so the command hold is exact.  `max_time_step: auto` /
+`rigid_time_step: auto` derive the step from that table at load
+(`bound_limited_steps`: the largest step, at most 5e-4 s, dividing the
+period, that keeps every DOF `<= 1`) instead of setting it by hand.
+
+```bash
+# one bag, printed, nothing written: gains, sag, the rigid-tier identity
+uv run python scripts/run_identification_simulation.py \
+    --config config/identification/ur10_table_round6.yaml --tier e00
+
+# the probe acceleration fraction: raised from 0.2 until peak |tau|/effort reaches 0.8, cap 0.7
+uv run python scripts/round6_probe_fraction.py --config config/identification/ur10_table_round6.yaml
+
+# the contribution budget (R6_02 P2-2): 2 robots, every effect toggled once,
+# gated on the elastically observable joints
+uv run python scripts/round6_budget.py --config config/identification/ur10_table_round6.yaml
+
+# production + gain-shift (+ the iiwa ablations), gated; --no-save to only check
+uv run python scripts/build_round6.py --config config/identification/kuka_lbr_iiwa_14_r820_table_round6_drive.yaml \
+    --ablations --robots 2 --trajectories 1 --no-save
+```
+
+`build_round6.py` holds every file to the hard checks (one backend, unstable
+bags <= 2 %, `ft_clean == tau_link_clean`, noise statistics within sampling
+error) and the production file to the controller-influence gates (no
+feedforward, sag <= 5 % of each joint's excitation span, Q-C v2 at or above
+round 5's `pd` level); a failing file is written as `*.refused.parquet`.
+Q-C v2 is `1 - R^2` of **`tau_cmd`** on the reference regressor, as round 5
+measured it (R6_02 §5); a `drive` dataset compares with round 5's
+`velocity_pi` row.  The Q-C gate is a verdict only over at least 3 bags of a
+tier kind (R6_04 A-6): a preflight's single rigid bag is reported, not gated.
+`gates.sag_mode: report` records the sag without refusing.
+
+The unattended run is `scripts/round6_run.sh` (`doctor`, `preflight`,
+`launch`): the production variants `iiwa_drive`, `iiwa_bus`, `fmrr` (UR10
+`drive` failed budget gate 1b and is dropped, `R6_05`; `VARIANTS=... ur10`
+still builds it), each
+built (production + gain-shift, iiwa `drive` also both ablations), then
+Optuna, export, training and `evaluate_on` on the test split and the
+gain-shift file for `lnn_tau_elastic`, `kalnn_tau_elastic`, `lnn_tau_res`,
+`kalnn_tau_res`.
+
 ### Other assets: FMRR (3-axis Cartesian gantry)
 
 `config/identification/fmrr_tecnobody.yaml` runs the same stack on the

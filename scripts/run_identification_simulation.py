@@ -39,9 +39,11 @@ from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.controllers import CONTROLLER_MODES, ControllerDraw
 from elastic_sim.dataset import (
-    DEFAULT_CONFIG, RIGID_TIER, elastic_time_step, load_config, payload_for, resolve_bag, rollout_frame,
-    run_condition, sample_all_payloads,
+    DEFAULT_CONFIG, RIGID_TIER, differentiation_policy, elastic_time_step, load_config, payload_for,
+    resolve_bag, rollout_frame, run_condition, sample_all_payloads,
 )
+from elastic_sim.dataset_bag import noise_seed
+from elastic_sim.dataset_worklist import motor_friction_for
 from elastic_sim.payload import Payload, payload_asset
 from elastic_sim.torque_runners import control_separation_ratio, link_inertia_envelope, link_inertia_max
 
@@ -189,6 +191,8 @@ def main() -> None:
         draw = ControllerDraw(natural_frequency, damping_ratio, position_gain, velocity_bandwidth, integral_time)
         extras = plant_extras_for_bag(
             config.plant_extras, len(asset.joint_names), config.seed, seed, robot=tier.name,
+            stiffness=None if tier.is_rigid else np.asarray(tier.stiffness, dtype=float),
+            effort=np.asarray([np.inf if j.effort is None else j.effort for j in asset.resolve_active_joints()]),
         )
         with payload_asset(asset, payload) as asset_p:
             report_kinematics = PortableKinematics(asset_p)
@@ -225,7 +229,10 @@ def main() -> None:
     if args.control_frequency is not None:
         natural_frequency = args.control_frequency
         draw = replace(draw, natural_frequency=natural_frequency)
-    friction = idn.FrictionModel.from_asset(asset)
+    # Round 6 draws the motor friction per robot, as generate() does.
+    friction = (idn.FrictionModel.from_asset(asset) if config.motor_friction is None
+                else motor_friction_for(config, asset, tier))
+    bag_name = f"t{args.trajectory}_{tier.name}_f0_{backend}"
     units = _units(asset)
     print(f"\ntier {tier.name!r} on {backend}" + (" with viewer" if run_config.visualize else ""))
     print(f"  controller   : {config.controller.mode}"
@@ -265,10 +272,14 @@ def main() -> None:
         for name, ratio in zip(asset.joint_names, ratios):
             flag = "  <-- below min_ratio" if wanted and ratio < config.control_separation.min_ratio else ""
             print(f"    {name:20s} {ratio:6.2f}{flag}")
+    seed = noise_seed(config, bag_name) if config.is_round6 else config.seed
     result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia,
                            payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio,
-                           draw=draw, extras=None if tier.is_rigid else extras)
+                           draw=draw, extras=extras if config.is_round6 or not tier.is_rigid else None,
+                           seed=seed)
     _report_rollout(asset, result, friction, units)
+    if config.is_round6:
+        _report_round6(config, asset, result, units)
 
     if not args.output:
         print("\nNothing written (pass --output to save this rollout).")
@@ -276,12 +287,47 @@ def main() -> None:
     frame = rollout_frame(
         asset, trajectory, result, bag=f"{tier.name}_{backend}", tier=tier,
         backend=backend, friction=friction, resample_step=config.sample_time_step,
-        signals=config.signals, measurement=config.measurement, measurement_seed=config.seed,
+        signals=config.signals, measurement=config.measurement, measurement_seed=seed,
+        noise=config.noise if config.is_round6 else None,
+        differentiation=differentiation_policy(config) if config.is_round6 else None,
     )
     target = Path(args.output).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(target, index=False)
     print(f"\nWrote {len(frame)} samples to {target}")
+
+
+def _report_round6(config, asset, result, units) -> None:
+    """The round-6 loop at a glance: timing, gains, sag, and the target's parts (`R6_00` Secs 2, 7)."""
+    period, delay = config.control_period, config.control_delay
+    where = ("on the bus" if config.controller.location == "bus"
+             else f"in the drive at {config.controller.drive_rate:g} Hz, recorded every {config.drive_ticks} ticks")
+    print(f"\nround-6 loop {where}: T={period:g}s, physics step {result['time_step']:.3g}s "
+          f"(decimation {result['control_decimation']}), delay {delay} period(s)")
+    draw = result["controller_draw"]
+    bound = 2.0 * draw.damping_ratio * draw.natural_frequency * period * (1.0 + delay)
+    rotor = np.max(np.asarray(result["kd"]) * period * (1.0 + delay) / config.nominal_rotor_inertia(len(asset.joint_names)))
+    print(f"  omega = {draw.natural_frequency:.2f} rad/s = {draw.natural_frequency / config.omega_max():.2f} "
+          f"omega_max, zeta = {draw.damping_ratio:.2f}, 2 zeta omega T (1+d) = {bound:.3f} (<= 0.5), "
+          f"rotor loop kd T (1+d) / J = {rotor:.3f}")
+    q_ref = np.asarray(result["q_ref"], dtype=float)
+    q_link = np.asarray(result["q_link"], dtype=float)
+    span = q_ref.max(axis=0) - q_ref.min(axis=0)
+    sag = np.sqrt(np.mean((q_link - q_ref) ** 2, axis=0)) / np.where(span > 0, span, np.nan)
+    print(f"  {'joint':20s} {'kp':>10s} {'kd':>9s} {'sag/span':>9s} {'rms tau_s':>10s}")
+    tau_s = np.asarray(result["tau_link"], dtype=float)
+    for index, name in enumerate(asset.joint_names):
+        flag = "  <-- over the 5 % gate" if sag[index] > config.gates.sag_max_fraction else ""
+        print(f"  {name:20s} {float(result['kp'][index]):10.4g} {float(result['kd'][index]):9.4g} "
+              f"{sag[index]:9.3%} {np.sqrt(np.mean(tau_s[:, index] ** 2)):10.4g}{flag}")
+    if result.get("mode") == "rigid" and "tau_applied" in result:
+        # Sec 2.3's identity: what the link receives is what the motor applied,
+        # less the rotor's own inertia and friction.
+        armature = np.asarray(result["armature"], dtype=float)
+        identity = (np.asarray(result["tau_applied"]) - armature * np.asarray(result["ddq_link"])
+                    - np.asarray(result["friction_motor"]))
+        print(_row("|tau_s - (tau_applied - J ddq - f_motor)|",
+                   f"{np.sqrt(np.mean((tau_s - identity) ** 2)):.3e} {units['tau']} (rigid-tier identity, ~0)"))
 
 
 def _report_trajectory(asset, trajectory, kinematics) -> None:
@@ -366,7 +412,7 @@ def _report_rollout(asset, result, friction, units) -> None:
                    "  (target vs input)"))
         if not result.get("independent_of_mujoco", True):
             print("  note: this Newton run uses SolverMuJoCo and is not independent of MuJoCo")
-    else:
+    elif "tau_applied" not in result:
         pin, model, data = idn.build_model(asset)
         stride = slice(None, None, max(1, len(q) // 400))
         predicted = np.asarray([

@@ -54,8 +54,11 @@ class FourierExcitationConfig:
     # n_harmonics; empty disables the probe.
     probe_harmonics: tuple[int, ...] = ()
     # Fraction of max_acceleration reserved for the probe; the main harmonics
-    # get the rest.
+    # get the rest.  With ``probe_budget: additive`` (`R6_04` D-1) the main
+    # harmonics keep the whole budget and the probe gets this fraction of it
+    # on top (0 < f <= 1, so the total stays <= 2 x max_acceleration).
     probe_acceleration_fraction: float = 0.2
+    probe_budget: str = "split"
     # Per-joint ``(lower, upper)`` [rad], overriding the URDF limit for that
     # joint before ``limit_margin`` is applied.  Empty means every joint keeps
     # its URDF limit (the iiwa's historical behaviour).  Needed on robots
@@ -91,8 +94,12 @@ class FourierExcitationConfig:
                 raise ValueError("probe_harmonics must be strictly increasing")
             if probe[0] <= self.n_harmonics:
                 raise ValueError("probe_harmonics must all be greater than n_harmonics")
-            if not 0.0 < self.probe_acceleration_fraction < 1.0:
+            if self.probe_budget not in ("split", "additive"):
+                raise ValueError("probe_budget must be 'split' or 'additive'")
+            if self.probe_budget == "split" and not 0.0 < self.probe_acceleration_fraction < 1.0:
                 raise ValueError("probe_acceleration_fraction must be in (0, 1)")
+            if self.probe_budget == "additive" and not 0.0 < self.probe_acceleration_fraction <= 1.0:
+                raise ValueError("an additive probe_acceleration_fraction must be in (0, 1]")
             # The probe's top frequency must sit below the output grid's
             # Nyquist with margin, or it aliases into the written dataset
             # instead of showing up as the modal response it is meant to be.
@@ -343,6 +350,7 @@ def _fit_to_limits(
     indices: np.ndarray | None = None,
     probe_count: int = 0,
     probe_acceleration_fraction: float = 0.0,
+    probe_budget: str = "split",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Scale each joint's series to the largest feasible amplitude.
 
@@ -356,7 +364,9 @@ def _fit_to_limits(
     position/velocity footprint is negligible (micro-radians at 40+ Hz) and
     reserving it costs the main trajectory nothing measurable.  The main
     harmonics are then scaled against the *remaining* position, velocity and
-    ``(1 - probe_acceleration_fraction)`` of the acceleration budget.
+    ``(1 - probe_acceleration_fraction)`` of the acceleration budget, or the
+    whole of it with ``probe_budget="additive"`` (`R6_04` D-1: the probe is
+    added on top, so workspace coverage does not shrink as the probe grows).
 
     Scaling the main harmonics first and giving the probe only what was
     "left over" (the original approach) is backwards: on any joint where
@@ -393,7 +403,8 @@ def _fit_to_limits(
         remaining_velocity = np.maximum(velocity_limit - np.abs(dq_probe).max(axis=0), 0.0)
         a_main, b_main = _scale_block(
             a[:, :n_main], b[:, :n_main], omega, time, main_indices, remaining_half_span, remaining_velocity,
-            np.full(n_joints, (1.0 - probe_acceleration_fraction) * max_acceleration),
+            np.full(n_joints, (1.0 if probe_budget == "additive" else 1.0 - probe_acceleration_fraction)
+                    * max_acceleration),
         )
         a = np.concatenate([a_main, a_probe], axis=1)
         b = np.concatenate([b_main, b_probe], axis=1)
@@ -442,6 +453,7 @@ def sample_candidate(
         a, b, omega, time, safe_lower, safe_upper, velocity_limit, config.max_acceleration,
         rng=rng, centre_jitter=config.centre_jitter, indices=indices,
         probe_count=len(config.probe_harmonics), probe_acceleration_fraction=config.probe_acceleration_fraction,
+        probe_budget=config.probe_budget,
     )
 
 
@@ -531,6 +543,8 @@ def optimize_excitation(
         "centre_jitter": float(config.centre_jitter),
         "probe_harmonics": list(int(v) for v in config.probe_harmonics),
         "probe_acceleration_fraction": float(config.probe_acceleration_fraction),
+        # Only when additive, so a split trajectory keeps its round-5 metadata bytes.
+        **({"probe_budget": "additive"} if config.probe_budget == "additive" else {}),
         "probe_top_hz": float(config.probe_harmonics[-1] * config.base_frequency) if config.probe_harmonics else 0.0,
         "candidates": int(n_candidates),
         "candidate_index": int(best["index"]),

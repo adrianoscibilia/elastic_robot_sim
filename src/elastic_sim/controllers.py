@@ -66,6 +66,20 @@ CONTROLLER_MODES = ("exact_ct", "nominal_ct", "pd_gravity", "pd", "velocity_pi")
 #: ``tau_cmd`` independent of the state regressor (``R5_00`` Sec 5.3).
 MODEL_FREE_MODES = ("pd", "velocity_pi")
 
+GAIN_SIZINGS = ("link_plus_rotor", "motor_inertia", "motor_plus_load")
+LOOPS = ("physics_step", "sample_rate")
+#: Where the PD runs (`R6_02` Sec 7): ``bus`` -- the host commands torque at
+#: the sample rate (iiwa FRI torque mode, FMRR CST); ``drive`` -- the host
+#: sends setpoints and the PD lives inside the drive at the drive's own rate
+#: (UR10 CB3, which has no joint-torque interface; FMRR CSP/CSV).
+LOCATIONS = ("bus", "drive")
+#: How a drive loop's bandwidth is bounded.  ``rotor``: the Sec 2.2 bound on
+#: the loop the rotor actually closes, ``2 zeta omega T (1 + d) (J + m) / J
+#: <= 0.5`` -- above the transmission mode the drive's gains act on ``J``
+#: alone; ``sizing``: the same bound on the sizing inertia ``J + m`` (R6_02
+#: Sec 7 read literally).
+DRIVE_BOUNDS = ("rotor", "sizing")
+
 
 @dataclass(frozen=True)
 class NominalModelSpec:
@@ -146,6 +160,27 @@ class VelocityLoopSpec:
 
 
 @dataclass(frozen=True)
+class IntegralSpec:
+    """The only remedy `R6_00` Sec 2.2 allows a platform that fails the sag gate.
+
+    A slow, model-free integral on the PD: ``tau += (kp / T_i) int e dt`` with
+    ``T_i = time_factor / omega``, ``time_factor >= 10`` so it stays a decade
+    below the loop, and conditional integration at the effort limit.  Enabled
+    per platform, with the reason recorded; never a gravity model.
+    """
+
+    enabled: bool = False
+    time_factor: float = 10.0
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.enabled and float(self.time_factor) < 10.0:
+            raise ValueError("simulation.controller.integral.time_factor must be >= 10 (T_i >= 10 / omega)")
+        if self.enabled and not str(self.reason).strip():
+            raise ValueError("simulation.controller.integral needs the reason it is enabled (R6_00 Sec 2.2)")
+
+
+@dataclass(frozen=True)
 class ControllerSpec:
     """Which controller a dataset build uses, and how it is randomized."""
 
@@ -157,10 +192,48 @@ class ControllerSpec:
     #: ``payload``/``regime``/``control_gains`` are: a directly-built
     #: ``DatasetConfig`` (most tests) stays deterministic unless it opts in.
     randomize: bool = False
+    #: How ``pd``/``pd_gravity``/``velocity_pi`` turn a bandwidth into torque
+    #: gains.  ``link_plus_rotor`` (rounds 4-5): ``(M_jj + J_j) omega^2``.
+    #: ``motor_inertia`` (`R6_00` Sec 2.2): the *nominal* rotor inertia alone,
+    #: ``J_j,nom omega^2`` -- above the transmission mode the motor sees only its
+    #: own inertia, and the controller does not know the sampled one.
+    #: ``motor_plus_load`` (`R6_02` Sec 7, drive loops): ``J_j,nom + m_j,nom``,
+    #: a commissioned drive's load-inertia ratio -- one scalar per axis, the
+    #: nominal link inertia's mean diagonal along the reference
+    #: (:func:`nominal_joint_inertia`), not a dynamic model.
+    gain_sizing: str = "link_plus_rotor"
+    #: ``physics_step`` (rounds 4-5): evaluated every physics step (or every
+    #: ``control_decimation``) on the true state.  ``sample_rate`` (Sec 2.1):
+    #: once per sample period, held, on the measured, delayed motor state.
+    loop: str = "physics_step"
+    integral: IntegralSpec = None  # type: ignore[assignment]
+    location: str = "bus"
+    #: The drive's loop rate [Hz] (``location: drive``); an integer multiple of the sample rate.
+    drive_rate: float = 0.0
+    drive_bound: str = "rotor"
+    #: Bus samples a drive's setpoint arrives late (the ROS 2 cycle, moved
+    #: from the feedback path to the reference path).
+    setpoint_delay: int = 1
+    #: The drive's velocity low-pass, as a fraction of its rate (`R6_04` A-4).
+    velocity_cutoff_fraction: float = 0.1
 
     def __post_init__(self) -> None:
+        if self.location not in LOCATIONS:
+            raise ValueError(f"simulation.controller.location must be one of {LOCATIONS}")
+        if self.drive_bound not in DRIVE_BOUNDS:
+            raise ValueError(f"simulation.controller.drive.bound must be one of {DRIVE_BOUNDS}")
+        if self.location == "drive" and self.drive_rate <= 0.0:
+            raise ValueError("simulation.controller.location: drive needs drive.rate [Hz]")
+        if self.integral is None:
+            object.__setattr__(self, "integral", IntegralSpec())
+        if self.integral.enabled and self.mode != "pd":
+            raise ValueError("simulation.controller.integral is the pd mode's sag remedy only")
         if self.mode not in CONTROLLER_MODES:
             raise ValueError(f"simulation.controller.mode must be one of {CONTROLLER_MODES}, got {self.mode!r}")
+        if self.gain_sizing not in GAIN_SIZINGS:
+            raise ValueError(f"simulation.controller.gain_sizing must be one of {GAIN_SIZINGS}")
+        if self.loop not in LOOPS:
+            raise ValueError(f"simulation.controller.loop must be one of {LOOPS}")
         if self.nominal is None:
             object.__setattr__(self, "nominal", NominalModelSpec())
         if self.velocity_loop is None:
@@ -282,7 +355,7 @@ def nominal_friction(friction: FrictionModel, spec: NominalModelSpec) -> Frictio
     if spec.friction_scale == 1.0:
         return friction
     scale = float(spec.friction_scale)
-    return FrictionModel(friction.viscous * scale, friction.coulomb * scale)
+    return friction.scaled(scale, scale)
 
 
 def nominal_transmission(transmission: TransmissionSpec, spec: NominalModelSpec) -> TransmissionSpec:
@@ -376,11 +449,17 @@ class JointPdController:
         gravity: bool = False,
         nominal: NominalModelSpec | None = None,
         effort_limit: np.ndarray | None = None,
+        integral_time: float | None = None,
+        frequency_scale: np.ndarray | None = None,
+        setpoint_period: float | None = None,
+        setpoint_delay: int = 0,
     ) -> None:
         from . import identification as idn
 
         if natural_frequency <= 0.0 or damping_ratio <= 0.0:
             raise ValueError("natural_frequency and damping_ratio must be positive")
+        if integral_time is not None and integral_time <= 0.0:
+            raise ValueError("integral_time must be positive")
         self.asset = asset
         self.trajectory = trajectory
         self.natural_frequency = float(natural_frequency)
@@ -391,15 +470,56 @@ class JointPdController:
             raise ValueError("joint_inertia must be positive on every joint")
         # Torque gains, in Nm/rad and Nm/(rad/s) -- not the error-dynamics
         # gains ComputedTorqueController uses.
-        self.kp = self.joint_inertia * self.natural_frequency**2
-        self.kd = 2.0 * self.damping_ratio * self.joint_inertia * self.natural_frequency
+        # ``frequency_scale`` gives each joint its own bandwidth, omega_j =
+        # scale_j omega (a drive loop's per-axis bound); ``None`` is one omega.
+        omega = self.natural_frequency * (1.0 if frequency_scale is None
+                                          else np.asarray(frequency_scale, dtype=float).reshape(-1))
+        self.joint_frequency = np.broadcast_to(omega, self.joint_inertia.shape).astype(float)
+        self.kp = self.joint_inertia * self.joint_frequency**2
+        self.kd = 2.0 * self.damping_ratio * self.joint_inertia * self.joint_frequency
         self.uses_gravity = bool(gravity)
         self.effort_limit = _effort_limit(asset, effort_limit)
+        self.integral_time = None if integral_time is None else float(integral_time)
+        # A drive receives its setpoints from the bus: sampled every
+        # ``setpoint_period``, ``setpoint_delay`` periods late (`R6_02` Sec 7
+        # amended), and interpolated between them (:meth:`setpoint`).
+        # ``None`` reads the reference at ``t``.
+        self.setpoint_period = None if setpoint_period is None else float(setpoint_period)
+        self.setpoint_delay = int(setpoint_delay)
+        self._integral = np.zeros(len(self.joint_inertia))
+        self._last_time: float | None = None
         self._idn = idn
         if self.uses_gravity:
             pin, model, data = idn.build_model(asset)
             model, data = idn.scale_model_inertias(pin, model, self.nominal.inertia_scale)
             self._pin, self._model, self._data = pin, model, data
+
+    #: Nothing of the plant is in the loop, so the runners apply the plant's
+    #: friction live rather than holding it with the command.
+    compensates_friction = False
+
+    def setpoint(self, t: float) -> tuple[np.ndarray, np.ndarray]:
+        """The ``(q_ref, dq_ref)`` the controller tracks at ``t``.
+
+        Without a ``setpoint_period``, the reference at ``t``.  With one (a
+        drive loop), what a cyclic-synchronous drive does with bus setpoints
+        (CSP interpolation, e.g. ASDA ``0x60C2``): during bus period ``k`` the
+        latest setpoint it holds is sample ``k - setpoint_delay``, and it
+        interpolates linearly from the one before it to that one over the
+        period, so the reference is continuous rather than a staircase whose
+        steps ``kp`` would turn into a torque spike every bus sample.
+        """
+        if self.setpoint_period is None:
+            q_ref, dq_ref, _ = self.trajectory(t)
+            return q_ref, dq_ref
+        period = self.setpoint_period
+        index = int(np.floor(t / period + 1e-9))
+        fraction = min(max(t / period - index, 0.0), 1.0)
+        latest = max(index - self.setpoint_delay, 0) * period
+        previous = max(index - self.setpoint_delay - 1, 0) * period
+        q_a, dq_a, _ = self.trajectory(previous)
+        q_b, dq_b, _ = self.trajectory(latest)
+        return q_a + fraction * (q_b - q_a), dq_a + fraction * (dq_b - dq_a)
 
     def stability_margin(self, time_step: float) -> float:
         """``kd / (M + J) * dt``; explicit integration needs it below 2."""
@@ -408,10 +528,22 @@ class JointPdController:
     def __call__(
         self, t: float, q: np.ndarray, dq: np.ndarray, tau_spring: np.ndarray | None = None,
     ) -> TorqueCommand:
-        q_ref, dq_ref, _ = self.trajectory(float(t))
+        q_ref, dq_ref = self.setpoint(float(t))
         q = np.asarray(q, dtype=float)
         dq = np.asarray(dq, dtype=float)
         feedback = self.kp * (q_ref - q) + self.kd * (dq_ref - dq)
+        if self.integral_time is not None:
+            # `R6_00` Sec 2.2's remedy: slow, model-free, conditional integration
+            # at the effort limit (the same anti-windup as VelocityLoopController).
+            # It is error feedback, so the feedforward stays zero (Sec 7 item 1).
+            error = q_ref - q
+            step = 0.0 if self._last_time is None else max(float(t) - self._last_time, 0.0)
+            self._last_time = float(t)
+            candidate = self._integral + error * step
+            unsaturated = feedback + self.kp / self.integral_time * candidate
+            winding_up = (np.abs(unsaturated) > self.effort_limit) & (np.sign(error) == np.sign(unsaturated))
+            self._integral = np.where(winding_up, self._integral, candidate)
+            feedback = feedback + self.kp / self.integral_time * self._integral
         if self.uses_gravity:
             feedforward = np.asarray(
                 self._pin.computeGeneralizedGravity(self._model, self._data, q), dtype=float
@@ -481,6 +613,8 @@ class VelocityLoopController:
         self.effort_limit = _effort_limit(asset, effort_limit)
         self.reset()
 
+    compensates_friction = False
+
     def reset(self) -> None:
         self._integral = np.zeros(len(self.joint_inertia))
         self._last_time: float | None = None
@@ -528,8 +662,12 @@ def build_controller(
     trajectory: MaterializedTrajectory,
     friction: FrictionModel,
     transmission: TransmissionSpec | None = None,
-    epsilon: float = COULOMB_EPSILON,
+    epsilon: float | None = None,
     joint_inertia: np.ndarray | None = None,
+    motor_inertia: np.ndarray | None = None,
+    load_inertia: np.ndarray | None = None,
+    frequency_scale: np.ndarray | None = None,
+    setpoint_period: float | None = None,
 ) -> Any:
     """Return the controller ``spec`` names, ready for either torque runner.
 
@@ -544,6 +682,14 @@ def build_controller(
     one.  ``joint_inertia`` overrides the nominal diagonal the PD and
     velocity-loop gains are sized from; it is computed from ``nominal_asset``
     when not given.
+
+    With ``spec.gain_sizing == "motor_inertia"`` (`R6_00` Sec 2.2) the gains
+    are sized on ``motor_inertia`` alone -- the *nominal* rotor inertia, the
+    same on the rigid tier (where it is the armature) as on every elastic
+    robot -- so ``kp_j = J_j,nom omega^2`` and ``kd_j = 2 zeta J_j,nom omega``.
+    ``motor_plus_load`` (a drive loop, `R6_02` Sec 7) sizes on
+    ``motor_inertia + load_inertia``, and ``frequency_scale`` sets each joint's
+    own bandwidth ``omega_j = scale_j omega`` (the drive bound per axis).
     """
     if spec.mode == "exact_ct" and not spec.nominal.is_exact:
         raise ValueError(
@@ -571,12 +717,22 @@ def build_controller(
             inertia_scale=inertia_scale,
         )
 
-    rotor = np.zeros(len(asset.joint_names)) if transmission is None else (
-        nominal_transmission(transmission, spec.nominal).rotor_inertia
-    )
-    if joint_inertia is None:
-        joint_inertia = nominal_joint_inertia(model_asset, trajectory, spec=spec.nominal)
-    joint_inertia = np.asarray(joint_inertia, dtype=float).reshape(-1) + np.asarray(rotor, dtype=float)
+    if spec.gain_sizing == "motor_inertia":
+        if motor_inertia is None:
+            raise ValueError("gain_sizing: motor_inertia needs the nominal rotor inertia (motor_inertia=)")
+        joint_inertia = np.asarray(motor_inertia, dtype=float).reshape(-1)
+    elif spec.gain_sizing == "motor_plus_load":
+        if motor_inertia is None or load_inertia is None:
+            raise ValueError("gain_sizing: motor_plus_load needs motor_inertia= and load_inertia=")
+        joint_inertia = (np.asarray(motor_inertia, dtype=float).reshape(-1)
+                         + np.asarray(load_inertia, dtype=float).reshape(-1))
+    else:
+        rotor = np.zeros(len(asset.joint_names)) if transmission is None else (
+            nominal_transmission(transmission, spec.nominal).rotor_inertia
+        )
+        if joint_inertia is None:
+            joint_inertia = nominal_joint_inertia(model_asset, trajectory, spec=spec.nominal)
+        joint_inertia = np.asarray(joint_inertia, dtype=float).reshape(-1) + np.asarray(rotor, dtype=float)
 
     if spec.mode in ("pd", "pd_gravity"):
         return JointPdController(
@@ -584,6 +740,10 @@ def build_controller(
             natural_frequency=draw.natural_frequency, damping_ratio=draw.damping_ratio,
             gravity=spec.mode == "pd_gravity", nominal=spec.nominal,
             effort_limit=_effort_limit(asset, None),
+            integral_time=(spec.integral.time_factor / draw.natural_frequency) if spec.integral.enabled else None,
+            frequency_scale=frequency_scale,
+            setpoint_period=setpoint_period if spec.location == "drive" else None,
+            setpoint_delay=spec.setpoint_delay if spec.location == "drive" else 0,
         )
     if spec.mode == "velocity_pi":
         return VelocityLoopController(
@@ -612,6 +772,22 @@ def describe_controller(spec: ControllerSpec, draw: ControllerDraw | None = None
             "integral_time": list(spec.velocity_loop.integral_time),
         },
     }
+    if spec.gain_sizing != "link_plus_rotor" or spec.loop != "physics_step":
+        # Round 6 only, so a round-4/5 manifest keeps its exact bytes.
+        record["integral"] = {"enabled": bool(spec.integral.enabled), "time_factor": float(spec.integral.time_factor),
+                              "reason": spec.integral.reason}
+        if spec.location != "bus":
+            record["location"] = spec.location
+            record["drive"] = {"rate": float(spec.drive_rate), "bound": spec.drive_bound, "delay_samples": 0,
+                               "setpoint_delay_samples": int(spec.setpoint_delay),
+                               "velocity": (f"encoder difference at the drive rate, first-order low-pass at "
+                                            f"{spec.velocity_cutoff_fraction:g} x rate")}
+        record.update(
+            gain_sizing=spec.gain_sizing, loop=spec.loop,
+            # `R6_00` Sec 7 item 1: the feedforward share is zero by construction.
+            feedforward="none" if spec.mode in ("pd", "velocity_pi") else (
+                "nominal gravity" if spec.mode == "pd_gravity" else "inverse dynamics"),
+        )
     if draw is not None:
         record["draw"] = draw.as_dict()
     return record

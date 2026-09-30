@@ -1,0 +1,202 @@
+# Round-6 production config for the UR10 CB3 (R6_00).
+#
+# The intermediate member of the round-6 family; see
+# kuka_lbr_iiwa_14_r820_table_round6_drive.yaml for what the three configs share.
+#
+# The asset is the bare `ur10_table`, not round 5's `ur10_table_ft`: with the
+# transmission output torque as target, no flange cell is needed (R6_00 Sec 4).
+# Excitation, window and payload therefore follow the round-4 bare-arm config
+# (ur10_table.yaml), not round 5's cell-driven changes (125 Hz, elbow window).
+schema_version: 3
+
+asset: ur10_table
+
+backends: [mujoco]
+rigid_reference: true
+
+transmission:
+  robots: 20
+  sampling: stratified
+  # Joint order: shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3.
+  # nominal = K2 / 3 of HD sizes 32/32/25/17/17/17 (inferred, [S-5, S-6, S-7]);
+  # see docs/PARAMETER_PROVENANCE.md for the round-6 size-17 correction.
+  stiffness_nominal: [2.6e4, 2.6e4, 1.23e4, 5.7e3, 5.7e3, 5.7e3]   # Nm/rad
+  stiffness_factor: [0.3333333333, 3.0]
+  stiffness_common_fraction: 0.0
+  stiffness_provenance: [D, D, D, D, D, D]
+  damping_ratio: [0.05, 0.2]
+  rotor_inertia_nominal: [4.0, 4.0, 1.7, 0.5, 0.5, 0.5]
+  rotor_inertia_factor: [0.5, 2.0]
+  rotor_inertia_provenance: [E, E, C, E, E, E]
+  inertia_samples: 512
+
+payload:
+  enabled: true
+  mass: [0.0, 5.0]
+  offset_x: [-0.08, 0.08]
+  offset_y: [-0.08, 0.08]
+  offset_z: [0.02, 0.20]
+  size: [0.05, 0.25]
+  per: robot
+
+comparison:
+  q_link_rms: 1.0e-4
+  ft_relative_rms: 0.01
+  deflection_relative_rms: 0.05
+
+excitation:
+  n_harmonics: 5
+  base_frequency: 0.1
+  n_periods: 1
+  limit_margin: 0.12
+  velocity_fraction: 0.6
+  max_acceleration: 2.0
+  centre_jitter: 1.0
+  candidates: 48
+  position_window:
+    shoulder_pan_joint: [-3.1416, 3.1416]
+    shoulder_lift_joint: [-3.1416, 0.0]
+    elbow_joint: [-2.8, 2.8]
+    wrist_1_joint: [-3.1416, 3.1416]
+    wrist_2_joint: [-3.1416, 3.1416]
+    wrist_3_joint: [-3.1416, 3.1416]
+  # R6_02 P2-1: the comb is aimed at the link-side modes, derived at load from
+  # the f_link table (elastic_sim.link_modes): log-spaced lines from
+  # min(lowest_hz, 0.5 f_link,low) to min(1.5 f_link,high, 0.09 x rate), the
+  # consumer's derivative passband [S-12, S-14].  The resolved harmonics and
+  # the table are in the manifest.
+  probe_design:
+    source: link_modes
+    lowest_hz: 1.5
+    lines: 32
+    span: [0.5, 1.5]
+  # R6_04 D-1: the probe is added on top of the main trajectory's full
+  # acceleration budget (workspace coverage unchanged); its share is raised
+  # until peak |tau|/effort reaches 0.8 or it equals the main budget
+  # (scripts/round6_probe_fraction.py, reports/round6/fraction_*).
+  probe_budget: additive
+  probe_acceleration_fraction: 1.0   # sweep: reports/round6/fraction_<stem>.json
+  regime:
+    enabled: true
+    max_acceleration: [0.5, 4.0]
+    velocity_fraction: [0.3, 0.8]
+
+dataset:
+  trajectories: 3
+  trajectories_per_robot: true
+  friction_samples: 1
+  friction_scale: [0.5, 2.0]
+  seed: 20260929
+  output: data/identification/ur10_table_round6.parquet
+  metadata_columns: inline
+  split:
+    mode: holdout_robots
+    test_robots: 4
+    val_robots: 2
+  signals:
+    position_side: motor
+    target: link_torque
+    target_source: measured
+    clean_columns: true
+
+simulation:
+  # R6_02 Sec 7: the UR10 CB3 has no joint-torque interface [S-7]; the host
+  # sends setpoints and the PD lives inside the drive, at the drive's 2 kHz
+  # with no bus delay (d = 0), gains sized on J + m_nom (the commissioned
+  # load-inertia ratio: the nominal M_jj averaged along the reference, one
+  # scalar per axis); setpoints arrive one bus sample late (R6_02 Sec 7 amended).
+  # tau is the drive's torque demand (target_current x k_t on the proxy chain).
+  #   omega_max = 0.5 / (2 * 1.3 * 5e-4) = 384.6 rad/s, scaled per axis by
+  #   J / (J + m) (drive.bound: rotor, see controllers.DRIVE_BOUNDS).
+  controller:
+    mode: pd
+    randomize: true
+    location: drive
+    drive: {rate: 2000.0, bound: rotor, setpoint_delay: 1, velocity_cutoff_fraction: 0.1}
+    gain_sizing: motor_plus_load
+    loop: sample_rate
+    nominal:
+      knows_payload: false
+  control_gains:
+    enabled: true
+    natural_frequency_fraction: [0.5, 0.9]
+    damping_ratio: [0.7, 1.3]
+  control_separation:
+    min_ratio: 5.0
+    action: warn
+  motor_friction:
+    viscous_fraction: 0.05
+    coulomb_fraction: 0.02
+    epsilon: 1.0e-2
+    per_robot: true
+    provenance: E
+  noise:
+    enabled: true
+    delay_samples: 1             # 2 ms at 500 Hz
+    q:
+      # R6_02 Sec 3: an encoder is quantization plus one count of white noise,
+      # not a percentage of RMS (0.01 % of RMS was ~800 iiwa counts).
+      # R6_04 A-4: the drive's joint encoder, >= 14-bit on the motor behind
+      # the 100:1 gear [S-7]: 2 pi / (100 * 2^14) = 3.8e-6 rad (class E).
+      quantization: 3.835e-6
+      sigma_quanta: 1.0
+    dq:
+      source: sensor             # RTDE actual_qd: the drive's estimate
+      p: 0.005
+    ft:
+      p: 0.02                    # the real proxy is current-based (post-training chain)
+      gain: 0.03
+      offset: 0.005
+    tag: modelling_error
+    provenance: E
+  plant_extras:
+    link_friction:
+      tier: fixed
+      viscous: {nominal: [2.0, 2.0, 1.0, 0.4, 0.4, 0.4], factor: [0.5, 2.0]}
+      coulomb: {nominal: [6.6, 6.6, 3.0, 1.1, 1.1, 1.1], factor: [0.5, 2.0]}
+      provenance: E
+      integration: implicit
+    # R6_00 Sec 5.2, class D [S-4, S-3]: HD catalog curves of the inferred sizes
+    # 32 / 25 / 17, knees in torque, converted per robot with its sampled k.
+    stiffness_nonlinearity:
+      factors:
+        - [0.69, 1.0, 1.44]   # shoulder_pan (size 32)
+        - [0.69, 1.0, 1.44]   # shoulder_lift (size 32)
+        - [0.74, 1.0, 1.68]   # elbow (size 25)
+        - [0.74, 1.0, 1.45]   # wrist_1 (size 17)
+        - [0.74, 1.0, 1.45]   # wrist_2
+        - [0.74, 1.0, 1.45]   # wrist_3
+      breakpoints_torque:
+        - [29.0, 108.0]
+        - [29.0, 108.0]
+        - [14.0, 48.0]
+        - [3.9, 12.0]
+        - [3.9, 12.0]
+        - [3.9, 12.0]
+      provenance: D
+    # R6_00 Sec 5.3, class E [S-7, S-8]: ratio 100 -> n = 200; ~1 arcmin
+    # transmission-accuracy class.
+    transmission_error:
+      amplitude: 2.0e-4
+      order: 200.0
+      random_phase: true
+      provenance: E
+  # Derived at load from the Sec 3 bound table (R6_02 Sec 6), capped at 5e-4 s.
+  rigid_time_step: auto
+  max_time_step: auto
+  sample_time_step: 0.002        # 500 Hz; the post-training chain resamples RTDE
+
+gates:
+  sag_max_fraction: 0.05
+  # Round 5's pd level (reports/round5/qc3_ur10_summary.csv, extras on).  That
+  # build ran at 125 Hz on the cell target with (M + J)-sized gains, so the
+  # reference is the same platform, not the same settings.
+  # R6_02 Sec 7 amended: a drive dataset compares with round 5's velocity_pi row.
+  qc_v2_reference: {elastic: 0.0170, rigid: 0.00383, source: "reports/round5/qc3_ur10_summary.csv, velocity_pi, extras on"}
+  unstable_max_fraction: 0.02
+  gainshift_fraction: [[0.3, 0.5], [0.9, 1.0]]
+  gainshift_max_ratio: 1.3
+
+visualization:
+  enabled: false
+  realtime_scale: 1.0

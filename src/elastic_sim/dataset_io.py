@@ -40,6 +40,8 @@ _METADATA_COLUMN_PREFIXES = (
     "payload_", "exc_",
     # Round 5, same reasoning: one value per bag repeated on every row.
     "gain_motor__", "gain_link__", "link_viscous__", "link_coulomb__", "ripple_",
+    # Round 6: the bag's instrument draws and transmission-error parameters.
+    "noise_", "te_",
 )
 
 
@@ -142,6 +144,8 @@ def write_dataset(
         "requires_consumer": "dynamic_model_nn dataset.py with the general ft0..ft{dof-1} branch",
         "split": manifest.get("split"),
     }
+    if int(manifest.get("schema_version", 0) or 0) >= 3:
+        contract.update(_round6_contract(manifest, n_dof))
     contract_path = csv_path.with_suffix(".contract.json")
     contract_path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
     comparison_path = None
@@ -149,6 +153,56 @@ def write_dataset(
         comparison_path = comparison_report_path(csv_path)
         comparison.to_csv(comparison_path, index=False)
     return csv_path, manifest_path, comparison_path
+
+
+def _round6_contract(manifest: Mapping[str, Any], n_dof: int) -> dict[str, Any]:
+    """The contract fields `R6_00` Sec 1 adds; they override the round-5 ones."""
+    signals = manifest.get("signals") or {}
+    noise = manifest.get("noise") or {}
+    measured = signals.get("target_source", "measured") == "measured" and bool(noise.get("enabled", True))
+    controller = dict(manifest.get("controller") or {})
+    return {
+        "schema": "elastic_sim.identification/3",
+        "target_kind": "per_joint_torque",
+        "target_instrument": "simulated_torque_measurement" if measured else "simulator_ground_truth",
+        "target_semantics": "transmission output torque applied to the link [N·m | N]",
+        "target_contains": (
+            "the torque the transmission applies to the link: the whole robot's rigid dynamics and link "
+            "friction seen from the link side, plus elasticity, spring nonlinearity and transmission error "
+            "seen from the motor-side inputs"
+        ),
+        "target_source": "measured" if measured else "clean",
+        "target_clean_column": "ft_clean",
+        "input_semantics": manifest.get("input"),
+        # The machine-readable form the consumer checks (`R6_00` Sec 10):
+        # the elastic classes observe tau_cmd and must know it is exact.
+        "inputs": {
+            "q": {"side": "motor", "measured": True},
+            "dq": {"side": "motor", "measured": True,
+                   "source": (noise.get("dq") or {}).get("source", "sensor")},
+            "tau": {"kind": "commanded_motor_torque", "noise_free": True},
+        },
+        "controller": {**controller, "model_free": True},
+        "noise": noise,
+        "motor_friction": manifest.get("motor_friction"),
+        "control_timing": manifest.get("control_timing"),
+        "posture_columns": (
+            {"sigma_min_j": "smallest singular value of the 6xn frame Jacobian at the recorded configuration "
+                            "(R5_07 T-15); diagnostic for the wrench columns only"}
+            if signals.get("wrench_columns") else None
+        ),
+        "wrench_columns": (
+            {
+                "columns": ["w_fx", "w_fy", "w_fz", "w_tx", "w_ty", "w_tz", "sigma_min_j"],
+                "acceleration_source": (
+                    "Savitzky-Golay derivative (the contract's differentiation window) of the clean link "
+                    "velocity on the output grid, not the simulator's point-sampled qacc (R6_00 Sec 5.5)"
+                ),
+                "instrument": "noise.wrench",
+                "use": "post-training chain only; never a model input or target",
+            } if signals.get("wrench_columns") else None
+        ),
+    }
 
 
 def comparison_report_path(csv_path: str | Path) -> Path:
