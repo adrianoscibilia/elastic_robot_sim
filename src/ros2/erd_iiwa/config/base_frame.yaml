@@ -1,0 +1,27 @@
+# erd_iiwa's own base_frame.yaml (RR_06 P3-1 finding, item 1): zero offset.
+#
+# `iiwa_description`'s own config/base_frame.yaml (the file this package
+# used to pass straight through to iiwa.config.xacro) ships x: 1.0 as its
+# *example* value -- a demo placement, not a real lab fact. erd's own
+# convention (RR_01 S4, erd_recording/frames.py's KNOWN_FRAMES) is that
+# `iiwa_base` is the kinematic root, at identity relative to `world`: every
+# lab config's `description.base_frame: iiwa_base` and the FK-identity gate
+# (planning.py's driver_gate_asset, RR_04 B-2) both assume this. Passing the
+# upstream default through unmodified put the exported driver URDF's `world`
+# link 1 m away from `iiwa_base`, which the bare simulation asset's URDF
+# (rooted at `iiwa_base` with no `world` link at all) has no equivalent
+# offset for -- the FK gate then fails on every single plan with a ~1 m
+# position error that has nothing to do with the two descriptions'
+# kinematics actually disagreeing.
+#
+# If this robot is ever mounted somewhere other than at `iiwa_base ==
+# world`, change this file (and reconcile it with frames.py's
+# `KNOWN_FRAMES["kuka_lbr_iiwa_14_r820"]["iiwa_base"]`, which hardcodes the
+# identity assumption) -- don't revert to the upstream file.
+base_frame:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+  roll: 0.0
+  pitch: 0.0
+  yaw: 0.0

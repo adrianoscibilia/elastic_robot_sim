@@ -1,0 +1,155 @@
+# erd.lab/1 -- UR10 CB3, mock hardware (L1).
+#
+# L0/L1 development template: `hardware: mock`, domain 87, deliberately fake
+# scene (T1.2), mirroring iiwa_mock.yaml.
+schema: erd.lab/1
+robot: ur10_cb3
+hardware: mock                          # mock | ursim | real
+operator: {confirm_each_trajectory: true}
+
+connection:
+  robot_ip: 192.168.56.10
+  reverse_ip: 192.168.56.1
+  headless_mode: false
+  kinematics_params_file: null          # T2.5: from ur_calibration; not needed for mock
+  servoj_gain: 2000
+  servoj_lookahead_time: 0.03
+  rtde_frequency: 125
+  software_version: 3.15.7
+  serial: "2017307500"
+  ros_domain_id: 87
+
+description:
+  sim_asset: ur10                        # the BARE asset (RR_04 A-6): planning, FK gate and baselines
+                                          # never use the `_table` variant, which is a different URDF root
+  joint_map:
+    shoulder_pan_joint: shoulder_pan_joint
+    shoulder_lift_joint: shoulder_lift_joint
+    elbow_joint: elbow_joint
+    wrist_1_joint: wrist_1_joint
+    wrist_2_joint: wrist_2_joint
+    wrist_3_joint: wrist_3_joint
+  base_frame: base_link
+  tool:
+    mass: 0.0
+    extra_collision: []
+
+limits:
+  reviewed: true
+  position:
+    shoulder_pan_joint: [-3.14, 3.14]
+    shoulder_lift_joint: [-3.14, 0.0]
+    elbow_joint: [-2.8, 2.8]
+    wrist_1_joint: [-3.14, 3.14]
+    wrist_2_joint: [-3.14, 3.14]
+    wrist_3_joint: [-3.14, 3.14]
+  velocity:
+    shoulder_pan_joint: 0.6
+    shoulder_lift_joint: 0.6
+    elbow_joint: 0.8
+    wrist_1_joint: 0.8
+    wrist_2_joint: 0.8
+    wrist_3_joint: 0.8
+  acceleration:
+    shoulder_pan_joint: 1.0
+    shoulder_lift_joint: 1.0
+    elbow_joint: 1.2
+    wrist_1_joint: 1.5
+    wrist_2_joint: 1.5
+    wrist_3_joint: 1.5
+  jerk:
+    shoulder_pan_joint: 15.0
+    shoulder_lift_joint: 15.0
+    elbow_joint: 15.0
+    wrist_1_joint: 15.0
+    wrist_2_joint: 15.0
+    wrist_3_joint: 15.0
+  effort:
+    shoulder_pan_joint: 330
+    shoulder_lift_joint: 330
+    elbow_joint: 150
+    wrist_1_joint: 56
+    wrist_2_joint: 56
+    wrist_3_joint: 56
+  approach: {velocity: 0.2, acceleration: 0.4}
+  abort: {tracking_rad: 0.05, torque_fraction: 0.8, stop_timeout_s: 3.0}
+
+scene:
+  reviewed: true
+  frame: base_link
+  clearance: 0.03
+  objects:
+    # A deliberately fake cell (there is none; this is the L1/CI fixture, not
+    # `ur10.yaml`), placed well clear of the robot's own reach so it never
+    # blocks a plan. It still exercises all three semantic scene types end to
+    # end (T1.2).
+    - {id: floor, type: floor, z: -0.9}
+    - {id: side_table, type: table, top_z: -0.5, centre_xy: [0.9, 0.9], size_xy: [0.4, 0.4], thickness: 0.05}
+    - {id: wall_behind, type: wall, point: [-1.2, 0.0, 0.0], normal: "-x", size: [3.0, 3.0], thickness: 0.2}
+  allowed_contacts: []
+
+poses:
+  # RR_06 P3-1 item 2, live finding: `use_mock_hardware` has no supported
+  # `initial_positions_file` passthrough in `ur_control.launch.py` (unlike
+  # the iiwa's ICube xacro, where erd_iiwa.description already points it at
+  # a config this pass controls) -- `ur_description/urdf/
+  # ros2_control_mock_hardware.xacro` hardcodes its own initial pose
+  # (shoulder_pan=0, shoulder_lift=-1.57, elbow=0, wrist_1=-1.57, wrist_2=0,
+  # wrist_3=0), confirmed live via `ros2 topic echo /joint_states`. This
+  # mock-only fixture's `home` must equal that pose exactly, or preflight's
+  # home/still check (RR_04 A-2) refuses every single mock run before it
+  # ever reaches `standstill`/`run`. `ur10_sim.yaml`/`ur10.yaml` are
+  # unaffected: URSim/the real cell have their own, physically-set starting
+  # pose, not a software default to match.
+  home: [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+  standstill:
+    - [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+    - [0.3, -1.3, 1.3, -1.5, -1.2, 0.3]
+    - [-0.3, -1.8, 1.7, -1.7, -1.8, -0.3]
+
+excitation:
+  trajectories: 2
+  seed: 20261001
+  base_frequency: 0.1
+  n_periods: 1
+  n_harmonics: 5
+  velocity_fraction: 0.6
+  max_acceleration: 1.0
+  centre_jitter: 1.0
+  position_window: {}
+  candidates: 12
+  regime:
+    enabled: true
+    velocity_fraction: [0.5, 1.0]
+    max_acceleration: [0.5, 1.0]
+  probe:
+    enabled: false
+    from_training_config: null
+    acceleration_fraction: 0.2
+    budget: split
+  settle_s: 1.0
+  amplitude_ladder: [0.1, 0.25, 0.5, 1.0]
+
+identification:
+  sweep_speeds: [0.05, 0.1, 0.2, 0.35, 0.5, 0.7]
+  sweep_range:
+    shoulder_pan_joint: [-1.0, 1.0]
+    shoulder_lift_joint: [-1.0, -0.5]
+    elbow_joint: [1.0, 2.0]
+    wrist_1_joint: [-2.0, -1.0]
+    wrist_2_joint: [-2.0, -1.0]
+    wrist_3_joint: [-1.0, 1.0]
+  holdout: 2
+
+consumer:
+  repo: /home/adriano/projects/dynamic_model_nn
+  python: /home/adriano/projects/dynamic_model_nn/.venv/bin/python
+  reference_contract: ../reference/synthetic_ur10_cb3.contract.json
+  checkpoints: null
+
+recording:
+  output_root: /home/adriano/projects/erd_data
+  standstill_s: 5.0
+  pre_roll_s: 1.0
+  post_roll_s: 1.0
+  max_lost_fraction: 0.001

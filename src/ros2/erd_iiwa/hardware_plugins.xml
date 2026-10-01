@@ -1,0 +1,9 @@
+<library path="erd_iiwa_hardware">
+  <class name="erd_iiwa/FriPositionSystem" type="erd_iiwa::FriPositionSystem" base_class_type="hardware_interface::SystemInterface">
+    <description>
+      One ros2_control cycle per FRI packet, POSITION mode only (RR_01 S3.3).
+      No upstream filtering: effort is the raw measured torque, velocity an
+      unfiltered finite difference for the JTC's state interface only.
+    </description>
+  </class>
+</library>

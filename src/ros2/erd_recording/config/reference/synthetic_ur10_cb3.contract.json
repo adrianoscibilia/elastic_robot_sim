@@ -1,0 +1,21 @@
+{
+  "schema": "elastic_sim.identification/3",
+  "synthetic": true,
+  "robot": "ur10_cb3",
+  "n_dof": 6,
+  "joint_names": [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint"
+  ],
+  "differentiation": {
+    "rate": 125,
+    "sg_poly": 3,
+    "sg_window": 5,
+    "sg_cutoff_hz": 11.25
+  },
+  "note": "RR_08 synthetic reference pending Q-16; never certifies real data."
+}

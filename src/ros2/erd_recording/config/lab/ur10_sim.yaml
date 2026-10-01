@@ -1,0 +1,158 @@
+# erd.lab/1 -- UR10 CB3, URSim (L2).
+#
+# Exercises the real `ur_robot_driver` and the RTDE sidecar against URSim
+# (RR_01 S3.5/T1.8), not the real robot. `robot_ip`/`reverse_ip` below are
+# placeholders: URSim's actual container IP is only known once it's started
+# (`src/ros2/README.md`'s "Running URSim" section).
+#
+# RR_06 P3-1 item 11, live finding: passing the real values as `ros2 launch
+# erd_ur10 ur10.launch.py hardware:=ursim robot_ip:=<container IP>
+# reverse_ip:=<docker0 IP> headless_mode:=true` launch arguments overrides
+# them for `ur_control.launch.py`'s own driver connection *only* --
+# `record_*`'s own sidecar (`RecordingNode.start_sidecar`/
+# `check_sidecar_actual_q_alignment`) reads `connection.robot_ip` straight
+# from *this file*, which the launch arguments never touch (`record_*` is a
+# separate process/invocation with no visibility into what the launch was
+# given). Edit `robot_ip`/`reverse_ip` below to match the actual running
+# container (confirmed live: left at the placeholder, the sidecar's RTDE
+# `connect()` times out against a nonexistent host, and every run refuses at
+# preflight) -- use the exact same values passed to `ur10.launch.py` above,
+# not a separately-chosen pair, since both must point at the one container.
+schema: erd.lab/1
+robot: ur10_cb3
+hardware: ursim                         # mock | ursim | real
+operator: {confirm_each_trajectory: true}
+
+connection:
+  robot_ip: 192.168.56.101               # this session's URSim container IP (see header; re-check after any docker restart)
+  reverse_ip: 192.168.56.1               # this session's ursim_net gateway (see header)
+  headless_mode: true                   # L2 (RR_01 v3.1 S3.5): the driver sends its own program
+  kinematics_params_file: null          # T2.5: from ur_calibration; not needed for URSim
+  servoj_gain: 2000
+  servoj_lookahead_time: 0.03
+  rtde_frequency: 125
+  software_version: 3.15.8              # URSim's published tag (3.15.7 isn't published, RR_01 S3.5)
+  serial: "2017307500"                  # not meaningful for URSim; kept for shape parity
+  ros_domain_id: 87
+
+description:
+  sim_asset: ur10                        # the BARE asset (RR_04 A-6): planning, FK gate and baselines
+                                          # never use the `_table` variant, which is a different URDF root
+  joint_map:
+    shoulder_pan_joint: shoulder_pan_joint
+    shoulder_lift_joint: shoulder_lift_joint
+    elbow_joint: elbow_joint
+    wrist_1_joint: wrist_1_joint
+    wrist_2_joint: wrist_2_joint
+    wrist_3_joint: wrist_3_joint
+  base_frame: base_link
+  tool:
+    mass: 0.0
+    extra_collision: []
+
+limits:
+  reviewed: true
+  position:
+    shoulder_pan_joint: [-3.14, 3.14]
+    shoulder_lift_joint: [-3.14, 0.0]
+    elbow_joint: [-2.8, 2.8]
+    wrist_1_joint: [-3.14, 3.14]
+    wrist_2_joint: [-3.14, 3.14]
+    wrist_3_joint: [-3.14, 3.14]
+  velocity:
+    shoulder_pan_joint: 0.6
+    shoulder_lift_joint: 0.6
+    elbow_joint: 0.8
+    wrist_1_joint: 0.8
+    wrist_2_joint: 0.8
+    wrist_3_joint: 0.8
+  acceleration:
+    shoulder_pan_joint: 1.0
+    shoulder_lift_joint: 1.0
+    elbow_joint: 1.2
+    wrist_1_joint: 1.5
+    wrist_2_joint: 1.5
+    wrist_3_joint: 1.5
+  jerk:
+    shoulder_pan_joint: 15.0
+    shoulder_lift_joint: 15.0
+    elbow_joint: 15.0
+    wrist_1_joint: 15.0
+    wrist_2_joint: 15.0
+    wrist_3_joint: 15.0
+  effort:
+    shoulder_pan_joint: 330
+    shoulder_lift_joint: 330
+    elbow_joint: 150
+    wrist_1_joint: 56
+    wrist_2_joint: 56
+    wrist_3_joint: 56
+  approach: {velocity: 0.2, acceleration: 0.4}
+  abort: {tracking_rad: 0.05, torque_fraction: 0.8, stop_timeout_s: 3.0}
+
+scene:
+  reviewed: true
+  frame: base_link
+  clearance: 0.03
+  objects:
+    # A deliberately fake cell (there is none; L2 tests the driver/RTDE
+    # path, not scene fidelity), placed well clear of the robot's own reach
+    # so it never blocks a plan.
+    - {id: floor, type: floor, z: -0.9}
+    - {id: side_table, type: table, top_z: -0.5, centre_xy: [0.9, 0.9], size_xy: [0.4, 0.4], thickness: 0.05}
+    - {id: wall_behind, type: wall, point: [-1.2, 0.0, 0.0], normal: "-x", size: [3.0, 3.0], thickness: 0.2}
+  allowed_contacts: []
+
+poses:
+  home: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+  standstill:
+    - [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+    - [0.3, -1.3, 1.3, -1.5, -1.2, 0.3]
+    - [-0.3, -1.8, 1.7, -1.7, -1.8, -0.3]
+
+excitation:
+  trajectories: 2                       # small so an L2 acceptance run finishes in reasonable time
+  seed: 20261001
+  base_frequency: 0.1
+  n_periods: 1
+  n_harmonics: 5
+  velocity_fraction: 0.6
+  max_acceleration: 1.0
+  centre_jitter: 1.0
+  position_window: {}
+  candidates: 12
+  regime:
+    enabled: true
+    velocity_fraction: [0.5, 1.0]
+    max_acceleration: [0.5, 1.0]
+  probe:
+    enabled: false
+    from_training_config: null
+    acceleration_fraction: 0.2
+    budget: split
+  settle_s: 1.0
+  amplitude_ladder: [0.1, 0.25, 0.5, 1.0]
+
+identification:
+  sweep_speeds: [0.05, 0.1, 0.2, 0.35, 0.5, 0.7]
+  sweep_range:
+    shoulder_pan_joint: [-1.0, 1.0]
+    shoulder_lift_joint: [-1.0, -0.5]
+    elbow_joint: [1.0, 2.0]
+    wrist_1_joint: [-2.0, -1.0]
+    wrist_2_joint: [-2.0, -1.0]
+    wrist_3_joint: [-1.0, 1.0]
+  holdout: 2
+
+consumer:
+  repo: /home/adriano/projects/dynamic_model_nn
+  python: /home/adriano/projects/dynamic_model_nn/.venv/bin/python
+  reference_contract: ../reference/synthetic_ur10_cb3.contract.json
+  checkpoints: null
+
+recording:
+  output_root: /home/adriano/projects/erd_data
+  standstill_s: 5.0                     # shortened for a quick L2 pass; real runs use 30
+  pre_roll_s: 1.0
+  post_roll_s: 1.0
+  max_lost_fraction: 0.001

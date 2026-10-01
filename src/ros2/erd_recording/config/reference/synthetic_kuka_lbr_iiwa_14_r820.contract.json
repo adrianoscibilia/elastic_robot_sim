@@ -1,0 +1,22 @@
+{
+  "schema": "elastic_sim.identification/3",
+  "synthetic": true,
+  "robot": "kuka_lbr_iiwa_14_r820",
+  "n_dof": 7,
+  "joint_names": [
+    "iiwa_A1",
+    "iiwa_A2",
+    "iiwa_A3",
+    "iiwa_A4",
+    "iiwa_A5",
+    "iiwa_A6",
+    "iiwa_A7"
+  ],
+  "differentiation": {
+    "rate": 1000,
+    "sg_poly": 3,
+    "sg_window": 21,
+    "sg_cutoff_hz": 21.428571428571427
+  },
+  "note": "RR_08 synthetic reference pending Q-16; never certifies real data."
+}

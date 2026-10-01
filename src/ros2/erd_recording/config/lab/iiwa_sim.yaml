@@ -1,0 +1,143 @@
+# erd.lab/1 -- KUKA LBR iiwa 14 R820, `erd_fri_emulator` (L2).
+#
+# Exercises the real `erd_iiwa/FriPositionSystem` plugin, network path and
+# FRI timing against the emulator (RR_01 S3.5/T1.9), not the real robot.
+# `robot_ip` below is a placeholder: the emulator's actual container IP is
+# only known once it's started (`src/ros2/README.md`'s "Running L2" section,
+# `docker inspect erd_fri_emulator --format '{{.NetworkSettings.IPAddress}}'`)
+# -- pass it at launch (`ros2 launch erd_iiwa iiwa.launch.py hardware:=emulator
+# robot_ip:=<that address>`), which overrides this file's value; `record_iiwa`
+# itself doesn't start the plugin, only sends goals through it.
+schema: erd.lab/1
+robot: kuka_lbr_iiwa_14_r820
+hardware: emulator                      # mock | emulator | real
+operator: {confirm_each_trajectory: true}
+
+connection:
+  robot_ip: 172.17.0.2                  # placeholder: the emulator's docker0 container IP (see header)
+  client_ip: 172.17.0.1                 # placeholder: this host's docker0 bridge IP
+  fri_port: 30200
+  fri_send_period_ms: 1
+  sunrise_version: 1.11.0.7             # not meaningful for the emulator; kept for shape parity
+  ros_domain_id: 87                     # mock/emulator/ursim runs use 87 (real uses 0)
+
+description:
+  sim_asset: kuka_lbr_iiwa_14_r820        # the BARE asset (RR_04 A-6): planning, FK gate and baselines
+                                          # never use the `_table` variant, which is a different URDF root
+  joint_map: {joint_a1: iiwa_A1, joint_a2: iiwa_A2, joint_a3: iiwa_A3, joint_a4: iiwa_A4,
+              joint_a5: iiwa_A5, joint_a6: iiwa_A6, joint_a7: iiwa_A7}
+  base_frame: iiwa_base
+  tool:
+    mass: 0.0
+    extra_collision:
+      # Media Flange I-12 provisional envelope beyond the bare flange (T2.0).
+      - {shape: cylinder, height: 0.03, radius: 0.045, parent: iiwa_link_ee, xyz: [0, 0, 0.015], rpy: [0, 0, 0]}
+
+limits:
+  reviewed: true                        # mock/emulator never gates on this; kept true so the
+                                         # same file also exercises the reviewed-config path
+  position:
+    iiwa_A1: [-2.7, 2.7]
+    iiwa_A2: [-1.9, 1.9]
+    iiwa_A3: [-2.7, 2.7]
+    iiwa_A4: [-1.9, 1.9]
+    iiwa_A5: [-2.7, 2.7]
+    iiwa_A6: [-1.9, 1.9]
+    iiwa_A7: [-3.0, 3.0]
+  velocity:
+    iiwa_A1: 0.6
+    iiwa_A2: 0.6
+    iiwa_A3: 0.6
+    iiwa_A4: 0.6
+    iiwa_A5: 0.8
+    iiwa_A6: 0.8
+    iiwa_A7: 0.8
+  acceleration:
+    iiwa_A1: 1.5
+    iiwa_A2: 1.5
+    iiwa_A3: 1.5
+    iiwa_A4: 1.5
+    iiwa_A5: 2.0
+    iiwa_A6: 2.0
+    iiwa_A7: 2.0
+  jerk:
+    iiwa_A1: 20.0
+    iiwa_A2: 20.0
+    iiwa_A3: 20.0
+    iiwa_A4: 20.0
+    iiwa_A5: 20.0
+    iiwa_A6: 20.0
+    iiwa_A7: 20.0
+  effort:
+    iiwa_A1: 320
+    iiwa_A2: 320
+    iiwa_A3: 176
+    iiwa_A4: 176
+    iiwa_A5: 110
+    iiwa_A6: 40
+    iiwa_A7: 40
+  approach: {velocity: 0.2, acceleration: 0.4}
+  abort: {tracking_rad: 0.05, torque_fraction: 0.8, stop_timeout_s: 3.0}
+
+scene:
+  reviewed: true                        # fake scene, but internally consistent -- reviewed
+                                         # here means "matches this (fake) cell", not "is real"
+  frame: iiwa_base
+  clearance: 0.03
+  objects:
+    # A deliberately fake cell (there is none; L2 tests the network/FRI/
+    # session-state path, not scene fidelity), placed well clear of the
+    # robot's own reach so it never blocks a plan.
+    - {id: floor, type: floor, z: -0.9}
+    - {id: side_table, type: table, top_z: -0.5, centre_xy: [0.9, 0.9], size_xy: [0.4, 0.4], thickness: 0.05}
+    - {id: wall_behind, type: wall, point: [-1.2, 0.0, 0.0], normal: "-x", size: [3.0, 3.0], thickness: 0.2}
+  allowed_contacts: []
+
+poses:
+  home: [0.0, 0.3, 0.0, -1.2, 0.0, 0.8, 0.0]
+  standstill:
+    - [0.0, 0.3, 0.0, -1.2, 0.0, 0.8, 0.0]
+    - [0.5, 0.2, 0.3, -1.0, 0.2, 0.9, 0.3]
+    - [-0.5, 0.4, -0.3, -1.4, -0.2, 0.7, -0.3]
+
+excitation:
+  trajectories: 2                       # small so an L2 acceptance run finishes in reasonable time
+  seed: 20261001
+  base_frequency: 0.1
+  n_periods: 1
+  n_harmonics: 5
+  velocity_fraction: 0.6
+  max_acceleration: 1.5
+  centre_jitter: 1.0
+  position_window: {}
+  candidates: 12
+  regime:
+    enabled: true
+    velocity_fraction: [0.5, 1.0]
+    max_acceleration: [0.5, 1.0]
+  probe:
+    enabled: false
+    from_training_config: null
+    acceleration_fraction: 0.2
+    budget: split
+  settle_s: 1.0
+  amplitude_ladder: [0.1, 0.25, 0.5, 1.0]
+
+identification:
+  sweep_speeds: []
+  sweep_range: {}
+  holdout: 2
+
+consumer:
+  repo: /home/adriano/projects/dynamic_model_nn
+  python: /home/adriano/projects/dynamic_model_nn/.venv/bin/python   # confirmed consumer env, Python 3.11 (RR_04 S5)
+  # RR_08 synthetic reference pending Q-16; validation remains synthetic.
+  reference_contract: ../reference/synthetic_kuka_lbr_iiwa_14_r820.contract.json
+  checkpoints: null
+
+recording:
+  output_root: /home/adriano/projects/erd_data
+  standstill_s: 5.0                     # shortened for a quick L2 pass; real runs use 30
+  pre_roll_s: 1.0
+  post_roll_s: 1.0
+  max_lost_fraction: 0.001

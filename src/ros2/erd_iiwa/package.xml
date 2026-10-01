@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>erd_iiwa</name>
+  <version>0.1.0</version>
+  <description>
+    iiwa FRI hardware plugin (erd_iiwa/FriPositionSystem, POSITION mode, RR_01
+    S3.3), description overlay, controllers and launch. Reads the bundled FRI
+    1.11 SDK from the pinned iiwa_ros2 checkout at build time
+    (ERD_FRI_SDK_ROOT); never vendors it.
+  </description>
+  <maintainer email="adriano.scibilia@cnr.it">adriano</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>controller_manager</depend>
+  <depend>joint_state_broadcaster</depend>
+  <depend>joint_trajectory_controller</depend>
+  <depend>iiwa_description</depend>
+  <depend>xacro</depend>
+  <depend>robot_state_publisher</depend>
+
+  <exec_depend>mock_components</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <!-- RR_04 C-1: ament_lint_common's flake8/pep257 default configs assume
+       ROS 2's own Python style (single quoted strings, D2xx docstring
+       shape); this repo's established convention, used by every existing
+       Python module under src/ros2 and src/elastic_sim, is double quoted
+       strings and free form module docstrings instead. ament_copyright's
+       checker only recognises the classic Apache-2.0 boilerplate block, not
+       the "SPDX-License-Identifier: Apache-2.0" line every file in this
+       package (and erd_fri_emulator, which never ran ament_lint_auto at
+       all) already carries; pasting the full legal paragraph into every
+       small file would be a regression from that deliberate, modern
+       convention, not a fix. Depending on the individual lint packages, not
+       the ament_lint_common aggregate, keeps the checks that are genuinely
+       about correctness and consistency (cppcheck, cpplint, lint_cmake,
+       uncrustify, xmllint) without the other two false positives. -->
+  <test_depend>ament_cmake_cppcheck</test_depend>
+  <test_depend>ament_cmake_cpplint</test_depend>
+  <test_depend>ament_cmake_lint_cmake</test_depend>
+  <test_depend>ament_cmake_uncrustify</test_depend>
+  <test_depend>ament_cmake_xmllint</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

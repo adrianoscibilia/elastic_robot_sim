@@ -1,0 +1,30 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # Hz; paced by the FRI blocking receive on emulator/real (RR_01 S3.3)
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    erd_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+erd_arm_controller:
+  ros__parameters:
+    joints:
+      - joint_a1
+      - joint_a2
+      - joint_a3
+      - joint_a4
+      - joint_a5
+      - joint_a6
+      - joint_a7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    interpolation_method: splines
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 1.0

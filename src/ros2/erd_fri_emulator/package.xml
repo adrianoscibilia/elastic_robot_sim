@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>erd_fri_emulator</name>
+  <version>0.1.0</version>
+  <description>
+    L2 iiwa simulator: the Sunrise/robot side of FRI 1.11 over UDP (RR_01
+    S3.5), for testing erd_iiwa/FriPositionSystem's real driver path without
+    the robot. Reads the bundled FRI 1.11 message definitions from the
+    pinned iiwa_ros2 checkout at build time (ERD_FRI_SDK_ROOT); never
+    vendors it. No ROS dependency beyond the build (plain UDP, no rclcpp).
+  </description>
+  <maintainer email="adriano.scibilia@cnr.it">adriano</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>pinocchio</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
