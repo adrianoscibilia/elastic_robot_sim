@@ -16,6 +16,8 @@
   <buildtool_depend>ament_cmake_python</buildtool_depend>
 
   <depend>hardware_interface</depend>
+  <depend>controller_interface</depend>
+  <depend>control_msgs</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>

@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <set>
+#include "rclcpp/rclcpp.hpp"
 
 #include "pluginlib/class_list_macros.hpp"
 
@@ -70,6 +71,7 @@ std::vector<hardware_interface::StateInterface> FriPositionSystem::export_state_
   result.emplace_back("fri", "operation_mode", &fri_operation_mode_);
   result.emplace_back("fri", "drive_state", &fri_drive_state_);
   result.emplace_back("fri", "cycle", &fri_cycle_);
+  result.emplace_back("fri", "received_cycle", &fri_received_cycle_);
   return result;
 }
 
@@ -120,6 +122,8 @@ hardware_interface::return_type FriPositionSystem::read(
     // to arrive at all): invalidate and tell the controller manager, so it
     // deactivates the JTC instead of holding/extrapolating a stale setpoint
     // (RR_04 A-4).
+    RCLCPP_ERROR(rclcpp::get_logger("erd_fri"),
+      "FRI read ERROR at received cycle %.0f", fri_received_cycle_);
     invalidate();
     return hardware_interface::return_type::ERROR;
   }
@@ -156,6 +160,7 @@ hardware_interface::return_type FriPositionSystem::read(
   fri_drive_state_ = static_cast<double>(sample.drive_state);
   // Remote packet sequence, not successful read count: lost packets remain visible.
   fri_cycle_ = static_cast<double>(sample.sequence_counter);
+  fri_received_cycle_ += 1.0;
   return hardware_interface::return_type::OK;
 }
 

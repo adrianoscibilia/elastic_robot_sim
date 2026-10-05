@@ -159,3 +159,43 @@ protective stop, an FRI drop, a speed-scaling dip, or torque above
   unit-tested this pass.
 * No PREEMPT_RT kernel on this laptop; 1 kHz jitter under real load is
   unmeasured.
+
+## Pass-4 recording details
+
+The iiwa driver uses the controller manager's blocking-read timing mode:
+FRI packets pace the loop. A second periodic sleep causes a receive backlog.
+The recording broadcaster buffers up to 8,192 hardware samples before DDS
+publication; queue overflow is an error. The standard joint-state broadcaster
+continues publishing `/joint_states` for TF. `fri/cycle` is the remote packet
+sequence and `fri/received_cycle` counts local reads, so the converter can
+distinguish FRI loss from publication/recording loss. An excitation containing
+missing cycles is excluded; its counters remain in `validation.json`.
+
+The FRI receive deadline is 20 ms. After a read error the controller manager
+must deactivate the trajectory controller within two control cycles. Stop
+confirmation additionally requires 0.5 s of fresh stationary telemetry; a
+stale cached velocity cannot confirm a stop.
+
+Until Q-16 supplies training references, the checked-in
+`config/reference/synthetic_<robot>.contract.json` files provide the robot's
+joint order and differentiation settings. Conversion records
+`reference_synthetic: true`, and validation remains `synthetic`, including
+when a synthetic reference is explicitly used with a real recording. These
+references do not establish identification validity or real-robot sign-off.
+Real-data parquet signals retain float64 precision so the recorded positions
+and their declared derivatives remain consistent after writing the file.
+
+The monitor's own joint-state/controller-state samples are served by a
+dedicated executor thread (`_MonitorFeed`), not by this process's main
+poll loop, so a busy main thread can never leave them stale at the iiwa's
+1 kHz (RR_08 S2c). This has not been re-measured live against the
+emulator this pass; re-run the P4 item 7 latency/cancel-latency check
+before relying on the numbers.
+
+To script the speed-scaling abort on URSim (RR_08 S2d, P4 item 9) instead
+of operating the pendant by hand, run `ros2 run erd_ur10
+speed_slider_abort --robot-ip <ip> --delay-s <seconds into the excitation>
+--fraction 0.5` alongside `record_ur10`; it opens a third, input-only RTDE
+connection and expects the live monitor to abort once `speed_scaling` drops
+below `safety.SPEED_SCALING_FLOOR` (0.999). Not yet run against a live
+URSim this pass.

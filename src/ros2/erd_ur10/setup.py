@@ -23,6 +23,7 @@ setup(
     entry_points={
         "console_scripts": [
             "rtde_logger = erd_ur10.rtde_logger:main",
+            "speed_slider_abort = erd_ur10.speed_slider_abort:main",
         ],
     },
 )

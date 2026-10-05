@@ -133,7 +133,7 @@ _IIWA_JOINT_INTERFACES = {
 }
 _IIWA_FRI_GPIO = ("time_sec", "time_nsec", "sample_time", "session_state", "command_mode",
                   "connection_quality", "tracking_performance", "safety_state", "operation_mode",
-                  "drive_state", "cycle")
+                  "drive_state", "cycle", "received_cycle")
 
 
 def build_iiwa_raw_frame(
@@ -199,3 +199,20 @@ def prepare_iiwa_conversion(config, run_dir: Path) -> None:
         events.append({"stamp_ns": stamp, "segment_id": event.segment_id, "kind": event.kind,
                        "plan_digest": event.plan_digest})
     (run_dir / "events.json").write_text(json.dumps(events, indent=2))
+
+
+def iiwa_cycle_health(frame: pd.DataFrame) -> dict[str, Any]:
+    """Distinguish remote packet loss from losses after the hardware read."""
+    cycles = frame['fri_cycle'].to_numpy(dtype=float)
+    remote = np.diff(cycles)
+    # FRI sequence is uint32. Its wrap is not a lost or reordered cycle.
+    remote[remote < -(2**31)] += 2**32
+    finite = bool(np.isfinite(remote).all())
+    lost = int(np.maximum(remote - 1, 0).sum()) if finite else -1
+    result = {'ok': finite and bool(np.all(remote == 1)), 'lost_cycles': lost,
+              'duplicates': int(np.sum(remote == 0)), 'reordered': int(np.sum(remote < 0))}
+    if 'fri_received_cycle' in frame and frame['fri_received_cycle'].notna().all():
+        received = np.diff(frame['fri_received_cycle'].to_numpy(dtype=float))
+        result['lost_fri_cycles'] = int(np.maximum(remote - received, 0).sum())
+        result['lost_publication_cycles'] = int(np.maximum(received - 1, 0).sum())
+    return result

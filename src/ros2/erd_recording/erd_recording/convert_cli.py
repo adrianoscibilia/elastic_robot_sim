@@ -5,12 +5,8 @@ Run as a subprocess from :mod:`erd_recording.pipeline` with
 ``plan_cli`` is (T1.0/T1.6): :func:`erd_recording.contract.real_baselines`
 and the sign-convention gravity fit both import Pinocchio (RR_04 A-8).
 
-**iiwa only, this pass.** The UR10 path additionally needs the RTDE parquet
-merged into the raw frame and a completed ``identify`` stage (E-ur-1's
-``K_tau``/E-ur-3's motor-side fit in ``identification.json``) before
-``ur10_dataset_frame`` has anything to call -- neither is wired up yet
-(RR_05 says so explicitly; `--robot ur10_cb3` raises ``NotImplementedError``
-naming exactly what's missing, rather than silently producing a wrong file).
+The UR10 path requires the exact-position-aligned RTDE raw frame and the
+recorded E-ur-1/3 results in ``identification.json``.
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ from .env_guard import assert_environment
 
 assert_environment(require_ros=False, require_pinocchio=True)
 
-from .bagio import build_iiwa_raw_frame, find_segment_start, read_bag_topic  # noqa: E402
+from .bagio import build_iiwa_raw_frame, find_segment_start, read_bag_topic, iiwa_cycle_health  # noqa: E402
 from .config import LabConfig, load_lab_config  # noqa: E402
 from .contract import differentiation_from_reference, load_reference, real_baselines, real_contract, write_real_contract  # noqa: E402
 from .convert import iiwa_dataset_frame  # noqa: E402
@@ -134,12 +130,15 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract_path: str
         else:
             window = window.drop_duplicates("fri_cycle").copy()
             cycles = window["fri_cycle"].to_numpy()
-            lost = int(np.maximum(np.diff(cycles) - 1, 0).sum())
+            health = iiwa_cycle_health(window)
+            lost = health["lost_cycles"] if health["ok"] else max(1, health["lost_cycles"])
             # Robot sequence supplies the uniform sampling grid. Wall-clock
             # FRI timestamps remain in raw.parquet for jitter diagnosis.
             window["t"] = (cycles - cycles[0]) / config.rate_hz
         segment_checks[segment.segment_id] = {"ok": lost == 0, "lost_cycles": lost,
                                                "samples": len(window)}
+        if config.hardware != "mock":
+            segment_checks[segment.segment_id].update(health)
         if lost:
             continue
         window["bag"] = segment.segment_id
@@ -238,11 +237,8 @@ def main(argv: list[str] | None = None) -> int:
     if config.robot == "kuka_lbr_iiwa_14_r820":
         result = _convert_iiwa(config, Path(args.run_dir), reference_contract)
     else:
-        raise NotImplementedError(
-            "convert_cli: UR10 needs the RTDE parquet merged into the raw frame and a completed "
-            "`identify` stage (K_tau/motor-side fit) before ur10_dataset_frame has inputs -- neither "
-            "is wired up yet (RR_05)."
-        )
+        from .ur_convert import convert_ur
+        result = convert_ur(config, Path(args.run_dir), reference_contract)
     print(json.dumps(result))
     return 0 if result["ok"] else 1
 

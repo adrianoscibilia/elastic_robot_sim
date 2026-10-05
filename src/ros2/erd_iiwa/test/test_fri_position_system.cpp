@@ -53,8 +53,8 @@ TEST(FriPositionSystem, ExportsEveryStateAndCommandInterface)
            hardware_interface::SystemInterface::CallbackReturn::SUCCESS);
   auto states = system.export_state_interfaces();
   auto commands = system.export_command_interfaces();
-  // 7 joints x 7 state interfaces + 11 GPIO "fri" interfaces.
-  EXPECT_EQ(states.size(), 7u * 7u + 11u);
+  // 7 joints x 7 state interfaces + 12 GPIO "fri" interfaces.
+  EXPECT_EQ(states.size(), 7u * 7u + 12u);
   EXPECT_EQ(commands.size(), 7u);
 }
 

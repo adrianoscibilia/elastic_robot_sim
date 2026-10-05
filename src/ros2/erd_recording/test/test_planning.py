@@ -134,6 +134,9 @@ def test_standstill_segments_round_trip_through_load_plan(config, tmp_path):
     assert [s.segment_id for s in reloaded.standstill_segments] == \
         [s.segment_id for s in bundle.standstill_segments]
     assert [s.digest for s in reloaded.standstill_segments] == [s.digest for s in bundle.standstill_segments]
+    assert [s.digest for s in reloaded.identify_segments] == [s.digest for s in bundle.identify_segments]
+    assert len([s for s in reloaded.identify_segments if s.kind == 'identify_hold']) == 3
+    assert len([s for s in reloaded.identify_segments if s.kind == 'identify_excitation']) == 1
 
 
 def test_approach_segment_starts_and_ends_at_rest():

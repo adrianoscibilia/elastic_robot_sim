@@ -80,7 +80,9 @@ void ErdFriClientImpl::set_target_position(const std::array<double, kNumJoints> 
 }
 
 ErdFriClient::ErdFriClient()
-: app_(connection_, client_) {}
+// Bound a lost peer without treating ordinary non-RT scheduling jitter as loss.
+// ERROR-to-controller-deactivation is separately bounded by controller_manager.
+: connection_(20), app_(connection_, client_) {}
 
 bool ErdFriClient::connect(int port, const char * remote_host)
 {

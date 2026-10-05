@@ -239,3 +239,19 @@ def test_identify_motor_side_fixes_unidentifiable_joints_at_the_prior(ur10_asset
     assert np.allclose(fit.j_m[identifiable], true_j_m[identifiable], rtol=0.01)
     assert np.allclose(fit.viscous, true_viscous, rtol=0.01)
     assert np.allclose(fit.coulomb, true_coulomb, rtol=0.01)
+
+
+def test_motor_fit_with_independent_sweep_friction(ur10_asset, synthetic_motion):
+    from erd_recording.identification import friction_torque
+    pin, model, data, q, dq, ddq = synthetic_motion
+    prior = np.array([4.,4.,1.7,.5,.5,.5])
+    parameters = {key: np.full(6,value) for key,value in
+                  [('viscous',.4),('coulomb',1.),('stribeck',.2),('stribeck_velocity',.1)]}
+    rigid = np.asarray([idn.inverse_dynamics(pin,model,data,qq,vv,aa) for qq,vv,aa in zip(q,dq,ddq)])
+    torque = rigid + prior * ddq + friction_torque(dq,parameters)
+    heldout = np.arange(len(q)) % 5 == 0
+    fit = identify_motor_side(ur10_asset,q,dq,ddq,torque,np.ones(6),holdout_mask=heldout,
+                              rotor_inertia_nominal=prior,friction_parameters=parameters)
+    assert fit.holdout_rms < 1e-6
+    assert np.allclose(fit.j_m,prior,rtol=.01)
+    assert np.array_equal(fit.stribeck,parameters['stribeck'])

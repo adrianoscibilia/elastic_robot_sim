@@ -50,6 +50,11 @@ def _launch_setup(context, *args, **kwargs):
     controllers_yaml = str(Path(get_package_share_directory("erd_iiwa")) / "config" / "controllers.yaml")
 
     controller_manager_parameters = [{"robot_description": urdf_xml}, controllers_yaml]
+    if hardware != "mock":
+        controller_manager_parameters.append({
+            "hardware_synchronization.expect_blocking_read_write": True,
+            "hardware_synchronization.minimum_cycle_time": 0.00001,
+        })
     if lab_config_path:
         # RR_04 A-5: per-joint path/goal tolerances from limits.abort.tracking_rad,
         # generated fresh from whichever lab config this run uses -- never
@@ -80,6 +85,7 @@ def _launch_setup(context, *args, **kwargs):
     controller_manager = Node(
         package="controller_manager", executable="ros2_control_node", output="screen",
         parameters=controller_manager_parameters,
+        remappings=[("/joint_state_broadcaster/joint_states", "/joint_states")],
     )
     joint_state_broadcaster_spawner = Node(
         package="controller_manager", executable="spawner", arguments=["joint_state_broadcaster"],
@@ -93,7 +99,11 @@ def _launch_setup(context, *args, **kwargs):
     arm_controller_spawner = Node(
         package="controller_manager", executable="spawner", arguments=arm_controller_args,
     )
-    return [robot_state_publisher, controller_manager, joint_state_broadcaster_spawner, arm_controller_spawner]
+    recording_spawner = Node(
+        package="controller_manager", executable="spawner", arguments=["erd_state_broadcaster"],
+    )
+    return [robot_state_publisher, controller_manager, joint_state_broadcaster_spawner,
+            recording_spawner, arm_controller_spawner]
 
 
 def generate_launch_description() -> LaunchDescription:

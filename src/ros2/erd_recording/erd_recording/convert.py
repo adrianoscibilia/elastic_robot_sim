@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
 
-from .identification import MotorSideFit
+from .identification import MotorSideFit, friction_torque
 
 
 def _prefixed(frame: pd.DataFrame, prefix: str, n_dof: int) -> np.ndarray:
@@ -67,7 +67,9 @@ def ur10_dataset_frame(
         index = group.index
         dq_bag = _prefixed(group, "dq", n_dof)
         ddq[index] = savgol_filter(dq_bag, int(sg_window), int(sg_poly), deriv=1, delta=time_step, axis=0, mode="interp")
-    friction = motor_fit.viscous[None, :] * dq + motor_fit.coulomb[None, :] * np.tanh(dq / epsilon)
+    friction = friction_torque(dq, {'viscous': motor_fit.viscous, 'coulomb': motor_fit.coulomb,
+                                  'stribeck': motor_fit.stribeck,
+                                  'stribeck_velocity': motor_fit.stribeck_velocity}, epsilon)
     ft = k_tau[None, :] * i_act - motor_fit.j_m[None, :] * ddq - friction
     _assign_prefixed(frame, "ft", ft)
     return frame

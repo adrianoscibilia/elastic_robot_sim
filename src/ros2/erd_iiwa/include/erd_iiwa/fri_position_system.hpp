@@ -94,6 +94,7 @@ private:
   double fri_operation_mode_{0.0};
   double fri_drive_state_{0.0};
   double fri_cycle_{0.0};
+  double fri_received_cycle_{0.0};
 
   void invalidate();
 };

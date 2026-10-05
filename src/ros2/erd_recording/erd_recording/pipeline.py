@@ -11,8 +11,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -30,6 +31,8 @@ assert_environment(require_ros=True, require_pinocchio=False)
 
 import rclpy  # noqa: E402
 from rclpy.action import ActionClient  # noqa: E402
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup  # noqa: E402
+from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy  # noqa: E402
 from rclpy.time import Time  # noqa: E402
@@ -267,6 +270,56 @@ def _first_point_by_driver_name(
 # ---------------------------------------------------------------------------
 
 
+class _MonitorFeed(Node):
+    """RR_08 S2c: the monitor's two depth-1 subscriptions (joint state,
+    controller state), serviced by a dedicated ``MultiThreadedExecutor``
+    thread so a busy main thread can never leave them stale.
+
+    This has to be a **second node**, not a second callback group on
+    ``RecordingNode`` spun from the same thread: ``rclpy.spin_once(node,
+    ...)`` adds ``node`` to rclpy's global executor on every call
+    (``Node.executor`` is a single slot -- assigning it evicts the node
+    from whatever executor held it before, see ``rclpy.node.Node.executor``'s
+    setter), which would silently tear this down again on the very next
+    poll-loop iteration if it shared ``RecordingNode``'s own node object.
+
+    RR_06 P3-2a found that a dedicated *timer* inside the same
+    single-threaded poll loop starved this exact data (``spin_once``
+    services one ready entity per call, and the timer -- always overdue
+    after any blocking pause -- kept winning). A genuinely separate
+    executor thread does not share that failure mode: it keeps servicing
+    its own (tiny, two-subscription) wait set on its own schedule
+    regardless of what the main thread's `spin_once` is doing.
+    """
+
+    def __init__(self, profile: RobotProfile, on_joint_state: Any, on_controller_state: Any):
+        super().__init__("erd_recording_monitor_feed")
+        group = MutuallyExclusiveCallbackGroup()
+        reliable_latest = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST, depth=1,
+        )
+        self.create_subscription(
+            DynamicJointState, profile.joint_state_topic, on_joint_state, reliable_latest,
+            callback_group=group,
+        )
+        self.create_subscription(
+            JointTrajectoryControllerState, f"/{profile.controller_name}/controller_state",
+            on_controller_state, reliable_latest, callback_group=group,
+        )
+        self._executor = MultiThreadedExecutor(num_threads=2)
+        self._executor.add_node(self)
+        self._thread = threading.Thread(
+            target=self._executor.spin, name="erd_monitor_feed_executor", daemon=True,
+        )
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(timeout_sec=1.0)
+        self._thread.join(timeout=2.0)
+        self._executor.remove_node(self)
+        self.destroy_node()
+
+
 class RecordingNode(Node):
     def __init__(self, profile: RobotProfile, config: LabConfig):
         super().__init__("erd_recording_pipeline")
@@ -275,24 +328,6 @@ class RecordingNode(Node):
         self.abort_requested = False  # set by the SIGINT/SIGTERM handler in _run_all
         reliable_deep = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST, depth=2000,
-        )
-        # RR_06 P3-2a: the monitor's own subscription, separate from the
-        # logging one below, KEEP_LAST depth 1 -- the DDS layer then always
-        # hands the monitor callback the newest sample available at the time
-        # it runs, regardless of how backlogged the (depth-2000) logging
-        # subscription on the same topic might be.
-        #
-        # **Live finding (RR_06 P3-1 item 2):** evaluation itself is *not*
-        # on a separate timer/callback group, despite RR_06 naming that as
-        # an option -- a dedicated 500 Hz timer, tried first, starved this
-        # exact subscription once enough other entities were active during
-        # a real goal (`rclpy`'s single-threaded `spin_once` services one
-        # ready entity per call; the timer, always overdue after any
-        # blocking pause, kept winning). See `send_goal_and_wait`'s own
-        # docstring. A single default callback group and inline evaluation,
-        # once per poll-loop iteration, has nothing left to starve.
-        reliable_latest = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST, depth=1,
         )
         self._event_pub = self.create_publisher(RunEvent, "/erd/events", 10)
 
@@ -305,18 +340,15 @@ class RecordingNode(Node):
         self._logging_joint_state_sub = self.create_subscription(
             DynamicJointState, profile.joint_state_topic, self._on_logging_joint_state, reliable_deep,
         )
-        # Monitor-only: always kept fresh, independent of `_logging` (also the
-        # source for `measured_positions`/`measured_velocities`/the FRI fields,
-        # used outside motion too, e.g. preflight's home/still check).
-        self._monitor_joint_state_sub = self.create_subscription(
-            DynamicJointState, profile.joint_state_topic, self._on_monitor_joint_state, reliable_latest,
-        )
 
         self._latest_controller_state: JointTrajectoryControllerState | None = None
-        self._controller_state_sub = self.create_subscription(
-            JointTrajectoryControllerState, f"/{profile.controller_name}/controller_state",
-            self._on_controller_state, reliable_latest,
-        )
+        # RR_08 S2c: the monitor's own joint-state/controller-state samples
+        # -- always kept fresh, independent of `_logging` (also the source
+        # for `measured_positions`/`measured_velocities`/the FRI fields,
+        # used outside motion too, e.g. preflight's home/still check) --
+        # come from `_MonitorFeed`'s dedicated executor thread, not a
+        # subscription on this node (see its docstring for why).
+        self._monitor_feed = _MonitorFeed(profile, self._on_monitor_joint_state, self._on_controller_state)
 
         self._speed_scaling: float | None = None
         self._robot_mode_running: bool | None = None
@@ -370,6 +402,10 @@ class RecordingNode(Node):
         self._bag_stdout_file = None
         self._bag_stderr_file = None
         self._sidecar_process: subprocess.Popen | None = None
+
+    def destroy_node(self) -> None:
+        self._monitor_feed.shutdown()
+        super().destroy_node()
 
     # -- subscriptions ----------------------------------------------------
 
@@ -693,12 +729,21 @@ class RecordingNode(Node):
         serviced again, which starved the timer's own inputs in turn: a
         self-inflicted, silent deadlock the mock run exposed only once a
         goal was actually outstanding. Evaluating inline, once per iteration
-        of this already-tight poll loop, has no second entity to starve
-        anything with; it is driven directly by whichever entity
-        ``spin_once`` just serviced, including the monitor's own dedicated
-        depth-1 subscription (still separate from the logging one, and the
-        age is still computed from the header stamp, not receipt time --
-        both still fixed).
+        of this already-tight poll loop, kept that timer's failure mode from
+        recurring; it is driven directly by whichever entity ``spin_once``
+        just serviced.
+
+        **RR_08 S2c:** at the iiwa's 1 kHz, measured p99 lag was 9.18 ms at
+        125 Hz already (RR_07), close enough to the 10 ms budget that more
+        100+ Hz competing entities crowding the same single-threaded
+        ``spin_once`` were expected to push it over. The sample this loop
+        evaluates (``build_monitor_sample``, reading
+        ``_latest_joint_state``/``_latest_controller_state``) no longer
+        depends on this loop's own ``spin_once`` ever servicing those two
+        subscriptions at all -- `_MonitorFeed` keeps them fresh from its own
+        executor thread regardless of what else this loop is doing. The age
+        is still computed from the header stamp, not receipt time (both
+        still fixed by RR_06).
         """
         if not self._action_client.wait_for_server(timeout_sec=10.0):
             return {"ok": False, "reason": "action server not available"}
@@ -787,19 +832,23 @@ class RecordingNode(Node):
         return {"ok": False, "reason": reason, "stop_confirmed": stop_confirmed}
 
     def wait_for_stationary(self, *, duration_s: float, velocity_tolerance: float, timeout_s: float) -> bool:
-        deadline = time.time() + timeout_s
-        stationary_since: float | None = None
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        stationary_since_ns = None
+        while time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.02)
             velocities = self.measured_velocities()
-            still = bool(velocities) and all(abs(v) < velocity_tolerance for v in velocities.values())
+            age = self._sample_age_s()
+            still = (age is not None and 0 <= age < STALE_SAMPLE_BUDGET_S and bool(velocities)
+                     and all(np.isfinite(v) and abs(v) < velocity_tolerance for v in velocities.values()))
             if still:
-                if stationary_since is None:
-                    stationary_since = time.time()
-                if time.time() - stationary_since >= duration_s:
+                stamp = self._latest_joint_state_stamp
+                stamp_ns = stamp.sec * 10**9 + stamp.nanosec
+                if stationary_since_ns is None:
+                    stationary_since_ns = stamp_ns
+                if (stamp_ns - stationary_since_ns) * 1e-9 >= duration_s:
                     return True
             else:
-                stationary_since = None
+                stationary_since_ns = None
         return False
 
     # -- bag lifecycle (RR_04 A-11) ----------------------------------------
@@ -1112,6 +1161,8 @@ def stage_standstill(
 
     node.start_bag(paths.standstill_bag_dir)
     try:
+        if not node.wait_for_stationary(duration_s=0.5, velocity_tolerance=0.01, timeout_s=5.0):
+            raise PipelineError("standstill refused: fresh stationary joint states unavailable")
         for index in range(len(config.poses.standstill)):
             approach = bundle.segment(f"standstill_approach_{index}")
             first_point = _first_point_by_driver_name(approach.trajectory, driver_joint_order, sim_to_driver)
@@ -1157,7 +1208,7 @@ def stage_standstill(
 #: `planning.build_ladder_segments` when `plan` was given `--ladder`, never
 #: mixed with the full-scale kinds in the same `run`.
 _COMMISSIONING_KINDS = frozenset({"approach_commissioning", "excitation_commissioning", "return_commissioning"})
-_EXCITATION_KINDS = frozenset({"excitation", "excitation_commissioning"})
+_EXCITATION_KINDS = frozenset({"excitation", "excitation_commissioning", "identify_excitation", "identify_sweep"})
 
 
 def _select_segments(bundle: PlanBundle, *, ladder: bool, only: frozenset[str] | None) -> list[PlanSegment]:
@@ -1222,6 +1273,8 @@ def stage_run(node: RecordingNode, config: LabConfig, paths: RunPaths, bundle: P
         node.start_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
     completed_segments: list[str] = []
     try:
+        if not node.wait_for_stationary(duration_s=0.5, velocity_tolerance=0.01, timeout_s=5.0):
+            raise PipelineError("run refused: fresh stationary joint states unavailable")
         for segment in segments_to_run:
             first_point = _first_point_by_driver_name(segment.trajectory, driver_joint_order, sim_to_driver)
             guard = check_start_state(node.measured_positions(), first_point)
@@ -1263,6 +1316,34 @@ def cancel_and_stop(node: RecordingNode, paths: RunPaths, *, reason: str) -> Non
     _write_manifest_status(paths, "failed", reason=reason)
 
 
+def stage_identify(node, config, config_path, paths, bundle, sim_to_driver, driver_joint_order, *, no_confirm=False):
+    if not bundle.identify_segments:
+        raise PipelineError("identify refused: rebuild the plan to freeze identification segments")
+    recording = RunPaths(paths.root / "identification")
+    recording.root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(paths.root / "preflight.json", recording.root / "preflight.json")
+    identification_bundle = replace(bundle, segments=bundle.identify_segments, standstill_segments=(), identify_segments=())
+    result = stage_run(node, config, recording, identification_bundle, sim_to_driver, driver_joint_order,
+                       no_confirm=no_confirm)
+    if not result['ok']:
+        _write_manifest_status(paths, "failed", identification=result)
+        raise PipelineError(f"identify failed: {result}")
+    _prepare_conversion(config, recording.root)
+    subprocess.run([sys.executable, '-m', 'erd_recording.identify_cli', '--config', config_path,
+                    '--run-dir', str(paths.root)], check=True, env=clean_ros_subprocess_env())
+    _write_manifest_status(paths, 'planned', identification_completed=True)
+    return result
+
+
+def _prepare_conversion(config, root):
+    if config.robot == 'ur10_cb3':
+        from .ur_bagio import prepare_ur_conversion
+        prepare_ur_conversion(config, root)
+    else:
+        from .bagio import prepare_iiwa_conversion
+        prepare_iiwa_conversion(config, root)
+
+
 # ---------------------------------------------------------------------------
 # `convert` / `validate` / `report`
 # ---------------------------------------------------------------------------
@@ -1272,9 +1353,7 @@ def stage_convert(config: LabConfig, config_path: str, paths: RunPaths, *, refer
     """Run ``convert_cli`` as a subprocess with a cleaned environment (RR_04
     A-8: like ``plan``, it imports Pinocchio for the baselines/sign-convention
     gravity fit -- T1.0/T1.6's LD_LIBRARY_PATH conflict)."""
-    if config.robot == "kuka_lbr_iiwa_14_r820":
-        from .bagio import prepare_iiwa_conversion
-        prepare_iiwa_conversion(config, paths.root)
+    _prepare_conversion(config, paths.root)
     reference = reference_contract or config.consumer.reference_contract
     command = [sys.executable, "-m", "erd_recording.convert_cli", "--config", config_path,
               "--run-dir", str(paths.root)]
@@ -1347,7 +1426,7 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
     paths = make_run_dir(config, run_id=args.run_id)
     sim_to_driver = config.description.sim_to_driver()
 
-    stages = ["plan", "preflight", "standstill", "run", "convert", "validate", "report"] \
+    stages = ["plan", "preflight", "standstill", "identify", "run", "convert", "validate", "report"] \
         if args.stage == "all" else [args.stage]
 
     bundle = None
@@ -1392,7 +1471,7 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 return 130
             if stage == "preflight":
                 report = stage_preflight(node, config, paths)
-                if not report["ok"] and args.stage == "all":
+                if not report["ok"]:
                     raise PipelineError(f"preflight failed: {report}")
             elif stage == "standstill":
                 if bundle is None:
@@ -1404,14 +1483,19 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 # standstill (goal aborted, stop not confirmed, ...) was
                 # silently swallowed and the pipeline carried on straight
                 # into `run` regardless.
-                if not standstill_result["ok"] and args.stage == "all":
+                if not standstill_result["ok"]:
                     raise PipelineError(f"standstill failed: {standstill_result}")
+            elif stage == "identify":
+                if bundle is None:
+                    bundle = load_plan(paths.plan_dir)
+                stage_identify(node, config, args.config, paths, bundle, sim_to_driver,
+                               profile.driver_joint_order, no_confirm=args.no_confirm)
             elif stage == "run":
                 if bundle is None:
                     bundle = load_plan(paths.plan_dir)
                 run_result = stage_run(node, config, paths, bundle, sim_to_driver, profile.driver_joint_order,
                                        only=only, ladder_scale=args.ladder, no_confirm=args.no_confirm)
-                if not run_result["ok"] and args.stage == "all":
+                if not run_result["ok"]:
                     raise PipelineError(f"run failed: {run_result}")
             elif stage == "convert":
                 stage_convert(config, args.config, paths, reference_contract=args.reference_contract)

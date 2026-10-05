@@ -192,13 +192,14 @@ class RtdeLoggerNode(Node):
     def _reader_loop(self) -> None:
         while self._keep_running:
             try:
-                state = self._connection.receive(binary=False)
+                state = self._connection.receive_buffered(binary=False)
             except Exception:
                 if not self._keep_running:
                     return
                 time.sleep(0.01)
                 continue
             if state is None:
+                time.sleep(0.0005)
                 continue
             self._recorder.on_sample(state_to_row(state))
 
@@ -209,12 +210,14 @@ class RtdeLoggerNode(Node):
 
     def destroy_node(self) -> bool:
         self._keep_running = False
-        self._recorder.close()
         try:
-            self._connection.send_pause()
             self._connection.disconnect()
         except Exception:
             pass
+        self._reader_thread.join(timeout=5.0)
+        if self._reader_thread.is_alive():
+            raise RuntimeError("RTDE reader did not stop; refusing to flush concurrently")
+        self._recorder.close()
         return super().destroy_node()
 
 
@@ -227,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
     return 0
 
 

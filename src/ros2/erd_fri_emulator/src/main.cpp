@@ -12,6 +12,8 @@ namespace
 {
 std::atomic<bool> g_keep_running{true};
 void on_signal(int) { g_keep_running.store(false); }
+volatile std::sig_atomic_t g_drops_enabled = 1;
+void on_drop_signal(int signum) { g_drops_enabled = signum == SIGUSR1 ? 1 : 0; }
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -44,6 +46,9 @@ int main(int argc, char ** argv)
       options.settle_cycles = std::stoi(next());
     } else if (arg == "--drop-probability") {
       options.drop_probability = std::stod(next());
+    } else if (arg == "--drop-on-signal") {
+      g_drops_enabled = 0;
+      options.drops_enabled = &g_drops_enabled;
     } else if (arg == "--drop-every") {
       options.drop_every = std::stoi(next());
     } else if (arg == "--jitter-us") {
@@ -56,7 +61,7 @@ int main(int argc, char ** argv)
       std::printf(
         "erd_fri_emulator --urdf <path> [--port 30200] [--no-auto-activate] "
         "[--settle-cycles 10] [--drop-probability 0.0] [--drop-every 0] [--jitter-us 0.0] "
-        "[--send-period-s 0.001] [--seed 0]\n");
+        "[--send-period-s 0.001] [--seed 0] [--drop-on-signal]\n");
       return 0;
     } else {
       std::fprintf(stderr, "erd_fri_emulator: unknown argument %s\n", arg.c_str());
@@ -75,6 +80,8 @@ int main(int argc, char ** argv)
   }
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+  std::signal(SIGUSR1, on_drop_signal);
+  std::signal(SIGUSR2, on_drop_signal);
 
   std::printf("erd_fri_emulator: listening on UDP :%d, urdf=%s\n", options.port, urdf_path.c_str());
   emulator.run(g_keep_running);

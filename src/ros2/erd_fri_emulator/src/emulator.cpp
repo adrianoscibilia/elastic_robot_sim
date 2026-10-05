@@ -158,7 +158,8 @@ void FriEmulator::send_monitoring_message()
   // session reached COMMANDING_ACTIVE (RR_04 B-8).
   const bool drop_by_schedule =
     options_.drop_every > 0 && (send_sequence_ % static_cast<uint32_t>(options_.drop_every)) == 0;
-  const bool drop = drop_by_probability || drop_by_schedule;
+  const bool enabled = options_.drops_enabled == nullptr || *options_.drops_enabled != 0;
+  const bool drop = enabled && (drop_by_probability || drop_by_schedule);
 
   // Hold the plant's own current position (mirrors IPO) until a target has
   // ever been received, exactly as the real client mirrors IPO position

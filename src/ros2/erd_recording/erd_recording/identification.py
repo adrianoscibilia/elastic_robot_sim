@@ -174,6 +174,8 @@ class MotorSideFit:
     holdout_rms: float | None
     j_m_source: tuple[str, ...] = ()          # "identified" | "prior", per joint
     j_m_sensitivity: np.ndarray | None = None  # RMS(dJ * ddq) per joint; NaN where identified
+    stribeck: np.ndarray | None = None
+    stribeck_velocity: np.ndarray | None = None
 
 
 def identify_motor_side(
@@ -181,6 +183,7 @@ def identify_motor_side(
     *, epsilon: float = 1.0e-2, holdout_mask: np.ndarray | None = None,
     rotor_inertia_nominal: np.ndarray | None = None,
     rotor_inertia_prior_factor_range: float = J_M_PRIOR_FACTOR_RANGE,
+    friction_parameters: dict[str, np.ndarray] | None = None,
 ) -> MotorSideFit:
     """E-ur-3: jointly fit ``K_tau * i_act = Y(q,dq,ddq) @ theta_base + J_m * ddq + f(dq)``.
 
@@ -217,13 +220,19 @@ def identify_motor_side(
     n_dof = q.shape[1]
     n_base = basis.shape[1]
     target = (k_tau[None, :] * i_act).reshape(-1)
+    if friction_parameters is not None:
+        friction = friction_torque(dq, friction_parameters, epsilon)
+        target = target - friction.reshape(-1)
 
     def _design(qq, dqq, ddqq) -> np.ndarray:
         rows = []
         for i in range(len(qq)):
             base = idn.joint_torque_regressor(pin, model, data, qq[i], dqq[i], ddqq[i], include_friction=False)
             projected = base @ basis
-            rows.append(np.hstack([projected, np.diag(ddqq[i]), np.diag(dqq[i]), np.diag(np.tanh(dqq[i] / epsilon))]))
+            friction_columns = np.hstack([np.diag(dqq[i]), np.diag(np.tanh(dqq[i] / epsilon))])
+            if friction_parameters is not None:
+                friction_columns = np.empty((n_dof, 0))
+            rows.append(np.hstack([projected, np.diag(ddqq[i]), friction_columns]))
         return np.vstack(rows)
 
     if holdout_mask is None:
@@ -272,6 +281,9 @@ def identify_motor_side(
     j_m = solution[n_base:n_base + n_dof]
     viscous = solution[n_base + n_dof:n_base + 2 * n_dof]
     coulomb = solution[n_base + 2 * n_dof:n_base + 3 * n_dof]
+    if friction_parameters is not None:
+        viscous = friction_parameters['viscous']
+        coulomb = friction_parameters['coulomb']
 
     fitted_fit = design_fit @ solution
     residual_rms = float(np.sqrt(np.mean((fitted_fit - target_fit) ** 2)))
@@ -285,4 +297,31 @@ def identify_motor_side(
 
     return MotorSideFit(j_m=j_m, viscous=viscous, coulomb=coulomb, base_parameters=theta_base,
                         residual_rms=residual_rms, holdout_rms=holdout_rms,
-                        j_m_source=tuple(j_m_source), j_m_sensitivity=j_m_sensitivity)
+                        j_m_source=tuple(j_m_source), j_m_sensitivity=j_m_sensitivity,
+                        stribeck=None if friction_parameters is None else friction_parameters['stribeck'],
+                        stribeck_velocity=None if friction_parameters is None else friction_parameters['stribeck_velocity'])
+
+
+def friction_torque(dq, parameters, epsilon=0.01):
+    """FrictionModel's viscous/Coulomb law plus the measured Stribeck term."""
+    velocity = np.asarray(dq)
+    smooth_sign = np.tanh(velocity / epsilon)
+    result = parameters['viscous'] * velocity + parameters['coulomb'] * smooth_sign
+    if parameters.get('stribeck') is not None:
+        result += parameters['stribeck'] * np.exp(-(velocity / parameters['stribeck_velocity'])**2) * smooth_sign
+    return result
+
+
+def fit_sweep_friction(speeds, torques, *, epsilon=0.01):
+    """Fit six bidirectional sweep pairs; grid-search the Stribeck velocity."""
+    from scipy.optimize import nnls
+    best = None
+    for scale in np.geomspace(max(min(speeds) / 2, 1e-4), max(speeds) * 2, 40):
+        sign = np.tanh(np.asarray(speeds) / epsilon)
+        design = np.column_stack([speeds, sign, np.exp(-(np.asarray(speeds) / scale)**2) * sign])
+        coefficients, residual = nnls(design, torques)
+        if best is None or residual < best[0]:
+            best = (residual, coefficients, scale)
+    residual, c, scale = best
+    return {'viscous': float(c[0]), 'coulomb': float(c[1]), 'stribeck': float(c[2]),
+            'stribeck_velocity': float(scale), 'residual_rms': float(residual / np.sqrt(len(speeds)))}

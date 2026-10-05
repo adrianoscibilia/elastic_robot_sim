@@ -20,7 +20,7 @@ from ament_index_python.packages import get_package_share_directory
 _EXTRA_JOINT_STATES = ("commanded_effort", "external_effort", "commanded_position", "ipo_position")
 _FRI_GPIO = ("time_sec", "time_nsec", "sample_time", "session_state", "command_mode",
             "connection_quality", "tracking_performance", "safety_state", "operation_mode",
-            "drive_state", "cycle")
+            "drive_state", "cycle", "received_cycle")
 
 
 def descriptions(hardware: str = "mock", robot_ip: str = "192.170.10.2", fri_port: str = "30200", initial_positions=None):

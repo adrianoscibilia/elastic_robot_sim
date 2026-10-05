@@ -300,6 +300,7 @@ class PlanBundle:
     #: with the JTC holding"), so there is no ``standstill_hold_k`` segment --
     #: only ``standstill_approach_k``/``standstill_return_k``.
     standstill_segments: tuple[PlanSegment, ...] = ()
+    identify_segments: tuple[PlanSegment, ...] = ()
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -317,10 +318,15 @@ class PlanBundle:
                  "n_samples": int(len(s.trajectory.time)), "duration": s.trajectory.duration}
                 for s in self.standstill_segments
             ],
+            "identify_segments": [
+                {"segment_id": s.segment_id, "kind": s.kind, "digest": s.digest,
+                 "n_samples": int(len(s.trajectory.time)), "duration": s.trajectory.duration}
+                for s in self.identify_segments
+            ],
         }
 
     def segment(self, segment_id: str) -> PlanSegment:
-        for segment in self.segments + self.standstill_segments:
+        for segment in self.segments + self.standstill_segments + self.identify_segments:
             if segment.segment_id == segment_id:
                 return segment
         raise KeyError(segment_id)
@@ -595,10 +601,16 @@ def build_plan(
 
     standstill_segments = build_standstill_segments(config, world, snapshot_asset.joint_names, time_step,
                                                     margin=collision_margin)
+    from .identification_plan import build_identification_segments
+
+    identify_segments = build_identification_segments(
+        config, world, [s for s in segments if s.kind == "excitation"],
+        snapshot_asset.joint_names, time_step, collision_margin,
+    )
 
     bundle = PlanBundle(config_digest=config_digest(config), asset=snapshot_asset,
                         segments=tuple(segments), rejected_for_collision=rejected_total,
-                        standstill_segments=standstill_segments)
+                        standstill_segments=standstill_segments, identify_segments=identify_segments)
     _write_bundle(bundle, output_dir)
     if config.robot == "kuka_lbr_iiwa_14_r820":
         manifest_path = output_dir / "plan.manifest.json"
@@ -621,7 +633,7 @@ def _rename(trajectory: MaterializedTrajectory, joint_names: tuple[str, ...]) ->
 
 def _write_bundle(bundle: PlanBundle, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    for segment in bundle.segments + bundle.standstill_segments:
+    for segment in bundle.segments + bundle.standstill_segments + bundle.identify_segments:
         segment.trajectory.save(output_dir / f"{segment.segment_id}.json")
     (output_dir / "plan.manifest.json").write_text(json.dumps(bundle.to_manifest(), indent=2), encoding="utf-8")
 
@@ -771,6 +783,8 @@ def load_plan(output_dir: Path) -> PlanBundle:
         loaded = []
         for entry in manifest.get(key, []):
             trajectory = MaterializedTrajectory.load(output_dir / f"{entry['segment_id']}.json")
+            if trajectory.digest() != entry['digest']:
+                raise PlanError(f"frozen trajectory digest mismatch: {entry['segment_id']}")
             loaded.append(PlanSegment(entry["segment_id"], entry["kind"], trajectory, entry["digest"]))
         return loaded
 
@@ -779,4 +793,5 @@ def load_plan(output_dir: Path) -> PlanBundle:
     asset_path = output_dir / f"{manifest['asset']}.relimited.urdf"
     asset = AssetSpec(name=manifest["asset"], urdf_path=asset_path, active_joints=tuple(manifest["joint_names"]))
     return PlanBundle(config_digest=manifest["config_digest"], asset=asset, segments=tuple(segments),
-                      rejected_for_collision=0, standstill_segments=tuple(standstill_segments))
+                      rejected_for_collision=0, standstill_segments=tuple(standstill_segments),
+                      identify_segments=tuple(_load_segments("identify_segments")))

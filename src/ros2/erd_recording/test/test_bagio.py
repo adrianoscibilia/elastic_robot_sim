@@ -71,3 +71,21 @@ def test_assign_segments_labels_windows_and_leaves_gaps_unlabelled():
     labels = assign_segments(10, [("approach_0", 0, 3), ("excitation_0", 5, 8)])
     assert labels == ["approach_0", "approach_0", "approach_0", "", "",
                       "excitation_0", "excitation_0", "excitation_0", "", ""]
+
+
+def test_cycle_health_distinguishes_network_and_publication_loss():
+    import pandas as pd
+    from erd_recording.bagio import iiwa_cycle_health
+    frame = pd.DataFrame({'fri_cycle': [10, 11, 13, 15], 'fri_received_cycle': [1, 2, 3, 5]})
+    result = iiwa_cycle_health(frame)
+    assert not result['ok']
+    assert result['lost_cycles'] == 2
+    assert result['lost_fri_cycles'] == 1
+    assert result['lost_publication_cycles'] == 1
+
+
+def test_cycle_health_accepts_remote_sequence_wrap():
+    import pandas as pd
+    from erd_recording.bagio import iiwa_cycle_health
+    frame = pd.DataFrame({'fri_cycle': [2**32 - 1, 0, 1], 'fri_received_cycle': [1, 2, 3]})
+    assert iiwa_cycle_health(frame)['ok']

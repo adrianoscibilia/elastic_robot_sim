@@ -1,0 +1,5 @@
+<library path="erd_iiwa_recording_controller">
+  <class name="erd_iiwa/BufferedStateBroadcaster" type="erd_iiwa::BufferedStateBroadcaster" base_class_type="controller_interface::ControllerInterface">
+    <description>Bounded FIFO telemetry for lossless recording of each hardware read.</description>
+  </class>
+</library>

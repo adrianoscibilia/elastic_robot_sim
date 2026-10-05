@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <csignal>
 #include <netinet/in.h>
 #include <random>
 #include <string>
@@ -49,6 +50,7 @@ struct EmulatorOptions
   // drop whose exact cycle varies run to run even with a fixed seed's
   // aggregate rate.
   int drop_every{0};
+  const volatile std::sig_atomic_t * drops_enabled{nullptr};
   // Timing jitter (RR_04 B-8): each cycle's send period is perturbed by a
   // uniform random offset in [-jitter_us, +jitter_us] microseconds, to
   // exercise the drop/gap-detection policy against unevenly spaced samples,
