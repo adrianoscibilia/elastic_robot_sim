@@ -10,15 +10,13 @@
   <maintainer email="adriano.scibilia@cnr.it">adriano</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>ur_robot_driver</depend>
   <depend>ur_description</depend>
   <depend>xacro</depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>python3-pandas</exec_depend>
-  <exec_depend>python3-pyarrow</exec_depend>
+  <!-- pandas/pyarrow come from ros2_ws/.venv-erd (src/ros2/requirements-erd.txt), not apt. -->
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

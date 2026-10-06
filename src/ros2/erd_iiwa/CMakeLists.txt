@@ -77,7 +77,7 @@ add_library(erd_iiwa_recording_controller SHARED src/buffered_state_broadcaster.
 ament_target_dependencies(erd_iiwa_recording_controller controller_interface control_msgs pluginlib rclcpp)
 pluginlib_export_plugin_description_file(controller_interface controller_plugins.xml)
 install(TARGETS erd_iiwa_hardware erd_iiwa_recording_controller DESTINATION lib)
-install(DIRECTORY launch config description sunrise DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config sunrise DESTINATION share/${PROJECT_NAME})
 ament_python_install_package(erd_iiwa)
 
 if(BUILD_TESTING)

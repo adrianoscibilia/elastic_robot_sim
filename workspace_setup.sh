@@ -125,7 +125,8 @@ _erd_setup_venv() {
   [[ -f "$stamp" ]] && have="$(cat "$stamp")"
   if [[ "$want" != "$have" ]] || ! "$venv/bin/python" -m pip show -q elastic-robot-sim >/dev/null 2>&1; then
     _erd_log "installing Python requirements into .venv-erd"
-    "$venv/bin/python" -m pip install --quiet --upgrade pip setuptools wheel || return 1
+    # setuptools stays < 80: the system colcon-core imports it from this venv.
+    "$venv/bin/python" -m pip install --quiet --upgrade pip "setuptools>=64,<80" wheel || return 1
     "$venv/bin/python" -m pip install --quiet -r "$req" || return 1
     # elastic_sim itself, editable, without the simulation's own dependency
     # set (MuJoCo/Newton/warp live in the repo's uv .venv, not here).
@@ -142,8 +143,8 @@ _erd_build() {
     # shellcheck disable=SC1091
     source "$ERD_WS/.venv-erd/bin/activate"
     cd "$ERD_WS" || exit 1
-    python -m colcon build \
-      --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DERD_FRI_SDK_ROOT=$ERD_FRI_SDK_ROOT"
+    # ERD_FRI_SDK_ROOT reaches erd_iiwa/erd_fri_emulator through the environment.
+    python -m colcon build --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
   )
 }
 
@@ -220,7 +221,9 @@ _erd_main() {
   if (( deps )); then
     _erd_log "rosdep install (stack + external sources)"
     # shellcheck disable=SC1091
+    # iiwa_bringup is COLCON_IGNOREd but iiwa_hardware still names it.
     ( source /opt/ros/jazzy/setup.bash && rosdep install -y -r --rosdistro jazzy --ignore-src \
+        --skip-keys iiwa_bringup \
         --from-paths "$ERD_REPO_ROOT/src/ros2" "$ERD_WS/src/external" ) \
       || _erd_warn "rosdep reported unresolved keys (see above); the explicit apt list usually covers them"
   fi

@@ -4,6 +4,7 @@
 # so rclpy, rosbag2_py, colcon, PyYAML and pytest come from ROS 2 Jazzy / apt.
 # These pins reproduce the laptop venv that passed RR_07/RR_09 (2026-10-05).
 # elastic_sim itself is installed editable from this repo with --no-deps.
+# setuptools is pinned < 80 by workspace_setup.sh (colcon-core requirement).
 numpy==2.5.3
 scipy==1.18.1
 pandas==3.0.6

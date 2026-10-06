@@ -28,7 +28,7 @@
   <depend>xacro</depend>
   <depend>robot_state_publisher</depend>
 
-  <exec_depend>mock_components</exec_depend>
+  <!-- mock_components/GenericSystem ships inside hardware_interface on Jazzy (no rosdep key). -->
 
   <test_depend>ament_lint_auto</test_depend>
   <!-- RR_04 C-1: ament_lint_common's flake8/pep257 default configs assume
