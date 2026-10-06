@@ -8,60 +8,34 @@ verified); it is the short version to have open in the lab.
 
 ## Build and environment
 
-One-time setup: `src/ros2/README.md`. Two environment issues were found and
-fixed (not "worked around" -- RR_04 B-1 removed the pass-1 `--prefix`
-stopgap):
+One command, from the repository root, in every terminal (first time on a
+new machine add `--deps`; see `src/ros2/README.md`):
 
-1. **pinocchio vs. ROS's sourced environment.** `/opt/ros/jazzy/setup.bash`
-   puts ROS's own `ros-jazzy-pinocchio` ahead of `.venv-erd`'s `pin==4.1.0` in
-   `PYTHONPATH`/`LD_LIBRARY_PATH` -- a numpy-ABI mismatch that segfaults,
-   not a clean import error. Every `erd_recording` entry point still guards
-   against this (`env_guard.assert_environment()`), and `plan`/`convert`
-   still run as **clean subprocesses** (`plan_cli.py`/`convert_cli.py`) so
-   pinocchio is never imported in the same process as a sourced ROS
-   environment. Consequence for testing: **`erd_recording`'s own pytest
-   suite must run without ROS sourced** (it imports `elastic_sim`/pinocchio
-   directly in several test files, not just through the subprocess CLIs):
-   ```bash
-   source ~/projects/erd_ws/.venv-erd/bin/activate   # a shell with NO ROS setup.bash sourced
-   cd ~/projects/erd_ws
-   python -m colcon test --packages-select erd_recording
-   ```
-2. **colcon/`ros2 run` and the interpreter.** `pip install
-   colcon-common-extensions` into `.venv-erd` (already done by the one-time
-   setup) and **build with the venv's own `python -m colcon build`**, not the
-   system `colcon`: generated console-script shebangs then point at the
-   active interpreter (`erd_recording/setup.cfg`'s `/usr/bin/env python3`
-   resolves correctly once the venv is first on `PATH`; other packages get an
-   absolute `.venv-erd/bin/python` shebang from setuptools directly). Verify
-   with `head -1 install/erd_recording/lib/erd_recording/record_iiwa`.
-   `ros2 run erd_recording record_iiwa ...` and `ros2 launch erd_ur10 ...`
-   (the sidecar) then work with **no `--prefix` needed**.
-3. The ROS/C++ packages' own tests (`erd_iiwa`, `erd_ur10`, `erd_fri_emulator`,
-   `erd_msgs`) need `rclpy`/`ament_index_python`, i.e. ROS **sourced**:
-   ```bash
-   source /opt/ros/jazzy/setup.bash
-   source ~/projects/erd_ws/.venv-erd/bin/activate
-   cd ~/projects/erd_ws
-   python -m colcon build
-   python -m colcon test --packages-select erd_iiwa erd_ur10 erd_fri_emulator erd_msgs
-   ```
-   Building is fine with ROS sourced (nothing at *build* time imports
-   pinocchio); only running erd_recording's *test suite* needs the ROS-free
-   shell. Two separate test invocations, not a workaround -- this is the same
-   process-separation the codebase already uses for `plan`/`convert`.
+```bash
+source workspace_setup.sh          # --build | --clean | --test | --real
+```
+
+It builds `ros2_ws/` if needed and leaves the shell with ROS, the overlay and
+`ros2_ws/.venv-erd` sourced, `ROS_DOMAIN_ID=87` (`--real`: 0), and
+`$ERD_LAB` (lab configs) / `$ERD_DATA_ROOT` (recordings, `data/real_robot/`).
+Two environment facts still hold underneath:
+
+1. **pinocchio vs. ROS's sourced environment.** ROS's own
+   `ros-jazzy-pinocchio` shadows `.venv-erd`'s `pin==4.1.0` (a numpy-ABI
+   mismatch that segfaults). Every `erd_recording` entry point guards against
+   it (`env_guard.assert_environment()`) and `plan`/`convert`/`identify` run
+   as clean subprocesses. `erd_recording`'s pytest suite therefore runs
+   without ROS sourced; `workspace_setup.sh --test` handles both invocations.
+2. **Build with the venv's `python -m colcon build`** (the script does), so
+   console-script shebangs point at `.venv-erd`. Verify with
+   `head -1 $ERD_WS/install/erd_recording/lib/erd_recording/record_iiwa`.
 
 ## Running a mock (L1) session
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source ~/projects/erd_ws/install/setup.bash
-source ~/projects/erd_ws/.venv-erd/bin/activate
-
-ros2 launch erd_iiwa iiwa.launch.py hardware:=mock \
-    lab_config:=src/erd/erd_recording/config/lab/iiwa_mock.yaml &
-ros2 run erd_recording record_iiwa \
-    --config src/erd/erd_recording/config/lab/iiwa_mock.yaml all --run-id demo
+source workspace_setup.sh
+ros2 launch erd_iiwa iiwa.launch.py hardware:=mock lab_config:=$ERD_LAB/iiwa_mock.yaml &
+ros2 run erd_recording record_iiwa --config $ERD_LAB/iiwa_mock.yaml all --run-id demo
 ```
 
 `lab_config:=` on the launch line generates the JTC's per-joint path/goal
@@ -69,7 +43,7 @@ tolerances from `limits.abort.tracking_rad` (RR_04 A-5) -- pass the same file
 the `record_iiwa`/`record_ur10` command uses, or the tolerances silently stay
 at the checked-in defaults instead of the lab's own abort radius.
 
-Output lands in `<recording.output_root>/<robot>/<date>/<run_id>/`
+Output lands in `$ERD_DATA_ROOT/<robot>/<date>/<run_id>/` (`recording.output_root`)
 (`config.yaml`, `plan/`, `preflight.json`, `manifest.yaml`, `bag/`,
 `bag_standstill/`, `raw/` logs). Kill any previous `ros2 launch`/
 `ros2_control_node`/`robot_state_publisher` before relaunching -- a stale

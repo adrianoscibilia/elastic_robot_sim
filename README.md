@@ -26,6 +26,20 @@ uv sync                 # add --group dev for pytest
 MuJoCo runs on a CPU. Newton needs a CUDA GPU and is used only by
 `scripts/audit_backends.py`.
 
+## ROS 2 real-data recording (iiwa, UR10)
+
+`src/ros2/` holds the ROS 2 stack that records real validation datasets in
+the same contract. On Ubuntu 24.04, from a fresh clone:
+
+```bash
+source workspace_setup.sh --deps   # first time: ROS 2 Jazzy + deps, workspace, build
+source workspace_setup.sh          # every new terminal
+```
+
+The colcon workspace (`ros2_ws/`) and the recordings (`data/real_robot/`)
+are generated inside the repository and gitignored. Details:
+`src/ros2/README.md`.
+
 ## The pipeline
 
 ```bash

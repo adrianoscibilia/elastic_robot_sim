@@ -92,16 +92,16 @@ def assert_environment(*, require_ros: bool = False, require_pinocchio: bool = T
     if venv.name != ".venv-erd":
         raise EnvironmentError_(
             f"not running inside .venv-erd (sys.prefix={sys.prefix}). Fix: "
-            "`source ~/projects/erd_ws/.venv-erd/bin/activate` before `ros2 run erd_recording ...`, "
-            "or (from a launch file) set the node's executable to "
-            "`~/projects/erd_ws/.venv-erd/bin/python3 -m erd_recording.cli`."
+            "`source <repo>/workspace_setup.sh` before `ros2 run erd_recording ...` (it activates "
+            "<repo>/ros2_ws/.venv-erd), or (from a launch file) set the node's executable to "
+            "`<repo>/ros2_ws/.venv-erd/bin/python3 -m erd_recording.cli`."
         )
     try:
         import elastic_sim  # noqa: F401
     except ImportError as exc:
         raise EnvironmentError_(
             "`import elastic_sim` failed. Fix: "
-            "`pip install -e ~/projects/elastic_robot_sim --no-deps` inside .venv-erd."
+            "`source <repo>/workspace_setup.sh` (it installs the repo editable into .venv-erd)."
         ) from exc
     if require_pinocchio:
         try:

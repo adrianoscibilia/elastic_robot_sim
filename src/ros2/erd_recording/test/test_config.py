@@ -248,3 +248,25 @@ def test_unknown_scene_frame_is_a_config_error(tmp_path):
     raw["scene"]["frame"] = "not_a_real_frame"
     with pytest.raises(ConfigError, match="not_a_real_frame"):
         load_lab_config(_write(tmp_path, raw))
+
+
+# ---------------------------------------------------------------------------
+# workspace_setup.sh: machine-dependent paths come from ${ERD_*} variables
+# ---------------------------------------------------------------------------
+
+
+def test_machine_paths_expand_from_environment(monkeypatch, tmp_path):
+    """The loader expands ${ERD_*} paths but keeps the raw text, so config and
+    plan digests do not depend on where the repository was cloned."""
+    monkeypatch.setenv("ERD_DATA_ROOT", str(tmp_path / "recordings"))
+    monkeypatch.setenv("ERD_CONSUMER_REPO", str(tmp_path / "dynamic_model_nn"))
+    config = load_lab_config(FIXTURE)
+    assert config.recording.output_root == str(tmp_path / "recordings")
+    assert config.consumer.repo == str(tmp_path / "dynamic_model_nn")
+    assert config.raw["recording"]["output_root"] == "${ERD_DATA_ROOT}"
+
+
+def test_unset_path_variable_refused(monkeypatch):
+    monkeypatch.delenv("ERD_DATA_ROOT", raising=False)
+    with pytest.raises(ConfigError, match="ERD_DATA_ROOT"):
+        load_lab_config(FIXTURE)

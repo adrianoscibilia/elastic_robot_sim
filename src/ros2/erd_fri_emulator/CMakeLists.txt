@@ -15,12 +15,23 @@ find_package(pinocchio REQUIRED)
 # generated FRIMessages.pb.* + pb_frimessages_callbacks) -- it speaks raw UDP
 # itself (erd_fri_emulator/emulator.cpp), not KUKA::FRI::UdpConnection/
 # ClientApplication, which are client-only abstractions (S1.9 finding).
-set(ERD_FRI_SDK_ROOT "$ENV{HOME}/projects/erd_ws/src/iiwa_ros2/iiwa_hardware/external/libFRI"
-    CACHE PATH "Path to the iiwa_ros2-bundled libFRI 1.11 SDK (headers + nanopb sources)")
+# Default: $ERD_FRI_SDK_ROOT (exported by workspace_setup.sh), else the
+# in-repo workspace checkout <repo>/ros2_ws/src/external/iiwa_ros2 (resolved
+# from this file's real path, since ros2_ws/src/erd is a symlink to src/ros2).
+if(DEFINED ENV{ERD_FRI_SDK_ROOT})
+  set(_erd_fri_default "$ENV{ERD_FRI_SDK_ROOT}")
+else()
+  get_filename_component(_erd_pkg_dir "${CMAKE_CURRENT_LIST_DIR}" REALPATH)
+  set(_erd_fri_default
+    "${_erd_pkg_dir}/../../../ros2_ws/src/external/iiwa_ros2/iiwa_hardware/external/libFRI")
+endif()
+set(ERD_FRI_SDK_ROOT "${_erd_fri_default}"
+  CACHE PATH "Path to the iiwa_ros2-bundled libFRI 1.11 SDK (headers + nanopb sources)")
 if(NOT EXISTS "${ERD_FRI_SDK_ROOT}/include/friLBRState.h")
   message(FATAL_ERROR
     "ERD_FRI_SDK_ROOT (${ERD_FRI_SDK_ROOT}) does not contain friLBRState.h. "
-    "Run `vcs import src < src/erd/erd.repos` in the erd_ws workspace first, "
+    "Run `source workspace_setup.sh` from the repository root first (it fetches "
+    "src/ros2/erd.repos into ros2_ws/src/external), "
     "or pass -DERD_FRI_SDK_ROOT=<path> to colcon build.")
 endif()
 set(FRI_MESSAGE_INCLUDES

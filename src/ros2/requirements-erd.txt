@@ -1,0 +1,16 @@
+# Python packages for ros2_ws/.venv-erd (installed by workspace_setup.sh).
+#
+# The venv is created from /usr/bin/python3 (3.12) with --system-site-packages,
+# so rclpy, rosbag2_py, colcon, PyYAML and pytest come from ROS 2 Jazzy / apt.
+# These pins reproduce the laptop venv that passed RR_07/RR_09 (2026-10-05).
+# elastic_sim itself is installed editable from this repo with --no-deps.
+numpy==2.5.3
+scipy==1.18.1
+pandas==3.0.6
+pyarrow==25.0.1
+pin==4.1.0
+pin-pink==4.3.0
+trimesh==5.1.0
+# UR's official RTDE client (`from rtde import rtde`): the sidecar logger and
+# the speed-slider script.
+UrRtde @ git+https://github.com/UniversalRobots/RTDE_Python_Client_Library.git@v2.7.12

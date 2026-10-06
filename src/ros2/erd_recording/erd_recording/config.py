@@ -19,6 +19,8 @@ Refusal rules (RR_01 S4):
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -53,6 +55,32 @@ def _require(mapping: Mapping[str, Any], key: str, source: str) -> Any:
     if key not in mapping:
         raise ConfigError(f"{source}: missing required key {key!r}")
     return mapping[key]
+
+
+#: ``$NAME`` / ``${NAME}`` left after expansion means the variable is unset.
+_UNEXPANDED_VARIABLE = re.compile(r"\$(\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _expand_path(value: Any, key: str, source: str) -> str | None:
+    """Expand ``${VAR}`` and ``~`` in a machine-dependent path value.
+
+    Lab configs name machine-dependent locations through the variables that
+    ``workspace_setup.sh`` exports (``ERD_DATA_ROOT``, ``ERD_CONSUMER_REPO``,
+    ``ERD_CONSUMER_PYTHON``), so one checked-in file works on every machine.
+    ``LabConfig.raw`` keeps the unexpanded text, so plan/config digests do
+    not depend on where the repository was cloned. An unset variable is an
+    error, never an empty string.
+    """
+    if value is None:
+        return None
+    text = os.path.expanduser(os.path.expandvars(str(value)))
+    unexpanded = _UNEXPANDED_VARIABLE.search(text)
+    if unexpanded:
+        raise ConfigError(
+            f"{source}: {key} uses {unexpanded.group(0)}, which is not set in the environment "
+            "(source workspace_setup.sh first)"
+        )
+    return text
 
 
 def _require_mapping(mapping: Mapping[str, Any], key: str, source: str) -> dict[str, Any]:
@@ -688,17 +716,18 @@ def _load_identification(raw: Mapping[str, Any], source: str) -> IdentificationS
 def _load_consumer(raw: Mapping[str, Any], source: str) -> ConsumerSpec:
     block = _require_mapping(raw, "consumer", source)
     return ConsumerSpec(
-        repo=str(_require(block, "repo", f"{source}.consumer")),
-        python=block.get("python"),
-        reference_contract=block.get("reference_contract"),
-        checkpoints=block.get("checkpoints"),
+        repo=_expand_path(_require(block, "repo", f"{source}.consumer"), "consumer.repo", source),
+        python=_expand_path(block.get("python"), "consumer.python", source),
+        reference_contract=_expand_path(block.get("reference_contract"), "consumer.reference_contract", source),
+        checkpoints=_expand_path(block.get("checkpoints"), "consumer.checkpoints", source),
     )
 
 
 def _load_recording(raw: Mapping[str, Any], source: str) -> RecordingSpec:
     block = _require_mapping(raw, "recording", source)
     return RecordingSpec(
-        output_root=str(_require(block, "output_root", f"{source}.recording")),
+        output_root=_expand_path(_require(block, "output_root", f"{source}.recording"),
+                                 "recording.output_root", source),
         standstill_s=float(block.get("standstill_s", 30.0)),
         pre_roll_s=float(block.get("pre_roll_s", 2.0)),
         post_roll_s=float(block.get("post_roll_s", 2.0)),

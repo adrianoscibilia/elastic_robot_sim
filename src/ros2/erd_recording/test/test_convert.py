@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,8 @@ SG_WINDOW = 11
 SG_POLY = 3
 TIME_STEP = 0.001
 N_DOF = 7
-CONSUMER_PYTHON = Path("/home/adriano/projects/dynamic_model_nn/.venv/bin/python")
+CONSUMER_REPO = Path(os.environ["ERD_CONSUMER_REPO"])      # defaults set in conftest.py
+CONSUMER_PYTHON = Path(os.environ["ERD_CONSUMER_PYTHON"])
 
 
 def _synthetic_iiwa_raw(n_samples: int = 400, n_bags: int = 2) -> pd.DataFrame:
@@ -296,7 +298,7 @@ def test_consumer_loads_real_dataset(iiwa_asset, tmp_path):
     csv_path, manifest_path, contract_path = write_real_dataset(frame, manifest, contract, output)
 
     script = (
-        "import sys; sys.path.insert(0, '/home/adriano/projects/dynamic_model_nn'); "
+        f"import sys; sys.path.insert(0, r'{CONSUMER_REPO}'); "
         "from dataset import CustomDataset; "
         f"ds = CustomDataset(r'{csv_path}'); "
         "print('LOADED', len(ds), ds.dof, ds.has_joint_torque)"

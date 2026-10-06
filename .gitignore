@@ -210,3 +210,8 @@ __marimo__/
 data
 figures
 MUJOCO_LOG.TXT
+
+# ROS 2 real-data stack (workspace_setup.sh): the colcon workspace, its
+# .venv-erd and the pinned external checkouts (KUKA libFRI must never be
+# committed) are generated; recordings go to data/real_robot (ignored above).
+ros2_ws/

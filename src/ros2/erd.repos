@@ -5,15 +5,12 @@
 # bundled `libFRI` 1.11 sources that `erd_iiwa` and `erd_fri_emulator` compile
 # in place (CMake var `ERD_FRI_SDK_ROOT`). It is not vendored: `elastic_robot_sim`
 # is public and `libFRI` carries KUKA's own SDK license (used-with-KUKA-products
-# only), so it is referenced by path from the build workspace, never copied
-# into this repository.
+# only), so it is compiled from the generated ros2_ws/src/external checkout,
+# never copied into this repository.
 #
-# Commit below is the laptop's local `jazzy-dev` working commit as of
-# 2026-09-30 (RR_01 S1.1, I-10). If it is not reachable from a fresh clone
-# (local-only commits on top of the branch), export it first:
-#   git -C ~/projects/ros2_ws/src/iiwa_ros2 bundle create \
-#       ~/projects/erd_ws/vendor/iiwa_ros2.bundle jazzy-dev
-# and point this entry's `uri` at that bundle path instead.
+# workspace_setup.sh clones every entry below into ros2_ws/src/external/ at
+# the pinned version (RR_01 S1.1, I-10). The iiwa_ros2 commit is the head of
+# its public `jazzy-dev` branch (checked 2026-10-06).
 repositories:
   iiwa_ros2:
     type: git

@@ -17,12 +17,26 @@
 # port itself, reintroducing the identical collision).
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-ERD_WS="${ERD_WS:-$HOME/projects/erd_ws}"
+# workspace_setup.sh exports ERD_REPO_ROOT/ERD_WS. The fallback derives them
+# from this file's location, which is only right when it runs from the
+# source tree (src/ros2/erd_fri_emulator/scripts/); the installed copy under
+# ros2_ws/install/... would otherwise mount the wrong assets folder.
+REPO_ROOT="${ERD_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+ERD_WS="${ERD_WS:-$REPO_ROOT/ros2_ws}"
 CONTAINER_NAME="${CONTAINER_NAME:-erd_fri_emulator}"
 FRI_PORT="${FRI_PORT:-30200}"
 URDF_PATH="${URDF_PATH:-/assets/robots/kuka_lbr_iiwa_14_r820/description/kuka_lbr_iiwa_14_r820.urdf}"
 EXTRA_ARGS=("$@")
+
+HOST_URDF="$REPO_ROOT/assets/${URDF_PATH#/assets/}"
+if [[ ! -f "$HOST_URDF" ]]; then
+  echo "run_emulator.sh: $HOST_URDF not found -- source workspace_setup.sh first" >&2
+  exit 1
+fi
+if [[ ! -x "$ERD_WS/install/erd_fri_emulator/lib/erd_fri_emulator/erd_fri_emulator" ]]; then
+  echo "run_emulator.sh: erd_fri_emulator is not built in $ERD_WS/install" >&2
+  exit 1
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "run_emulator.sh: docker is required" >&2
