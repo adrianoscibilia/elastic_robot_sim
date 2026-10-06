@@ -119,6 +119,9 @@ def sample_payloads(sampling: PayloadSampling, seed: int, count: int) -> tuple[P
             float(rng.uniform(sampling.offset_z[0], sampling.offset_z[1])),
         )
         size = float(rng.uniform(sampling.size[0], sampling.size[1]))
+        if sampling.offset_z_reference == "near_face":
+            # The draw is the clearance to the box's near face (same draws as `centre`).
+            offset = (offset[0], offset[1], offset[2] + 0.5 * size)
         payloads.append(Payload(mass=mass, offset=offset, size=size))
     return tuple(payloads)
 

@@ -36,6 +36,10 @@ payload:
   offset_x: [-0.08, 0.08]
   offset_y: [-0.08, 0.08]
   offset_z: [0.02, 0.20]
+  # R6_07: offset_z is the flange-to-near-face clearance, centre = offset_z +
+  # size / 2.  Read as the centre, 6 of 20 robots drew a box (up to 0.25 m)
+  # reaching 5-10 cm back through the wrist, and no trajectory was collision-free.
+  offset_z_reference: near_face
   size: [0.05, 0.25]
   per: robot
 
@@ -136,9 +140,12 @@ simulation:
     q:
       # R6_02 Sec 3: an encoder is quantization plus one count of white noise,
       # not a percentage of RMS (0.01 % of RMS was ~800 iiwa counts).
-      # R6_04 A-4: the drive's joint encoder, >= 14-bit on the motor behind
-      # the 100:1 gear [S-7]: 2 pi / (100 * 2^14) = 3.8e-6 rad (class E).
-      quantization: 3.835e-6
+      # R6_06 Sec 4: the drive's joint encoder, 17-bit assumed on the motor
+      # behind the 100:1 gear [S-7]: 2 pi / (100 * 2^17) = 4.79e-7 rad.  Class E,
+      # modelling error: mainstream servo class; AksIM-type encoders reported
+      # in UR joints, resolution unpublished [S-24].  (At the 14-bit lower
+      # bound, 3.8e-6 rad, the in-loop velocity noise failed budget gate 1b.)
+      quantization: 4.79e-7
       sigma_quanta: 1.0
     dq:
       source: sensor             # RTDE actual_qd: the drive's estimate

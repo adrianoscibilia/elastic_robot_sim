@@ -110,8 +110,11 @@ def _heaviest_payload(config: DatasetConfig):
     def farthest(bounds: tuple[float, float]) -> float:
         return bounds[0] if abs(bounds[0]) > abs(bounds[1]) else bounds[1]
 
+    z = farthest(sampling.offset_z)
+    if sampling.offset_z_reference == "near_face":
+        z += 0.5 * float(sampling.size[1])
     return Payload(mass=float(sampling.mass[1]),
-                   offset=(farthest(sampling.offset_x), farthest(sampling.offset_y), farthest(sampling.offset_z)),
+                   offset=(farthest(sampling.offset_x), farthest(sampling.offset_y), z),
                    size=float(sampling.size[1]))
 
 

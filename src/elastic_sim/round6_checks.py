@@ -100,7 +100,10 @@ def noise_statistics(frame: pd.DataFrame, manifest: Mapping[str, Any]) -> pd.Dat
         group = group.reset_index(drop=True)
         channels = [("q", "q", "q_motor_clean", "q_ref_clean")]
         if (noise.get("dq") or {}).get("source", "sensor") == "sensor":
-            channels.append(("dq", "dq", "dq_motor_clean", "dq_ref_clean"))
+            # Under a drive the recorded dq is the drive's estimate through the
+            # instrument (R6_04 A-4): measure the noise against that estimate.
+            dq_clean = "dq_drive_clean" if f"dq_drive_clean0" in group.columns else "dq_motor_clean"
+            channels.append(("dq", "dq", dq_clean, "dq_ref_clean"))
         measured_target = "noise_gain_ft__" + names[0] in group.columns
         for channel, recorded_prefix, clean_prefix, basis_prefix in channels:
             recorded = _block(group, recorded_prefix, n)[delay:]

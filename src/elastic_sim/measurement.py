@@ -637,6 +637,7 @@ class DriveInstrument:
         self._tick = 0
         self._q_last: np.ndarray | None = None
         self._velocity: np.ndarray | None = None
+        self._estimates: list[np.ndarray] = []
 
     def sample(self, q: np.ndarray, dq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         q_read = self.recorder.read_q(q)
@@ -648,10 +649,14 @@ class DriveInstrument:
             self._velocity = self._velocity + self.alpha * (raw - self._velocity)
         self._q_last = q_read
         if self._tick % self.ticks_per_sample == 0:
+            self._estimates.append(self._velocity.copy())
             dq_record = None if self.recorder.derivative else self.recorder.measure_dq(self._velocity)
             self.recorder.record(q_read, dq_record)
         self._tick += 1
         return q_read, self._velocity.copy()
 
     def history(self) -> dict[str, np.ndarray]:
-        return self.recorder.history()
+        # The drive's own velocity estimate at the sample instants, before the
+        # record-only noise and undelayed: the ``dq`` instrument's input, so
+        # the Sec 9 noise check measures the noise and not the estimator.
+        return {**self.recorder.history(), "dq_motor_estimate": np.asarray(self._estimates, dtype=float)}

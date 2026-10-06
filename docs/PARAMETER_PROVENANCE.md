@@ -175,7 +175,7 @@ in-loop derivative turned into rotor shaking), so `q` is quantization plus
 | iiwa | q | - (sigma = 1 count) | - | - | 5.989e-8 rad | 1 | E / P (quantization) | [S-1]; `R6_02` Sec 3 |
 | iiwa | dq | derived: the contract's SG derivative of the recorded q (FRI has no velocity) | - | - | - | - | - | `R6_00` Sec 1 |
 | iiwa | ft | 1 % | 1 % | 0.2 % of effort | - | 1 | E | strain-gauge joint sensor |
-| UR10 | q | - (sigma = 1 count) | - | - | 3.835e-6 rad | 1 | E | the drive's joint encoder: >= 14-bit motor encoder behind the 100:1 gear [S-7], 2 pi / (100 x 2^14) (`R6_04` A-4; was the round-5 2 pi / 2^17) |
+| UR10 | q | - (sigma = 1 count) | - | - | 4.79e-7 rad | 1 | E | 17-bit assumed, mainstream servo class, behind the 100:1 gear [S-7]: 2 pi / (100 x 2^17); AksIM-type encoders reported in UR joints [S-24]; unpublished, modelling error (`R6_06` Sec 4; was 14-bit 3.835e-6 rad in `R6_04` A-4, which failed budget gate 1b) |
 | UR10 | dq | 0.5 % | - | - | - | 1 | E | RTDE drive estimate |
 | UR10 | ft | 2 % | 3 % | 0.5 % | - | 1 | E | current-based proxy (post-training chain) |
 | FMRR | q | - (sigma = 1 count) | - | - | 2.381e-8 m (y, x), 1.190e-8 m (z) | 1 | E / D (quantization) | `0x6064` factors [I-2]; `R6_02` Sec 3 |

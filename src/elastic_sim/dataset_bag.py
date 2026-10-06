@@ -551,6 +551,10 @@ def rollout_frame(
         # tracking error is the headline difference between controller modes and
         # a diagnostic reading a written file cannot recover it otherwise.
         clean = dict(clean, q_ref=_on_grid(result["q_ref"]), dq_ref=_on_grid(result["dq_ref"]))
+        if noise is not None and "dq_motor_estimate" in result and noise.dq_source == "sensor":
+            # A drive's own velocity estimate (R6_04 A-4), what its recorded dq
+            # is measured from (debug column, never a model input).
+            clean = dict(clean, dq_drive=np.asarray(result["dq_motor_estimate"], dtype=float))
         if wrench_target is not None:
             clean = dict(clean, ft=wrench_target)
         elif noise is not None and signals.target == "link_torque":

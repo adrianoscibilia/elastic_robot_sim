@@ -706,3 +706,17 @@ def test_drive_setpoints_are_interpolated_one_sample_late(configs, registry):
     # Continuous across a bus instant: no staircase for kp to turn into a spike.
     before, after = controller.setpoint(0.02 - 1e-9)[0], controller.setpoint(0.02)[0]
     assert np.max(np.abs(after - before)) < 1e-6
+
+
+def test_near_face_payload_keeps_the_box_outside_the_wrist(configs):
+    """R6_07: UR10 offset_z is the clearance to the box's near face; same draws as `centre`."""
+    from elastic_sim.dataset_worklist import sample_payloads
+
+    sampling = configs["ur10"].payload
+    assert sampling.offset_z_reference == "near_face"
+    near = sample_payloads(sampling, 7, 50)
+    centre = sample_payloads(replace(sampling, offset_z_reference="centre"), 7, 50)
+    for a, b in zip(near, centre):
+        assert (a.mass, a.size, a.offset[:2]) == (b.mass, b.size, b.offset[:2])
+        assert a.offset[2] == pytest.approx(b.offset[2] + 0.5 * a.size)
+        assert a.offset[2] - 0.5 * a.size >= sampling.offset_z[0] - 1e-12

@@ -379,10 +379,19 @@ class PayloadSampling:
     offset_z: tuple[float, float] = (0.0, 0.0)
     size: tuple[float, float] = (0.1, 0.1)
     per: str = "robot"
+    #: What ``offset_z`` measures: ``centre`` (the box's centre, rounds 3-6
+    #: default) or ``near_face`` (the gap from the mounting frame to the box's
+    #: near face, so the centre is ``offset_z + size / 2``).  ``near_face``
+    #: keeps a large tool from reaching back through the wrist: with ``centre``
+    #: a 0.25 m box centred 0.02 m out intersects the last link, and every
+    #: candidate trajectory self-collides (`R6_07`).  Same draws either way.
+    offset_z_reference: str = "centre"
 
     def __post_init__(self) -> None:
         if self.per not in ("robot", "trajectory"):
             raise ValueError("payload.per must be 'robot' or 'trajectory'")
+        if self.offset_z_reference not in ("centre", "near_face"):
+            raise ValueError("payload.offset_z_reference must be 'centre' or 'near_face'")
         for name in ("mass", "size"):
             low, high = getattr(self, name)
             if low < 0.0 or high < low:
@@ -965,7 +974,7 @@ _EXCITATION_KEYS = {
 _REGIME_KEYS = {"enabled", "max_acceleration", "velocity_fraction"}
 
 
-_PAYLOAD_KEYS = {"enabled", "mass", "offset_x", "offset_y", "offset_z", "size", "per"}
+_PAYLOAD_KEYS = {"enabled", "mass", "offset_x", "offset_y", "offset_z", "offset_z_reference", "size", "per"}
 
 
 _DATASET_KEYS = {
@@ -1318,6 +1327,7 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
         offset_z=(float(payload_z[0]), float(payload_z[1])),
         size=(float(payload_size[0]), float(payload_size[1])),
         per=str(payload_cfg.get("per", "robot")),
+        offset_z_reference=str(payload_cfg.get("offset_z_reference", "centre")),
     )
     try:
         tiers = build_tiers(rigid_reference, sampling, seed)
