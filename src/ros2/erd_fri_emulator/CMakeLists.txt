@@ -77,7 +77,14 @@ if(BUILD_TESTING)
     ${ERD_FRI_SDK_ROOT}/src/protobuf/friMonitoringMessageDecoder.cpp
   )
   target_include_directories(test_emulator PRIVATE ${ERD_FRI_SDK_ROOT}/include ${FRI_MESSAGE_INCLUDES})
-  target_compile_definitions(test_emulator PRIVATE HAVE_SOCKLEN_T PB_FIELD_16BIT)
+  # Default test URDF: the bare asset in this repository, located from this
+  # file's real path (ros2_ws/src/erd is a symlink); ERD_TEST_URDF overrides.
+  get_filename_component(_erd_test_pkg_dir "${CMAKE_CURRENT_LIST_DIR}" REALPATH)
+  get_filename_component(_erd_test_urdf
+    "${_erd_test_pkg_dir}/../../../assets/robots/kuka_lbr_iiwa_14_r820/description/kuka_lbr_iiwa_14_r820.urdf"
+    ABSOLUTE)
+  target_compile_definitions(test_emulator PRIVATE HAVE_SOCKLEN_T PB_FIELD_16BIT
+    "ERD_TEST_URDF_DEFAULT=\"${_erd_test_urdf}\"")
   target_link_libraries(test_emulator erd_fri_emulator_core Threads::Threads)
 endif()
 

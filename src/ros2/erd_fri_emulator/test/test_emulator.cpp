@@ -26,8 +26,7 @@ std::string test_urdf_path()
   if (env) {
     return env;
   }
-  return "/home/adriano/projects/elastic_robot_sim/assets/robots/"
-         "kuka_lbr_iiwa_14_r820/description/kuka_lbr_iiwa_14_r820.urdf";
+  return ERD_TEST_URDF_DEFAULT;  // set by CMakeLists.txt from the repository path
 }
 }  // namespace
 

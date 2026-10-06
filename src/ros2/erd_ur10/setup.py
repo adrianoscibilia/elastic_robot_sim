@@ -20,6 +20,7 @@ setup(
     description="UR10 CB3 launch + RTDE sidecar logger (RR_01 S3.4).",
     license="Apache-2.0",
     tests_require=["pytest"],
+    extras_require={"test": ["pytest"]},
     entry_points={
         "console_scripts": [
             "rtde_logger = erd_ur10.rtde_logger:main",
