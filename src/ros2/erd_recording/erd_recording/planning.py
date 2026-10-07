@@ -212,6 +212,8 @@ def resolve_probe_harmonics(config: LabConfig, rate_hz: float) -> tuple[int, ...
     resolved = resolve_probe_design(training)
     harmonics = resolved.excitation.probe_harmonics
     bound_hz = 0.09 * rate_hz
+    if config.excitation.probe.max_top_hz is not None:
+        bound_hz = min(bound_hz, config.excitation.probe.max_top_hz)  # RR_12 S4.4 cap
     base = resolved.excitation.base_frequency
     capped = tuple(int(h) for h in harmonics if h * base <= bound_hz)
     return capped

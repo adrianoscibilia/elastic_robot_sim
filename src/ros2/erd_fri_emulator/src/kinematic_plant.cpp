@@ -23,6 +23,12 @@ KinematicPlant::KinematicPlant(const std::string & urdf_path, double dt, unsigne
   }
 }
 
+void KinematicPlant::reset(const JointArray & position)
+{
+  q_ = position;
+  dq_.fill(0.0);
+}
+
 KinematicPlant::Sample KinematicPlant::step(const JointArray & commanded_position)
 {
   const int n = n_joints();

@@ -16,6 +16,7 @@
   <depend>xacro</depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>ur_msgs</exec_depend>
   <!-- pandas/pyarrow come from ros2_ws/.venv-erd (src/ros2/requirements-erd.txt), not apt. -->
 
   <test_depend>ament_copyright</test_depend>

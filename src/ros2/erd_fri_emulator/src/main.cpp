@@ -55,13 +55,35 @@ int main(int argc, char ** argv)
       options.jitter_us = std::stod(next());
     } else if (arg == "--send-period-s") {
       options.send_period_s = std::stod(next());
+    } else if (arg == "--initial-positions") {
+      // Comma-separated, one value per joint in A1..A7 order (rad).
+      const std::string text = next();
+      erd_fri_emulator::JointArray q{};
+      size_t start = 0;
+      int count = 0;
+      while (start <= text.size() && count < erd_fri_emulator::kNumJoints) {
+        const size_t comma = text.find(',', start);
+        q[count++] = std::stod(text.substr(start, comma - start));
+        if (comma == std::string::npos) {
+          start = text.size() + 1;
+          break;
+        }
+        start = comma + 1;
+      }
+      if (count != erd_fri_emulator::kNumJoints || start <= text.size()) {
+        std::fprintf(stderr, "erd_fri_emulator: --initial-positions needs exactly %d values\n",
+          erd_fri_emulator::kNumJoints);
+        return 2;
+      }
+      options.initial_position = q;
     } else if (arg == "--seed") {
       options.seed = static_cast<unsigned>(std::stoul(next()));
     } else if (arg == "--help") {
       std::printf(
         "erd_fri_emulator --urdf <path> [--port 30200] [--no-auto-activate] "
         "[--settle-cycles 10] [--drop-probability 0.0] [--drop-every 0] [--jitter-us 0.0] "
-        "[--send-period-s 0.001] [--seed 0] [--drop-on-signal]\n");
+        "[--send-period-s 0.001] [--seed 0] [--drop-on-signal] "
+        "[--initial-positions a1,...,a7]\n");
       return 0;
     } else {
       std::fprintf(stderr, "erd_fri_emulator: unknown argument %s\n", arg.c_str());

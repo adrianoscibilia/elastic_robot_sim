@@ -36,6 +36,9 @@ FriEmulator::FriEmulator(EmulatorOptions options)
   drop_rng_(options_.seed + 1),
   jitter_rng_(options_.seed + 2)
 {
+  if (options_.initial_position) {
+    plant_.reset(*options_.initial_position);
+  }
 }
 
 FriEmulator::~FriEmulator()

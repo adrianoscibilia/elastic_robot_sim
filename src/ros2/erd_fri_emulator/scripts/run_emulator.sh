@@ -66,7 +66,14 @@ docker run -d --name "$CONTAINER_NAME" \
   " >/dev/null
 # no -p/port publishing -- see the header comment
 
-CONTAINER_IP="$(docker inspect "$CONTAINER_NAME" --format '{{.NetworkSettings.IPAddress}}')"
+# Docker >= 29 dropped the top-level .NetworkSettings.IPAddress; read the
+# default bridge's entry instead (the container joins no other network).
+CONTAINER_IP="$(docker inspect "$CONTAINER_NAME" --format '{{(index .NetworkSettings.Networks "bridge").IPAddress}}')"
+if [[ -z "$CONTAINER_IP" ]]; then
+  echo "run_emulator.sh: $CONTAINER_NAME has no bridge IP; docker logs $CONTAINER_NAME:" >&2
+  docker logs "$CONTAINER_NAME" >&2 || true
+  exit 1
+fi
 echo "erd_fri_emulator running as '$CONTAINER_NAME', container IP: $CONTAINER_IP"
 echo "Use: ros2 launch erd_iiwa iiwa.launch.py hardware:=emulator robot_ip:=$CONTAINER_IP fri_port:=$FRI_PORT"
 echo "Stop with: docker stop $CONTAINER_NAME && docker rm $CONTAINER_NAME"

@@ -52,6 +52,21 @@ TEST(KinematicPlant, CommandedTorqueNeverEqualsMeasuredTorqueAtRest)
   EXPECT_TRUE(saw_difference);
 }
 
+TEST(KinematicPlant, ResetStartsAtRestAtTheGivenPose)
+{
+  // RR_10: the emulator starts at the lab config's home (--initial-positions)
+  // so preflight's home/still check sees what the real robot would show.
+  erd_fri_emulator::KinematicPlant plant(test_urdf_path(), 0.001, 42);
+  const erd_fri_emulator::JointArray home{{0.0, 0.3, 0.0, -1.2, 0.0, 0.8, 0.0}};
+  plant.reset(home);
+  for (int i = 0; i < 100; ++i) {
+    auto sample = plant.step(home);
+    for (int j = 0; j < plant.n_joints(); ++j) {
+      EXPECT_NEAR(sample.measured_position[j], home[j], 1e-6);
+    }
+  }
+}
+
 TEST(RobotSideMessages, MonitoringEncodeDecodesWithRealSdkDecoder)
 {
   FRIMonitoringMessage message{};

@@ -144,10 +144,14 @@ identification:
     wrist_3_joint: [-1.0, 1.0]
   holdout: 2
 
+safety:
+  vendor_checksum: "not applicable: URSim has no vendor safety configuration"   # RR_12 A-3c
+
 consumer:
   repo: ${ERD_CONSUMER_REPO}                 # exported by workspace_setup.sh (default: ../dynamic_model_nn)
   python: ${ERD_CONSUMER_PYTHON}               # consumer env (Python 3.11)
   reference_contract: ../reference/synthetic_ur10_cb3.contract.json
+  reference_sha256: 1b6220c742ddb361fddae005c6dbd309e6be11904572b3db2eeb490ecac9fcb5   # RR_12 C-1 pin
   checkpoints: null
 
 recording:

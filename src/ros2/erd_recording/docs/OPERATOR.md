@@ -30,6 +30,122 @@ Two environment facts still hold underneath:
    console-script shebangs point at `.venv-erd`. Verify with
    `head -1 $ERD_WS/install/erd_recording/lib/erd_recording/record_iiwa`.
 
+## Laptop (Step 2: the machine at the robots)
+
+The laptop records; peepo analyses (checkpoints and GPU live there). Same repo
+layout on both: the laptop clone is `~/projects/elastic_robot_sim`, peepo's is
+`~/Projects/elastic_robot_sim`. Below, `peepo` is an SSH host alias for
+peepo; replace it with `user@host` if you have none. `~/projects/erd_ws` and
+`~/projects/erd_data` are retired: nothing reads them any more.
+
+**1. Once: clone, build, test.**
+
+```bash
+git clone https://github.com/adrianoscibilia/elastic_robot_sim.git ~/projects/elastic_robot_sim
+cd ~/projects/elastic_robot_sim
+git pull                                  # later updates: pull, then the line below again
+source workspace_setup.sh --deps --test   # sudo for apt; ends with two "Summary: N tests, 0 errors, 0 failures"
+```
+
+Both test summaries must show `0 errors, 0 failures` (the ROS-sourced packages
+also report 6 skipped cppcheck tests). Anything else: stop and send the output.
+
+**2. Once: the two training reference contracts and their manifests.** Four
+JSON files, ~1.2 MB, no parquet. `convert` refuses a reference whose sha256
+differs from `consumer.reference_sha256` in the lab file:
+
+```bash
+cd ~/projects/elastic_robot_sim
+for f in r6-full-20260929-0049/iiwa_drive/kuka_lbr_iiwa_14_r820_table_round6_drive \
+         r6-ur10-20261005-1126/ur10/ur10_table_round6; do
+  mkdir -p "data/identification/$(dirname "$f")"
+  rsync -av "peepo:Projects/elastic_robot_sim/data/identification/$f.contract.json" \
+            "peepo:Projects/elastic_robot_sim/data/identification/$f.manifest.json" \
+            "data/identification/$(dirname "$f")/"
+done
+sha256sum data/identification/*/*/*.contract.json
+# expect c64f7aef2e1e0f46...  kuka_lbr_iiwa_14_r820_table_round6_drive.contract.json
+#        cc8867e909b0e980...  ur10_table_round6.contract.json
+```
+
+The checkpoints stay on peepo.
+
+**3. Every robot terminal:**
+
+```bash
+source ~/projects/elastic_robot_sim/workspace_setup.sh --real   # ROS_DOMAIN_ID=0
+```
+
+`record_*` refuses a real lab file in a shell without `--real`, and a
+`*_sim.yaml`/`*_mock.yaml` file in a shell with it.
+
+**4. After every run: copy the run folder to peepo.** `convert`, `validate`
+and `report` run on the laptop right after the run (to catch problems at the
+robot) and again on peepo:
+
+```bash
+cd ~/projects/elastic_robot_sim
+rsync -av --partial data/real_robot/ peepo:Projects/elastic_robot_sim/data/real_robot/
+```
+
+On peepo, the offline stages take the copied folder and the run's own frozen
+config (one stage per call; `evaluate` only on peepo):
+
+```bash
+RUN=data/real_robot/<robot>/<date>/<run_id>
+for stage in convert report evaluate; do
+  ros2 run erd_recording record_iiwa --config $RUN/config.yaml --run-dir $RUN $stage   # record_ur10 for the UR10
+done
+```
+
+## Measurement tools (RR_12 A-2)
+
+* `ros2 run erd_recording erd_link_test --config <lab file> 300`: rung 1. No
+  motion command; records 300 s and writes `link_test.json` in a run folder.
+  iiwa: lost FRI cycles (`fri/cycle`), lost publication cycles
+  (`fri/received_cycle`), stamp-step histogram, Sunrise connection quality,
+  and `pass_rung1` (<= 5 lost cycles per 300 s, stamp-step p99 <= 2 ms). UR10:
+  driver and sidecar rates, sidecar gaps, exact `actual_q` match fraction.
+  Both: per-topic recorder losses.
+* Every `standstill`/`identify`/`run` writes `monitor.json` (sample age
+  p50/p99/max over all monitor evaluations, and every cancel). `report` adds
+  the cancel latency of every abort, from the bag: the first sample over the
+  threshold the cancel names, to the `cancel` event.
+* `ros2 run erd_recording erd_monitor_test --config <sim lab file>`: L1/L2
+  only (refuses `hardware: real`). 20 deliberate 0.15 rad / 0.3 s steps with
+  the monitor threshold at 5 mrad; reports cancel latency and sample ages.
+* Rung 4a on the real robot uses the normal pipeline instead:
+  `record_iiwa ... run --ladder 0.1 --abort-tracking-rad <x>`. The override
+  is refused above `--ladder 0.1`, lowers only the monitor's threshold (the
+  JTC keeps the lab file's path tolerance), acts **inside excitation
+  segments only** (approaches and returns keep the lab file's threshold),
+  and is written into `manifest.yaml`.
+* `<x>` (RR_14 P-3, amends RR_12 S4.6 rung 4a): 0.5 x the largest tracking
+  error of the rung-4 `--ladder 0.1` run, and at least 4 encoder counts
+  (iiwa 2.4e-7 rad, UR10 1.9e-6 rad). `report` on that run prints it:
+  `report: suggested --abort-tracking-rad ...`, also in `report.md`.
+
+## Preflight on real hardware (RR_12 A-3)
+
+Besides RR_01 S5's items, `preflight` on `hardware: real` refuses when:
+* the set of active controllers is not exactly the JTC plus the recording
+  broadcasters (iiwa: `erd_arm_controller`, `joint_state_broadcaster`,
+  `erd_state_broadcaster`; UR10: `scaled_joint_trajectory_controller`,
+  `joint_state_broadcaster`, `speed_scaling_state_broadcaster`,
+  `io_and_status_controller`, `ur_configuration_controller` (it serves
+  the software version), `force_torque_sensor_broadcaster` (the joint-state
+  broadcaster is chained to it)). The list goes into `preflight.json`.
+  `ur10.launch.py` deactivates the three other controllers
+  `ur_robot_driver` 3.9 activates (`gravity_update_controller`,
+  `friction_model_controller`, `tcp_pose_broadcaster`) and prints
+  `erd_ur10: deactivated ...`;
+* UR10: the controller's software version differs from
+  `connection.software_version`;
+* `safety.vendor_checksum` is empty. It is copied into every run's
+  `manifest.yaml` and the dataset contract.
+
+At L1/L2 the same items are listed with `would_pass` but don't gate.
+
 ## Running a mock (L1) session
 
 ```bash
@@ -50,6 +166,34 @@ Output lands in `$ERD_DATA_ROOT/<robot>/<date>/<run_id>/` (`recording.output_roo
 `robot_state_publisher` still latching an old `/robot_description` is a real,
 confusing failure mode (the new `ros2_control_node` silently loads the *old*
 URDF).
+
+## Pre-session check: the green L1+L2 set (RR_14 P-2)
+
+Before every hardware session, run these four with **the exact code that
+goes to the laptop** (one robot stack at a time, domain 87). Each must end
+`status: synthetic` in `manifest.yaml` and `validation.json`:
+
+```bash
+record_iiwa --config $ERD_LAB/iiwa_mock.yaml all --no-confirm   # iiwa.launch.py hardware:=mock
+record_iiwa --config $ERD_LAB/iiwa_sim.yaml  all --no-confirm   # + run_emulator.sh, hardware:=emulator
+record_ur10 --config $ERD_LAB/ur10_mock.yaml all --no-confirm   # ur10.launch.py hardware:=mock
+record_ur10 --config $ERD_LAB/ur10_sim.yaml  all --no-confirm   # + start_ursim.sh, hardware:=ursim, at home
+```
+
+`synthetic` means every check is `true`, or failed on the fixed
+simulator-limits list (`validate.SIMULATOR_LIMITS`; `simulator_limit:` on the
+check, listed under `simulator_limits`), or is the iiwa's allowed
+`not_applicable` freshness:
+* mock: `tau != ft`, `sign convention` (no torque channels),
+  `identification freshness` (no temperatures; UR10);
+* URSim: `tau != ft` (pure feed-forward current);
+* emulator: nothing; the iiwa L2 `sign convention` must be true on A2 and A4
+  (the sim poses give 52 / 31 N*m of gravity range).
+
+The list is never consulted on `hardware: real`. A failing simulator run
+ends `invalid`. Contracts written from mock/emulator/URSim data say
+`"source": "synthetic_mock"` with `real.hardware`; `evaluate` refuses a
+contract whose `source` and hardware disagree.
 
 ## The live safety monitor and stopping a run (RR_04 A-1)
 
@@ -160,16 +304,22 @@ Real-data parquet signals retain float64 precision so the recorded positions
 and their declared derivatives remain consistent after writing the file.
 
 The monitor's own joint-state/controller-state samples are served by a
-dedicated executor thread (`_MonitorFeed`), not by this process's main
-poll loop, so a busy main thread can never leave them stale at the iiwa's
-1 kHz (RR_08 S2c). This has not been re-measured live against the
-emulator this pass; re-run the P4 item 7 latency/cancel-latency check
-before relying on the numbers.
+dedicated executor thread (`_MonitorFeed`, a `SingleThreadedExecutor`: rclpy's
+multi-threaded executor delivered only 2-11 of the 1000 msg/s), not by this
+process's main poll loop, so a busy main thread can never leave them stale at
+the iiwa's 1 kHz (RR_08 S2c). The 1 kHz logging subscription exists only
+while preflight measures the rate (or the UR sidecar alignment runs);
+otherwise its queue refills during every blocking pause and draining it
+starves the feed. Measured on the emulator (RR_11): trigger -> cancel
+3.0-7.7 ms over 20 injections, sample age p99 1.3 ms.
 
 To script the speed-scaling abort on URSim (RR_08 S2d, P4 item 9) instead
 of operating the pendant by hand, run `ros2 run erd_ur10
-speed_slider_abort --robot-ip <ip> --delay-s <seconds into the excitation>
---fraction 0.5` alongside `record_ur10`; it opens a third, input-only RTDE
-connection and expects the live monitor to abort once `speed_scaling` drops
-below `safety.SPEED_SCALING_FLOOR` (0.999). Not yet run against a live
-URSim this pass.
+speed_slider_abort --delay-s <seconds into the excitation> --fraction 0.5`
+alongside `record_ur10`, only while an excitation/sweep segment is moving.
+It calls the driver's `/io_and_status_controller/set_speed_slider` service
+(a second RTDE client cannot write the slider: the driver's connection owns
+those inputs, S-24), holds the fraction for `--hold-s`, and always resets
+the slider to 1.0 at the end, also on Ctrl-C. Expect the live monitor to
+abort once `speed_scaling` drops below `safety.SPEED_SCALING_FLOOR`
+(0.999).

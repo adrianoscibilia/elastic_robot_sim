@@ -9,6 +9,7 @@ loads in the same process as a sourced ROS environment (T1.0/T1.6).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -42,7 +43,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"plan ok: {len(bundle.segments)} segments, config_digest={bundle.config_digest[:12]}, "
           f"rejected_for_collision={bundle.rejected_for_collision}")
+    ranges = gravity_ranges(config)
+    (Path(args.output_dir) / "gravity_range.json").write_text(json.dumps(ranges, indent=2))
+    print("gravity range over the standstill poses (RR_12 B-3; a slope is testable at >= 10x the standstill sigma):")
+    for joint, entry in ranges["joints"].items():
+        print(f"  {joint}: {entry['range_nm']:.3f} N*m  (min {entry['min_nm']:.3f}, max {entry['max_nm']:.3f})")
     return 0
+
+
+def gravity_ranges(config) -> dict:
+    """Pinocchio gravity torque of the bare sim asset at each standstill pose,
+    and its per-joint range: the poses must load the joints differently for
+    E-iiwa-2 / the E-ur-1 standstill slope to be testable (RR_12 B-3)."""
+    import numpy as np
+    from elastic_sim import identification as idn
+    from elastic_sim.assets import AssetRegistry
+
+    pin, model, data = idn.build_model(AssetRegistry.for_repository().load(config.description.sim_asset))
+    torques = np.asarray([pin.computeGeneralizedGravity(model, data, np.asarray(pose, dtype=float)).copy()
+                          for pose in config.poses.standstill])
+    return {"poses": [list(map(float, pose)) for pose in config.poses.standstill],
+            "gravity_nm": torques.tolist(),
+            "joints": {name: {"min_nm": float(torques[:, j].min()), "max_nm": float(torques[:, j].max()),
+                              "range_nm": float(np.ptp(torques[:, j]))} for j, name in enumerate(config.joint_order)}}
 
 
 if __name__ == "__main__":

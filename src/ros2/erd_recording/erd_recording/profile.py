@@ -43,6 +43,13 @@ class RobotProfile:
     #: `control_msgs/FollowJointTrajectory` action and is therefore always a
     #: client on it, with or without any operator interference.
     competing_action_client_allowlist: tuple[str, ...] = ()
+    #: RR_12 A-3a: exactly these controllers may be active on ``hardware: real``.
+    expected_active_controllers: tuple[str, ...] = ()
+    #: RR_12 A-3b: ``ur_msgs/srv/GetRobotSoftwareVersion`` service (UR only).
+    software_version_service: str | None = None
+    #: one encoder count of the recorded joint position (RR_12 S5.1 table:
+    #: iiwa S-1, UR10 S-24 class E); RR_14 P-3's floor for the rung-4a threshold.
+    position_count_rad: float = 0.0
 
 
 IIWA_PROFILE = RobotProfile(
@@ -52,12 +59,14 @@ IIWA_PROFILE = RobotProfile(
     joint_state_topic="/dynamic_joint_states",
     driver_joint_order=("joint_a1", "joint_a2", "joint_a3", "joint_a4", "joint_a5", "joint_a6", "joint_a7"),
     rate_hz=1000.0,
+    position_count_rad=5.989e-8,
     hardware_choices=("mock", "emulator", "real"),
     command_interfaces=("position",),
     state_interfaces=("position", "velocity", "effort", "commanded_effort"),
     has_fri_gpio=True,
     torque_abort_state_interface="effort",
     controller_spawns_active=False,
+    expected_active_controllers=("erd_arm_controller", "joint_state_broadcaster", "erd_state_broadcaster"),
 )
 
 UR10_PROFILE = RobotProfile(
@@ -68,12 +77,20 @@ UR10_PROFILE = RobotProfile(
     driver_joint_order=("shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                         "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"),
     rate_hz=125.0,
+    position_count_rad=4.79e-7,
     hardware_choices=("mock", "ursim", "real"),
     command_interfaces=("position",),
     state_interfaces=("position", "velocity"),
     has_ur_status_topics=True,
     controller_spawns_active=True,
     competing_action_client_allowlist=("trajectory_until_node",),
+    expected_active_controllers=("scaled_joint_trajectory_controller", "joint_state_broadcaster",
+                                 "speed_scaling_state_broadcaster", "io_and_status_controller",
+                                 # A-3b reads the software version through it:
+                                 "ur_configuration_controller",
+                                 # joint_state_broadcaster is chained to it:
+                                 "force_torque_sensor_broadcaster"),
+    software_version_service="/ur_configuration_controller/get_robot_software_version",
 )
 
 

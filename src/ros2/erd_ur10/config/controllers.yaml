@@ -55,6 +55,15 @@ controller_manager:
     tool_contact_controller:
       type: ur_controllers/ToolContactController
 
+    # Spawned by ur_robot_driver >= 3.9's ur_control.launch.py; without a
+    # type here its spawner dies and takes scaled_joint_trajectory_controller
+    # down with it (RR_10, live on peepo).
+    gravity_update_controller:
+      type: ur_controllers/GravityUpdateController
+
+    twist_controller:
+      type: ur_controllers/TwistController
+
     # The way this is currently implemented upstream doesn't really work for us. When using
     # position control, the robot will have a tracking error. However, limits will be enforced
     # from the currently reported position, effectively limiting the possible step size using the
@@ -202,6 +211,14 @@ friction_model_controller:
     tf_prefix: "$(var tf_prefix)"
 
 freedrive_mode_controller:
+  ros__parameters:
+    tf_prefix: "$(var tf_prefix)"
+
+gravity_update_controller:
+  ros__parameters:
+    tf_prefix: "$(var tf_prefix)"
+
+twist_controller:
   ros__parameters:
     tf_prefix: "$(var tf_prefix)"
 

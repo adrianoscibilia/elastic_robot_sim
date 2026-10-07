@@ -20,7 +20,8 @@ def test_synthetic_reference_matches_robot(robot, short, rate, dof):
     assert reference['n_dof'] == dof
     differentiation = differentiation_from_reference(reference, rate_real=rate, probe_top_real=0,
                                                      reference_path=path)
-    assert differentiation['rate'] == rate
+    assert differentiation['sample_rate_hz'] == rate
+    assert differentiation['cutoff_matched'] is True
     assert differentiation['sg_window'] % 2 == 1
     with pytest.raises(ValueError, match='joint order'):
         load_reference(path, robot=robot, joint_order=tuple(reversed(config.joint_order)))

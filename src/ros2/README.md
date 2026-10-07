@@ -90,7 +90,11 @@ ros2 run erd_recording record_iiwa --config $ERD_LAB/iiwa_mock.yaml all
 # cannot both bind the FRI port on one host (the client's SDK code binds a
 # UDP wildcard address; two same-host wildcard binds always conflict), so the
 # emulator runs in its own Docker network namespace/bridge IP:
-bash $ERD_REPO_ROOT/src/ros2/erd_fri_emulator/scripts/run_emulator.sh
+# --initial-positions starts the emulator at the lab config's poses.home
+# (iiwa_sim.yaml), the pose the operator leaves the real robot in; without it
+# the emulator starts at all zeros and preflight's home/still check refuses.
+bash $ERD_REPO_ROOT/src/ros2/erd_fri_emulator/scripts/run_emulator.sh \
+    --initial-positions 0,0.3,0,-1.2,0,0.8,0
 # -> prints the container IP; use it as robot_ip:
 ros2 launch erd_iiwa iiwa.launch.py hardware:=emulator robot_ip:=<printed IP> \
     lab_config:=$ERD_LAB/iiwa_sim.yaml
@@ -105,11 +109,28 @@ ros2 run erd_ur10 start_ursim.sh
 ros2 launch erd_ur10 ur10.launch.py hardware:=ursim headless_mode:=true \
     robot_ip:=<printed IP> reverse_ip:=<printed gateway IP> \
     lab_config:=$ERD_LAB/ur10_sim.yaml
+# URSim powers up at its own default pose, not ur10_sim.yaml's poses.home:
+# move there once (slowly) before the first record_ur10, and again after any
+# aborted run:
+ros2 action send_goal /scaled_joint_trajectory_controller/follow_joint_trajectory \
+    control_msgs/action/FollowJointTrajectory "{trajectory: {joint_names: [shoulder_pan_joint, \
+    shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint], points: \
+    [{positions: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0], time_from_start: {sec: 15}}]}}"
 ```
 
 `lab_config:=` on both launch lines generates the JTC's per-joint path/goal
 tolerances from `limits.abort.tracking_rad` (RR_04 A-5) -- pass the same file
 the `record_iiwa`/`record_ur10` command uses.
+
+**Measurement tools and offline stages** (RR_12; details in
+`erd_recording/docs/OPERATOR.md`):
+
+```bash
+ros2 run erd_recording erd_link_test --config $ERD_LAB/iiwa_sim.yaml 300     # rung 1: link stats, no motion
+ros2 run erd_recording erd_monitor_test --config $ERD_LAB/iiwa_sim.yaml      # L1/L2: 20 monitor cancels
+# offline, on any copy of a run folder (convert | validate | report | evaluate):
+ros2 run erd_recording record_iiwa --config $RUN/config.yaml --run-dir $RUN convert
+```
 
 See `RR_03_IMPLEMENTATION_REPORT.md` and `RR_05_IMPLEMENTATION_REPORT.md` in
 `REFACTOR_SPECS/ros2_real_data/` for every acceptance result.

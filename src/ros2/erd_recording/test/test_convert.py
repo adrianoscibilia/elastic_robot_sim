@@ -235,7 +235,8 @@ def test_differentiation_same_rate_copies_the_window(tmp_path):
                                             reference_path=reference_path)
     assert result["sg_window"] == 11
     assert result["sg_poly"] == 3
-    assert result["rate"] == 1000.0
+    assert result["sample_rate_hz"] == 1000.0
+    assert result["cutoff_matched"] is True
     assert str(reference_path) in result["derived_from"]
 
 
@@ -280,7 +281,7 @@ def test_consumer_loads_real_dataset(iiwa_asset, tmp_path):
     output = tmp_path / "synthetic_mock.parquet"
 
     contract = real_contract(
-        manifest, n_dof=n_dof, target_instrument="iiwa_joint_torque_sensor_raw",
+        manifest, hardware="mock", n_dof=n_dof, target_instrument="iiwa_joint_torque_sensor_raw",
         target_semantics="joint torque sensor, raw, gravity included [Nm]",
         q_side="motor", dq_side="motor", dq_source="position_derivative",
         tau_instrument="fri_commanded_torque",
@@ -295,6 +296,7 @@ def test_consumer_loads_real_dataset(iiwa_asset, tmp_path):
         }}},
         real_block={"robot_id": "synthetic_mock"},
     )
+    assert contract["source"] == "synthetic_mock" and contract["real"]["hardware"] == "mock"
     csv_path, manifest_path, contract_path = write_real_dataset(frame, manifest, contract, output)
 
     script = (

@@ -28,15 +28,156 @@ CONTRACT_SCHEMA = "elastic_sim.identification/3"
 CONTRACT_OWNER_PENDING = "pending RR_02 CR-4"
 
 
-def load_reference(path: str | Path, *, robot: str, joint_order: tuple[str, ...]) -> dict[str, Any]:
-    reference = json.loads(Path(path).read_text())
+#: RR_12 C-1: an achieved SG cutoff within this relative distance of the
+#: training reference's counts as matched.
+CUTOFF_MATCH_RTOL = 0.01
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def portable_path(path: str | Path) -> str:
+    """RR_12 C-3: ``path`` relative to ``$ERD_REPO_ROOT`` when it lies inside
+    the repository (runs move between the laptop and peepo), else unchanged."""
+    import os
+
+    resolved = Path(path).expanduser().resolve()
+    root = os.environ.get("ERD_REPO_ROOT")
+    if root:
+        try:
+            return str(resolved.relative_to(Path(root).expanduser().resolve()))
+        except ValueError:
+            pass
+    return str(resolved)
+
+
+def reference_manifest_path(contract_path: str | Path) -> Path:
+    """``<stem>.contract.json`` -> ``<stem>.manifest.json`` (the production layout)."""
+    path = Path(contract_path)
+    name = path.name
+    if not name.endswith(".contract.json"):
+        raise ValueError(f"reference contract {path} must be named <stem>.contract.json")
+    return path.with_name(name[: -len(".contract.json")] + ".manifest.json")
+
+
+def resolve_reference(config_path: str | Path, configured: str | None, configured_sha256: str | None,
+                      cli_path: str | None = None, cli_sha256: str | None = None) -> tuple[str, str | None]:
+    """RR_12 C-1: the reference contract a stage uses, and the sha256 it must
+    have. A path on the command line replaces the configured one together with
+    its pin: the configured sha256 only ever applies to the configured file."""
+    if cli_path:
+        path, expected = cli_path, cli_sha256
+    else:
+        path, expected = configured, configured_sha256
+    if not path:
+        raise ValueError("no --reference-contract given and consumer.reference_contract is null (RR_01 S8.2)")
+    resolved = (Path(config_path).expanduser().resolve().parent / Path(path).expanduser()).resolve()
+    return str(resolved), (expected.lower() if expected else None)
+
+
+def compare_arm(reference_asset: str, sim_asset: str, *, tolerance: float = 1e-9) -> dict[str, Any]:
+    """RR_12 C-1: the reference manifest's ``asset`` (a ``*_table`` variant)
+    must carry the same arm as ``description.sim_asset``: joint names and
+    types/axes, every joint placement but the first (the table only moves
+    the base) and every link inertia. Needs Pinocchio (clean subprocess)."""
+    from elastic_sim import identification as idn
+    from elastic_sim.assets import AssetRegistry
+
+    registry = AssetRegistry.for_repository()
+    _, ref_model, _ = idn.build_model(registry.load(reference_asset))
+    _, sim_model, _ = idn.build_model(registry.load(sim_asset))
+    problems: list[str] = []
+    ref_names = list(ref_model.names)[1:]
+    sim_names = list(sim_model.names)[1:]
+    if ref_names != sim_names:
+        problems.append(f"joint names {ref_names} != {sim_names}")
+    else:
+        for index in range(1, sim_model.njoints):
+            name = sim_model.names[index]
+            ref_joint, sim_joint = ref_model.joints[index], sim_model.joints[index]
+            if ref_joint.shortname() != sim_joint.shortname():
+                problems.append(f"{name}: joint type {ref_joint.shortname()} != {sim_joint.shortname()}")
+            elif hasattr(sim_joint, "axis") and np.abs(np.asarray(ref_joint.axis) - np.asarray(sim_joint.axis)).max() > tolerance:
+                problems.append(f"{name}: axis differs")
+            if ref_model.parents[index] != sim_model.parents[index]:
+                problems.append(f"{name}: parent differs")
+            if index > 1:
+                placement = np.abs(ref_model.jointPlacements[index].homogeneous
+                                   - sim_model.jointPlacements[index].homogeneous).max()
+                if placement > tolerance:
+                    problems.append(f"{name}: joint placement differs by {placement:.3g}")
+            ref_inertia, sim_inertia = ref_model.inertias[index], sim_model.inertias[index]
+            inertia = max(abs(ref_inertia.mass - sim_inertia.mass),
+                          float(np.abs(ref_inertia.lever - sim_inertia.lever).max()),
+                          float(np.abs(ref_inertia.inertia - sim_inertia.inertia).max()))
+            if inertia > tolerance:
+                problems.append(f"{name}: link inertia differs by {inertia:.3g}")
+    return {"ok": not problems, "reference_asset": reference_asset, "sim_asset": sim_asset,
+            "compared": "joint names, types/axes, placements of joints 2..n, link inertias", "problems": problems}
+
+
+def load_reference(
+    path: str | Path, *, robot: str, joint_order: tuple[str, ...], expected_sha256: str | None = None,
+    hardware: str | None = None, sim_asset: str | None = None,
+) -> dict[str, Any]:
+    """Read a training reference contract (RR_01 S8.2; RR_12 C-1).
+
+    Production contracts carry neither ``joint_names`` nor a rate: both come
+    from the sibling ``<stem>.manifest.json`` (``joint_names``,
+    ``sample_time_step``/``differentiation.sample_rate_hz``, ``asset``). The
+    checked-in synthetic references have no manifest and keep both keys in
+    the contract. Refuses: a sha256 other than ``expected_sha256``; a joint
+    order other than ``joint_order``; ``hardware: real`` against a
+    ``synthetic: true`` reference; a manifest asset whose arm differs from
+    ``sim_asset`` (checked only when ``sim_asset`` is given).
+
+    The returned dict is the contract plus ``_path``, ``_sha256``,
+    ``_joint_names``, ``_rate_hz``, ``_asset`` and ``_arm_check``.
+    """
+    path = Path(path)
+    digest = file_sha256(path)
+    if expected_sha256 and digest != expected_sha256.lower():
+        raise ValueError(f"reference contract {path} has sha256 {digest}, the config pins {expected_sha256}")
+    reference = json.loads(path.read_text())
     if reference.get("schema") != CONTRACT_SCHEMA or reference.get("n_dof") != len(joint_order):
         raise ValueError("reference contract schema or n_dof mismatch")
-    if reference.get("joint_names") != list(joint_order):
-        raise ValueError("reference contract joint order mismatch")
     if reference.get("robot", robot) != robot:
         raise ValueError("reference contract robot mismatch")
-    return reference
+    if hardware == "real" and reference.get("synthetic", False):
+        raise ValueError(f"{path} is a synthetic reference; hardware: real needs the production contract (RR_12 C-1)")
+
+    manifest_path = reference_manifest_path(path)
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+    elif not reference.get("synthetic", False):
+        raise ValueError(f"reference manifest {manifest_path} is missing (copy it next to the contract, RR_12 S4.2)")
+    joint_names = manifest.get("joint_names", reference.get("joint_names"))
+    if joint_names != list(joint_order):
+        raise ValueError("reference contract joint order mismatch")
+    differentiation = reference.get("differentiation") or {}
+    rate = differentiation.get("sample_rate_hz", differentiation.get("rate"))
+    if rate is None and manifest.get("sample_time_step"):
+        rate = 1.0 / float(manifest["sample_time_step"])
+    if rate is None:
+        raise ValueError(f"{path}: no differentiation.sample_rate_hz/rate and no manifest sample_time_step")
+
+    arm_check = None
+    asset = manifest.get("asset")
+    if asset and sim_asset:
+        arm_check = compare_arm(asset, sim_asset)
+        if not arm_check["ok"]:
+            raise ValueError(f"reference asset {asset!r} is not the arm of {sim_asset!r}: {arm_check['problems']}")
+
+    result = dict(reference)
+    result.update(_path=str(path), _sha256=digest, _joint_names=list(joint_names), _rate_hz=float(rate),
+                  _asset=asset, _arm_check=arm_check)
+    return result
 
 
 def _round_to_odd(value: float) -> int:
@@ -44,39 +185,52 @@ def _round_to_odd(value: float) -> int:
     return rounded if rounded % 2 == 1 else rounded + 1
 
 
+def sg_cutoff_hz(rate_hz: float, sg_window: int) -> float:
+    """The order-3 SG differentiator's working cutoff, ``0.45 * rate / W``
+    (the convention the production contracts use: 1000 Hz, W 5 -> 90 Hz)."""
+    return 0.45 * float(rate_hz) / int(sg_window)
+
+
 def differentiation_from_reference(
     reference_contract: Mapping[str, Any], *, rate_real: float, probe_top_real: float,
     reference_path: str | Path,
 ) -> dict[str, Any]:
-    """RR_01 S8.2's differentiation rule, exactly: same rate as the training
+    """RR_01 S8.2's differentiation rule: same rate as the training
     reference copies its window (``sg_poly``/``sg_window``); a different rate
     keeps the reference's **cutoff**, solving for the window that gives that
-    cutoff at ``rate_real``
-    (``W = odd(round(0.45 * rate_real / sg_cutoff_hz_ref))``, floored at
-    ``sg_poly + 2``). This is the UR10 at 125 Hz against a 500 Hz reference;
-    the iiwa at 1 kHz against an ``iiwa_drive`` reference is the same-rate
-    case.
+    cutoff at ``rate_real`` (``W = odd(round(0.45 * rate_real /
+    sg_cutoff_hz_ref))``, floored at ``sg_poly + 2``).
 
-    ``reference_path`` is hashed into ``derived_from`` so the contract names
-    exactly which training contract file produced this window.
+    RR_12 C-1/F-5: the block uses the production key names, states the cutoff
+    the window **achieves** at ``rate_real`` (``sg_cutoff_hz``) next to the
+    reference's (``reference_cutoff_hz``), and whether they match
+    (``cutoff_matched``): the UR10 at 125 Hz floors at W 5 = 11.25 Hz against
+    a 45 Hz reference. ``derived_from`` is the repo-relative path plus the
+    file's sha256 (RR_12 C-3), so the block is the same on every machine.
     """
     ref_diff = reference_contract["differentiation"]
-    ref_rate = float(ref_diff["rate"])
+    ref_rate = float(ref_diff.get("sample_rate_hz", ref_diff.get("rate", reference_contract.get("_rate_hz", 0.0))))
     sg_poly = int(ref_diff["sg_poly"])
-    sg_cutoff_hz = float(ref_diff["sg_cutoff_hz"])
+    reference_cutoff = float(ref_diff["sg_cutoff_hz"])
 
+    floored = False
     if abs(rate_real - ref_rate) <= 1.0e-6:
         sg_window = int(ref_diff["sg_window"])
     else:
-        sg_window = _round_to_odd(0.45 * rate_real / sg_cutoff_hz)
+        sg_window = _round_to_odd(0.45 * rate_real / reference_cutoff)
         floor = sg_poly + 2
         if sg_window < floor:
             sg_window = floor if floor % 2 == 1 else floor + 1
-
-    digest = hashlib.sha256(Path(reference_path).read_bytes()).hexdigest()
+            floored = True
+    achieved = sg_cutoff_hz(rate_real, sg_window)
+    matched = abs(achieved - reference_cutoff) <= CUTOFF_MATCH_RTOL * reference_cutoff
+    digest = file_sha256(reference_path)
     return {
-        "rate": rate_real, "sg_window": sg_window, "sg_poly": sg_poly, "sg_cutoff_hz": sg_cutoff_hz,
-        "probe_top_hz": probe_top_real, "derived_from": f"{Path(reference_path)}#sha256:{digest}",
+        "sample_rate_hz": float(rate_real), "sg_window": sg_window, "sg_poly": sg_poly,
+        "sg_cutoff_hz": achieved, "reference_cutoff_hz": reference_cutoff,
+        "reference_sample_rate_hz": ref_rate, "cutoff_matched": bool(matched), "window_floored": floored,
+        "probe_top_hz": probe_top_real,
+        "derived_from": f"{portable_path(reference_path)}#sha256:{digest}",
     }
 
 
@@ -187,9 +341,22 @@ def real_baselines(
     }
 
 
+#: RR_02 CR-4's ``source`` values: ``real`` only for ``hardware: real``; mock,
+#: the FRI emulator and URSim all write ``synthetic_mock`` (RR_14 P-1).
+CONTRACT_SOURCES = ("sim", "real", "synthetic_mock")
+
+
+def contract_source(hardware: str) -> str:
+    """The contract's ``source`` for a lab file's ``hardware`` value."""
+    if hardware not in ("mock", "emulator", "ursim", "real"):
+        raise ValueError(f"unknown hardware {hardware!r}")
+    return "real" if hardware == "real" else "synthetic_mock"
+
+
 def real_contract(
     manifest: Mapping[str, Any],
     *,
+    hardware: str,
     n_dof: int,
     target_instrument: str,
     target_semantics: str,
@@ -218,10 +385,13 @@ def real_contract(
     block is carried into the contract, with its statistic string (RR_01
     S8.2: "with the statistic string of add_baselines_to_contract"), not just
     the ``test`` split alone.
+
+    ``source`` follows ``hardware`` (:func:`contract_source`), which the
+    ``real`` block also records.
     """
     contract: dict[str, Any] = {
         "schema": CONTRACT_SCHEMA,
-        "source": "real",
+        "source": contract_source(hardware),
         "n_dof": n_dof,
         "input_columns": [f"q0..q{n_dof - 1}", f"dq0..dq{n_dof - 1}", f"tau0..tau{n_dof - 1}"],
         "target_columns": [f"ft0..ft{n_dof - 1}"],
@@ -241,7 +411,7 @@ def real_contract(
         "noise": None,
         "friction_split": friction_split,
         "baselines": {"statistic": baselines.get("statistic"), "splits": dict(baselines.get("splits", {}))},
-        "real": dict(real_block),
+        "real": {"hardware": hardware, **dict(real_block)},
         "contract_owner": CONTRACT_OWNER_PENDING,
         "requires_consumer": "dynamic_model_nn dataset.py with the general ft0..ft{dof-1} branch",
     }
@@ -252,5 +422,7 @@ def write_real_contract(dataset_path: Path, contract: Mapping[str, Any]) -> Path
     """Overwrite ``<stem>.contract.json`` written by ``write_dataset`` with
     the real contract (RR_02 CR-4: the ROS 2 side's interim writer)."""
     contract_path = Path(dataset_path).with_suffix(".contract.json")
-    contract_path.write_text(json.dumps(dict(contract), indent=2), encoding="utf-8")
+    contract_path.write_text(json.dumps(dict(contract), indent=2,
+                                        default=lambda v: v.item() if isinstance(v, np.generic) else str(v)),
+                             encoding="utf-8")
     return contract_path

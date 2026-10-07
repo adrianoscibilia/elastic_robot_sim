@@ -1,73 +1,50 @@
-"""The speed-slider input recipe and trigger/release logic (RR_08 S2d, P4
-item 9), tested against a fake RTDE connection (no live RTDE server
-available in this environment, mirrors test_rtde_logger.py)."""
+"""The speed-slider sequence (RR_08 S2d, RR_10 item 2), tested against a fake
+service call (no running driver in this environment)."""
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+import pytest
 
-from erd_ur10.speed_slider_abort import (
-    SPEED_SLIDER_RECIPE,
-    build_speed_slider_connection,
-    release_speed_slider,
-    trigger_speed_slider,
-)
+from erd_ur10.speed_slider_abort import RESET_FRACTION, run_sequence, set_speed_slider
 
 
-def _fake_setup():
-    return SimpleNamespace(**{name: None for name, _ in SPEED_SLIDER_RECIPE})
+class _FakeService:
+    def __init__(self, answers=None):
+        self.calls = []
+        self._answers = list(answers or [])
+
+    def __call__(self, fraction):
+        self.calls.append(fraction)
+        return self._answers.pop(0) if self._answers else True
 
 
-def test_trigger_sets_mask_and_fraction_then_sends():
-    connection = MagicMock()
-    setup = _fake_setup()
-    trigger_speed_slider(connection, setup, fraction=0.5)
-    assert setup.speed_slider_mask == 1
-    assert setup.speed_slider_fraction == 0.5
-    connection.send.assert_called_once_with(setup)
+def test_sequence_lowers_holds_then_resets():
+    service = _FakeService()
+    sleeps = []
+    run_sequence(service, fraction=0.5, delay_s=2.0, hold_s=3.0, sleep=sleeps.append)
+    assert service.calls == [0.5, RESET_FRACTION]
+    assert sleeps == [2.0, 3.0]
 
 
-def test_release_hands_the_slider_back():
-    connection = MagicMock()
-    setup = _fake_setup()
-    release_speed_slider(connection, setup)
-    assert setup.speed_slider_mask == 0
-    assert setup.speed_slider_fraction == 1.0
-    connection.send.assert_called_once_with(setup)
+def test_reset_runs_when_the_hold_is_interrupted():
+    service = _FakeService()
+
+    def interrupted(seconds):
+        if seconds == 3.0:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_sequence(service, fraction=0.5, delay_s=0.0, hold_s=3.0, sleep=interrupted)
+    assert service.calls == [0.5, RESET_FRACTION]
 
 
-def test_build_speed_slider_connection_configures_the_input_recipe(monkeypatch):
-    fake_setup = _fake_setup()
-    fake_connection = MagicMock()
-    fake_connection.send_input_setup.return_value = fake_setup
-    fake_connection.send_start.return_value = True
-
-    fake_rtde_module = SimpleNamespace(RTDE=MagicMock(return_value=fake_connection))
-    monkeypatch.setitem(__import__("sys").modules, "rtde.rtde", fake_rtde_module)
-    monkeypatch.setitem(__import__("sys").modules, "rtde", SimpleNamespace(rtde=fake_rtde_module))
-
-    connection, setup = build_speed_slider_connection("10.0.0.5", port=30004)
-
-    fake_connection.connect.assert_called_once()
-    fake_connection.get_controller_version.assert_called_once()
-    names = [name for name, _ in SPEED_SLIDER_RECIPE]
-    types = [kind for _, kind in SPEED_SLIDER_RECIPE]
-    fake_connection.send_input_setup.assert_called_once_with(names, types)
-    fake_connection.send_start.assert_called_once()
-    assert connection is fake_connection
-    assert setup is fake_setup
+def test_refused_fraction_raises_and_still_resets():
+    service = _FakeService(answers=[False, True])
+    with pytest.raises(RuntimeError):
+        run_sequence(service, fraction=0.5, delay_s=0.0, hold_s=1.0, sleep=lambda s: None)
+    assert service.calls == [0.5, RESET_FRACTION]
 
 
-def test_build_speed_slider_connection_raises_on_refused_setup(monkeypatch):
-    fake_connection = MagicMock()
-    fake_connection.send_input_setup.return_value = None
-
-    fake_rtde_module = SimpleNamespace(RTDE=MagicMock(return_value=fake_connection))
-    monkeypatch.setitem(__import__("sys").modules, "rtde.rtde", fake_rtde_module)
-    monkeypatch.setitem(__import__("sys").modules, "rtde", SimpleNamespace(rtde=fake_rtde_module))
-
-    try:
-        build_speed_slider_connection("10.0.0.5")
-        raised = False
-    except RuntimeError:
-        raised = True
-    assert raised
+def test_out_of_range_fraction_is_rejected_before_calling():
+    service = _FakeService()
+    with pytest.raises(ValueError):
+        set_speed_slider(service, 1.5)
+    assert service.calls == []

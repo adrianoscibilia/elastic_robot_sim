@@ -7,6 +7,7 @@ is plain Python.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import signal
 import subprocess
@@ -32,7 +33,7 @@ assert_environment(require_ros=True, require_pinocchio=False)
 import rclpy  # noqa: E402
 from rclpy.action import ActionClient  # noqa: E402
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup  # noqa: E402
-from rclpy.executors import MultiThreadedExecutor  # noqa: E402
+from rclpy.executors import SingleThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy  # noqa: E402
 from rclpy.time import Time  # noqa: E402
@@ -47,16 +48,21 @@ from trajectory_msgs.msg import JointTrajectoryPoint  # noqa: E402
 from elastic_sim.materialized import MaterializedTrajectory  # noqa: E402
 
 from .bagio import decode_dynamic_joint_state  # noqa: E402
-from .config import LabConfig, load_lab_config  # noqa: E402
+from .config import LabConfig, check_environment_domain, load_lab_config  # noqa: E402
 from .planning import PlanBundle, load_plan  # noqa: E402
 from .profile import RobotProfile, profile_for  # noqa: E402
 from .safety import (  # noqa: E402
+    EXCITATION_KINDS,
     FRI_COMMANDING_ACTIVE,
     STALE_SAMPLE_BUDGET_S,
     MonitorSample,
+    check_abort_override,
+    check_active_controllers,
     check_at_home_and_still,
+    check_software_version,
     check_start_state,
     evaluate_abort_conditions,
+    segment_tracking_rad,
 )
 from .tolerances import GOAL_TOLERANCE_RAD  # noqa: E402
 from .env_guard import clean_ros_subprocess_env  # noqa: E402
@@ -71,11 +77,20 @@ _BASE_BAG_TOPICS = [
     "/rosout", "/diagnostics", "/erd/events",
 ]
 
+#: RR_15: how long `start_sidecar` waits for the sidecar's first RTDE rows.
+SIDECAR_STARTUP_TIMEOUT_S = 10.0
+
 _STATUS_ORDER = ("planned", "recorded", "converted", "valid", "failed", "synthetic")
 
 #: RR_04 A-1: within this long of a triggering sample, a monitor tick must
 #: have reached (not necessarily completed) its cancel decision.
 _MONITOR_POLL_PERIOD_S = 0.01
+
+
+#: RR_13 B-2: segments start this long after rosbag2's "Recording..." line,
+#: past its start-up receive stall (seen at 1.10-1.44 s).
+RECORDER_STARTUP_S = 2.0
+_ROSBAG2_RECORDING = re.compile(r"\[(\d+\.\d+)\] \[rosbag2_recorder\]: Recording\.\.\.")
 
 
 def bag_topics_for(profile: RobotProfile) -> list[str]:
@@ -188,6 +203,15 @@ def _write_manifest_status(paths: RunPaths, status: str, **extra: Any) -> None:
     paths.manifest.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
+def _write_manifest_fields(paths: RunPaths, **fields: Any) -> None:
+    """Merge ``fields`` into ``manifest.yaml`` without touching ``status``."""
+    data = {}
+    if paths.manifest.is_file():
+        data = yaml.safe_load(paths.manifest.read_text(encoding="utf-8")) or {}
+    data.update(fields)
+    paths.manifest.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
 class PipelineError(RuntimeError):
     pass
 
@@ -244,6 +268,7 @@ def stage_plan(config: LabConfig, config_path: str, paths: RunPaths, *, n_candid
     result = subprocess.run(command, env=clean_ros_subprocess_env(), capture_output=True, text=True)
     if result.returncode != 0:
         raise PipelineError(f"plan subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}")
+    print(result.stdout, end="")  # the plan summary and the gravity ranges (RR_12 B-3)
     bundle = load_plan(paths.plan_dir)
     _write_manifest_status(paths, "planned")
     return bundle
@@ -272,8 +297,8 @@ def _first_point_by_driver_name(
 
 class _MonitorFeed(Node):
     """RR_08 S2c: the monitor's two depth-1 subscriptions (joint state,
-    controller state), serviced by a dedicated ``MultiThreadedExecutor``
-    thread so a busy main thread can never leave them stale.
+    controller state), serviced by a dedicated executor thread so a busy
+    main thread can never leave them stale.
 
     This has to be a **second node**, not a second callback group on
     ``RecordingNode`` spun from the same thread: ``rclpy.spin_once(node,
@@ -290,6 +315,15 @@ class _MonitorFeed(Node):
     executor thread does not share that failure mode: it keeps servicing
     its own (tiny, two-subscription) wait set on its own schedule
     regardless of what the main thread's `spin_once` is doing.
+
+    RR_10, live on the emulator: the executor on that thread is a
+    ``SingleThreadedExecutor``, not the ``MultiThreadedExecutor`` RR_08 S2c
+    named. rclpy 7.1 (Jazzy)'s multi-threaded executor delivered 2-11
+    msg/s of the 1 kHz ``/dynamic_joint_states`` under every QoS tried
+    (depth 1/100, reliable/best-effort), the single-threaded one 1000 msg/s
+    under all of them; with the multi-threaded one the preflight's FRI
+    stability loop saw 22 distinct cycles in 10 s. What S2c needs is the
+    separate thread, which this keeps.
     """
 
     def __init__(self, profile: RobotProfile, on_joint_state: Any, on_controller_state: Any):
@@ -306,7 +340,7 @@ class _MonitorFeed(Node):
             JointTrajectoryControllerState, f"/{profile.controller_name}/controller_state",
             on_controller_state, reliable_latest, callback_group=group,
         )
-        self._executor = MultiThreadedExecutor(num_threads=2)
+        self._executor = SingleThreadedExecutor()
         self._executor.add_node(self)
         self._thread = threading.Thread(
             target=self._executor.spin, name="erd_monitor_feed_executor", daemon=True,
@@ -326,6 +360,20 @@ class RecordingNode(Node):
         self.profile = profile
         self.config = config
         self.abort_requested = False  # set by the SIGINT/SIGTERM handler in _run_all
+        # RR_12 A-4: the monitor's tracking threshold is the lab file's value;
+        # `--abort-tracking-rad` (rung 4a, `--ladder <= 0.1`) lowers it inside
+        # excitation segments only (RR_14 P-3): approaches and returns keep
+        # the file's value. The JTC keeps the file's path tolerance, which
+        # preflight reads back.
+        self.monitor_tracking_rad = config.limits.abort.tracking_rad
+        self.excitation_tracking_rad: float | None = None
+        self._goal_tracking_rad = self.monitor_tracking_rad
+        self._goal_kind: str | None = None
+        # RR_12 A-2b: every evaluation's sample age and every cancel, written to
+        # `monitor.json` per stage.
+        self._monitor_ages_s: list[float] = []
+        self._monitor_evaluations = 0
+        self._monitor_cancels: list[dict[str, Any]] = []
         reliable_deep = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST, depth=2000,
         )
@@ -335,11 +383,17 @@ class RecordingNode(Node):
         self._latest_joint_state_stamp: Any = None
         self._joint_state_log: list[tuple[float, DynamicJointState]] = []
         self._logging = False
-        # Logging-only: feeds `measured_rate_hz` (preflight); the bag already
-        # records everything else, so nothing else should read `_joint_state_log`.
-        self._logging_joint_state_sub = self.create_subscription(
-            DynamicJointState, profile.joint_state_topic, self._on_logging_joint_state, reliable_deep,
-        )
+        # Logging-only: feeds `measured_rate_hz` (preflight) and the UR sidecar
+        # alignment; the bag already records everything else, so nothing else
+        # should read `_joint_state_log`. Subscribed only between
+        # start_state_logging()/stop_state_logging() (RR_10, live on the
+        # emulator): kept subscribed, this depth-2000 1 kHz queue refilled
+        # during every blocking pause (plan load, a standstill hold), and
+        # draining it afterwards kept the main thread busy enough to starve
+        # `_MonitorFeed` of the GIL -- a 50.1 ms stale-sample abort right
+        # after `standstill_hold_0`, with the telemetry itself gap-free.
+        self._logging_qos = reliable_deep
+        self._logging_joint_state_sub: Any = None
 
         self._latest_controller_state: JointTrajectoryControllerState | None = None
         # RR_08 S2c: the monitor's own joint-state/controller-state samples
@@ -439,12 +493,24 @@ class RecordingNode(Node):
     def _on_safety_mode(self, msg: Any) -> None:
         self._safety_mode_normal = bool(msg.mode == 1)  # SafetyMode.NORMAL
 
-    def start_state_logging(self) -> None:
+    def start_state_logging(self, match_timeout_s: float = 2.0) -> None:
         self._joint_state_log.clear()
+        if self._logging_joint_state_sub is None:
+            self._logging_joint_state_sub = self.create_subscription(
+                DynamicJointState, self.profile.joint_state_topic, self._on_logging_joint_state,
+                self._logging_qos,
+            )
+            # Wait for discovery so the caller's window measures data, not matching.
+            deadline = time.time() + match_timeout_s
+            while self._logging_joint_state_sub.get_publisher_count() == 0 and time.time() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.01)
         self._logging = True
 
     def stop_state_logging(self) -> list[tuple[float, DynamicJointState]]:
         self._logging = False
+        if self._logging_joint_state_sub is not None:
+            self.destroy_subscription(self._logging_joint_state_sub)
+            self._logging_joint_state_sub = None
         return list(self._joint_state_log)
 
     def publish_event(self, run_id: str, segment_id: str, kind: str, *, plan_digest: str = "", detail: str = "") -> None:
@@ -708,9 +774,15 @@ class RecordingNode(Node):
 
     # -- the live abort monitor's poll loop (RR_04 A-1; RR_06 P3-2a) ------
 
+    def tracking_rad_for(self, kind: str | None) -> float:
+        """RR_14 P-3: the monitor's tracking threshold for a segment kind."""
+        return segment_tracking_rad(kind, file_rad=self.monitor_tracking_rad,
+                                    excitation_override=self.excitation_tracking_rad)
+
     def send_goal_and_wait(
         self, goal: FollowJointTrajectory.Goal, *, timeout_s: float, run_paths: RunPaths,
         effort_limit: dict[str, float] | None = None, target_speed_fraction: float | None = None,
+        kind: str | None = None,
     ) -> dict[str, Any]:
         """Send one goal, then monitor every abort condition (RR_04 A-1)
         while waiting for the result, cancelling (with a confirmed stop) on
@@ -755,6 +827,8 @@ class RecordingNode(Node):
         result_future = goal_handle.get_result_async()
         deadline = time.time() + timeout_s
         torque_fraction = self.config.limits.abort.torque_fraction if effort_limit is not None else None
+        self._goal_kind = kind
+        self._goal_tracking_rad = self.tracking_rad_for(kind)
         # RR_06 P3-1 item 2, live finding: anything that blocked this
         # process since the last spin (the bag's 1 s pre-roll `time.sleep`,
         # a standstill hold, ...) leaves the monitor's cached sample exactly
@@ -790,8 +864,11 @@ class RecordingNode(Node):
                 break
             rclpy.spin_once(self, timeout_sec=_MONITOR_POLL_PERIOD_S)
             sample = self.build_monitor_sample(effort_limit=effort_limit, target_speed_fraction=target_speed_fraction)
+            self._monitor_evaluations += 1
+            if sample.sample_age_s is not None:
+                self._monitor_ages_s.append(sample.sample_age_s)
             reasons = evaluate_abort_conditions(
-                sample, tracking_rad=self.config.limits.abort.tracking_rad, torque_fraction=torque_fraction,
+                sample, tracking_rad=self._goal_tracking_rad, torque_fraction=torque_fraction,
             )
             if reasons:
                 return self._cancel_and_confirm(goal_handle, result_future, run_paths, reason="; ".join(reasons))
@@ -827,9 +904,62 @@ class RecordingNode(Node):
 
         stationary_ok = self.wait_for_stationary(duration_s=0.5, velocity_tolerance=0.01, timeout_s=stop_timeout_s)
         stop_confirmed = terminal_ok and stationary_ok
+        self._monitor_cancels.append({"reason": reason, "stop_confirmed": stop_confirmed,
+                                      "segment_kind": self._goal_kind, "tracking_rad": self._goal_tracking_rad,
+                                      "terminal_status_seen": bool(terminal_ok), "wall_time": time.time()})
         if not stop_confirmed:
             self.get_logger().error("STOP NOT CONFIRMED -- use the e-stop")
         return {"ok": False, "reason": reason, "stop_confirmed": stop_confirmed}
+
+    def write_monitor_json(self, path: Path, stage: str) -> dict[str, Any]:
+        """RR_12 A-2b: sample-age statistics over every monitor evaluation of
+        this stage, merged into ``path`` under ``stage``; then reset."""
+        ages_ms = np.asarray(self._monitor_ages_s, dtype=float) * 1e3
+        entry: dict[str, Any] = {
+            "evaluations": self._monitor_evaluations, "aged_samples": int(len(ages_ms)),
+            "tracking_rad": self.monitor_tracking_rad,
+            "excitation_tracking_rad": self.tracking_rad_for("excitation"),
+            "tracking_rad_overridden": self.excitation_tracking_rad is not None,
+            "poll_period_s": _MONITOR_POLL_PERIOD_S, "stale_budget_ms": STALE_SAMPLE_BUDGET_S * 1e3,
+            "cancels": list(self._monitor_cancels),
+        }
+        if len(ages_ms):
+            entry["sample_age_ms"] = {"p50": float(np.percentile(ages_ms, 50)), "p99": float(np.percentile(ages_ms, 99)),
+                                      "max": float(ages_ms.max())}
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        data[stage] = entry
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._monitor_ages_s, self._monitor_evaluations, self._monitor_cancels = [], 0, []
+        return entry
+
+    def controller_states(self, timeout_s: float = 10.0) -> dict[str, str] | None:
+        """``{controller: state}`` from ``controller_manager/list_controllers``."""
+        if not self._list_controllers.wait_for_service(timeout_sec=timeout_s):
+            return None
+        future = self._list_controllers.call_async(ListControllers.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+        if not future.done() or future.result() is None:
+            return None
+        return {controller.name: controller.state for controller in future.result().controller}
+
+    def robot_software_version(self, timeout_s: float = 5.0) -> tuple[int, int, int, int] | None:
+        """RR_12 A-3b: (major, minor, bugfix, build) from the UR controller."""
+        if self.profile.software_version_service is None:
+            return None
+        from ur_msgs.srv import GetRobotSoftwareVersion
+
+        client = self.create_client(GetRobotSoftwareVersion, self.profile.software_version_service)
+        try:
+            if not client.wait_for_service(timeout_sec=timeout_s):
+                return None
+            future = client.call_async(GetRobotSoftwareVersion.Request())
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+            if not future.done() or future.result() is None:
+                return None
+            result = future.result()
+            return (int(result.major), int(result.minor), int(result.bugfix), int(result.build))
+        finally:
+            self.destroy_client(client)
 
     def wait_for_stationary(self, *, duration_s: float, velocity_tolerance: float, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -853,21 +983,49 @@ class RecordingNode(Node):
 
     # -- bag lifecycle (RR_04 A-11) ----------------------------------------
 
+    #: RR_13 B-2: `ros2 bag record --log-level`; `debug` adds rosbag2's
+    #: per-topic loss line at ~800 log lines/s, so it is a diagnostic setting.
+    recorder_log_level = "info"
+
     def start_bag(self, bag_dir: Path, *, extra_topics: list[str] | None = None) -> None:
         topics = bag_topics_for(self.profile) + list(extra_topics or [])
         bag_dir.parent.mkdir(parents=True, exist_ok=True)
         log_dir = bag_dir.parent / "raw"
         log_dir.mkdir(parents=True, exist_ok=True)
-        qos_path = write_qos_overrides(log_dir / f"{bag_dir.name}.qos.yaml",
-                                       reliable_deep_topics=["/dynamic_joint_states"])
+        # RR_13 B-2: every 1 kHz stream gets a deep reliable reader (rosbag2's
+        # default depth is 10). This absorbs recorder callback stalls; it cannot
+        # recover messages a depth-1 *writer* (JSB /joint_states, JTC
+        # controller_state) has already overwritten -- see the pre-roll below.
+        qos_path = write_qos_overrides(log_dir / f"{bag_dir.name}.qos.yaml", reliable_deep_topics=[
+            "/dynamic_joint_states", "/joint_states", f"/{self.profile.controller_name}/controller_state"])
         self._bag_stdout_file = open(log_dir / f"{bag_dir.name}.rosbag2.stdout.log", "wb")
         self._bag_stderr_file = open(log_dir / f"{bag_dir.name}.rosbag2.stderr.log", "wb")
         self._bag_process = subprocess.Popen(
             ["ros2", "bag", "record", "-s", "mcap", "-o", str(bag_dir), "--include-hidden-topics",
+            "--log-level", self.recorder_log_level,
             "--qos-profile-overrides-path", str(qos_path), *topics],
             stdout=self._bag_stdout_file, stderr=self._bag_stderr_file,
         )
-        time.sleep(1.0)  # let rosbag2 subscribe before motion starts (RR_01 S3.6 pre-roll)
+        # RR_01 S3.6 pre-roll. RR_13, two findings that a blind 1 s missed:
+        # * discovery can take 1.4 s: erd_monitor_test's first 0.32 s of
+        #   controller_state never reached the bag;
+        # * in about one bag in three the recorder stops receiving for ~0.33 s
+        #   at a fixed 1.10-1.44 s after its "Recording..." line (5 of 5
+        #   affected bags), and the depth-1 publishers (/joint_states, JTC
+        #   controller_state) lose ~175 messages each. l2_iiwa_emustop's first
+        #   goals fell inside that window.
+        # So: wait for every topic subscribed and >= 2 s past "Recording...".
+        stderr_log = log_dir / f"{bag_dir.name}.rosbag2.stderr.log"
+        deadline = time.time() + 15.0
+        while time.time() < deadline and self._bag_process.poll() is None:
+            text = stderr_log.read_text(errors="replace")
+            started = _ROSBAG2_RECORDING.search(text)
+            if ("All requested topics are subscribed" in text and started
+                    and time.time() >= float(started.group(1)) + RECORDER_STARTUP_S):
+                break
+            time.sleep(0.05)
+        else:
+            self.get_logger().warning("rosbag2 did not report every topic subscribed within 15 s")
 
     def bag_alive(self) -> bool:
         return self._bag_process is None or self._bag_process.poll() is None
@@ -992,6 +1150,34 @@ class RecordingNode(Node):
             "-p", f"output_path:={output_path}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        self._wait_for_sidecar_rows()
+
+    def _wait_for_sidecar_rows(self, *, timeout_s: float = SIDECAR_STARTUP_TIMEOUT_S) -> None:
+        """RR_15: the sidecar connects to RTDE ~0.5 s after it starts; a first
+        segment that begins sooner (an identify hold at the home pose has a
+        ~50 ms approach) loses its first rows (rr15_ur10_sim: hold_0 began
+        0.24 s before the first RTDE row, 565 of 588 samples). Block until
+        its `/erd/rtde_status` (1 Hz) reports rows."""
+        from std_msgs.msg import String
+
+        state = {"rows": 0}
+
+        def on_status(msg: String) -> None:
+            try:
+                state["rows"] = int(json.loads(msg.data).get("rows") or 0)
+            except (ValueError, TypeError):
+                pass
+
+        subscription = self.create_subscription(String, "/erd/rtde_status", on_status, 10)
+        try:
+            deadline = time.time() + timeout_s
+            while state["rows"] <= 0:
+                if time.time() > deadline or not self.sidecar_alive():
+                    raise PipelineError(f"RTDE sidecar reported no rows within {timeout_s} s "
+                                        f"(alive: {self.sidecar_alive()})")
+                rclpy.spin_once(self, timeout_sec=0.1)
+        finally:
+            self.destroy_subscription(subscription)
 
     def sidecar_alive(self) -> bool:
         return self._sidecar_process is None or self._sidecar_process.poll() is None
@@ -1125,6 +1311,26 @@ def stage_preflight(node: RecordingNode, config: LabConfig, paths: RunPaths) -> 
             node.profile.driver_joint_order, config.limits.abort.tracking_rad,
         )
 
+    # RR_12 A-3a: exactly the expected controllers active. Gated on real
+    # hardware; listed (and judged, ungated) at L1/L2.
+    states = node.controller_states()
+    active_set = check_active_controllers(states or {}, node.profile.expected_active_controllers)
+    if states is None:
+        active_set.update(ok=False, reason="list_controllers did not answer")
+    active_set["gated"] = config.hardware == "real"
+    checks["active_controllers"] = active_set if config.hardware == "real" else {**active_set, "ok": True,
+                                                                                    "would_pass": active_set["ok"]}
+    # RR_12 A-3b: the UR controller's software version is the configured one.
+    if node.profile.software_version_service is not None and config.hardware != "mock":
+        version = check_software_version(node.robot_software_version(), config.connection.software_version)
+        version["gated"] = config.hardware == "real"
+        checks["software_version"] = version if config.hardware == "real" else {**version, "ok": True,
+                                                                                 "would_pass": version["ok"]}
+    # RR_12 A-3c: the vendor safety checksum is on file (the loader already
+    # refuses a null one on real hardware).
+    checks["safety_vendor_checksum"] = {"ok": config.hardware != "real" or bool(config.safety.vendor_checksum),
+                                        "value": config.safety.vendor_checksum}
+
     free_bytes = shutil.disk_usage(config.recording.output_root).free
     checks["disk_space"] = {"ok": free_bytes >= 2 * 1024**3, "free_gb": free_bytes / 1024**3}
 
@@ -1174,7 +1380,7 @@ def stage_standstill(
             node.publish_event(paths.root.name, approach.segment_id, f"{approach.kind}_start", plan_digest=approach.digest)
             goal = node.build_goal(approach.trajectory, driver_joint_order, sim_to_driver)
             result = node.send_goal_and_wait(goal, timeout_s=approach.trajectory.duration + 10.0,
-                                             run_paths=paths, effort_limit=effort_limit)
+                                             run_paths=paths, effort_limit=effort_limit, kind=approach.kind)
             if not result["ok"]:
                 _write_manifest_status(paths, "failed", failed_segment=approach.segment_id, reason=result)
                 return {"ok": False, "failed_segment": approach.segment_id, "reason": result}
@@ -1188,13 +1394,14 @@ def stage_standstill(
             node.publish_event(paths.root.name, ret.segment_id, f"{ret.kind}_start", plan_digest=ret.digest)
             goal = node.build_goal(ret.trajectory, driver_joint_order, sim_to_driver)
             result = node.send_goal_and_wait(goal, timeout_s=ret.trajectory.duration + 10.0,
-                                             run_paths=paths, effort_limit=effort_limit)
+                                             run_paths=paths, effort_limit=effort_limit, kind=ret.kind)
             if not result["ok"]:
                 _write_manifest_status(paths, "failed", failed_segment=ret.segment_id, reason=result)
                 return {"ok": False, "failed_segment": ret.segment_id, "reason": result}
             node.publish_event(paths.root.name, ret.segment_id, f"{ret.kind}_end", plan_digest=ret.digest)
     finally:
         node.stop_bag()
+        node.write_monitor_json(paths.root / "monitor.json", "standstill")
     _write_manifest_status(paths, "planned", standstill_completed=True)
     return {"ok": True}
 
@@ -1208,7 +1415,7 @@ def stage_standstill(
 #: `planning.build_ladder_segments` when `plan` was given `--ladder`, never
 #: mixed with the full-scale kinds in the same `run`.
 _COMMISSIONING_KINDS = frozenset({"approach_commissioning", "excitation_commissioning", "return_commissioning"})
-_EXCITATION_KINDS = frozenset({"excitation", "excitation_commissioning", "identify_excitation", "identify_sweep"})
+_EXCITATION_KINDS = EXCITATION_KINDS
 
 
 def _select_segments(bundle: PlanBundle, *, ladder: bool, only: frozenset[str] | None) -> list[PlanSegment]:
@@ -1252,7 +1459,7 @@ def _confirm_trajectory(segment: PlanSegment, *, no_confirm: bool) -> None:
 def stage_run(node: RecordingNode, config: LabConfig, paths: RunPaths, bundle: PlanBundle,
               sim_to_driver: dict[str, str], driver_joint_order: tuple[str, ...], *,
               only: frozenset[str] | None = None, ladder_scale: float | None = None,
-              no_confirm: bool = False) -> dict[str, Any]:
+              no_confirm: bool = False, stage_name: str = "run") -> dict[str, Any]:
     if not _preflight_is_fresh(paths):
         raise PipelineError("run refused: preflight not passed")
     from .planning import config_digest
@@ -1269,10 +1476,10 @@ def stage_run(node: RecordingNode, config: LabConfig, paths: RunPaths, bundle: P
                         for i, sim in enumerate(config.joint_order) if sim in sim_to_driver}
 
     node.start_bag(paths.bag_dir)
-    if node.profile.has_ur_status_topics:
-        node.start_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
     completed_segments: list[str] = []
     try:
+        if node.profile.has_ur_status_topics:
+            node.start_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
         if not node.wait_for_stationary(duration_s=0.5, velocity_tolerance=0.01, timeout_s=5.0):
             raise PipelineError("run refused: fresh stationary joint states unavailable")
         for segment in segments_to_run:
@@ -1290,7 +1497,8 @@ def stage_run(node: RecordingNode, config: LabConfig, paths: RunPaths, bundle: P
             goal = node.build_goal(segment.trajectory, driver_joint_order, sim_to_driver)
             target_speed_fraction = 1.0 if segment.kind in _EXCITATION_KINDS else None
             result = node.send_goal_and_wait(goal, timeout_s=segment.trajectory.duration + 15.0, run_paths=paths,
-                                             effort_limit=effort_limit, target_speed_fraction=target_speed_fraction)
+                                             effort_limit=effort_limit, target_speed_fraction=target_speed_fraction,
+                                             kind=segment.kind)
             if not result["ok"]:
                 node.publish_event(paths.root.name, segment.segment_id, "fault", detail=str(result))
                 _write_manifest_status(paths, "failed", failed_segment=segment.segment_id, reason=result)
@@ -1300,6 +1508,7 @@ def stage_run(node: RecordingNode, config: LabConfig, paths: RunPaths, bundle: P
     finally:
         node.stop_bag()
         node.stop_sidecar()
+        node.write_monitor_json(paths.root / "monitor.json", stage_name)
     _write_manifest_status(paths, "recorded", segments=completed_segments)
     return {"ok": True, "segments": completed_segments}
 
@@ -1316,7 +1525,8 @@ def cancel_and_stop(node: RecordingNode, paths: RunPaths, *, reason: str) -> Non
     _write_manifest_status(paths, "failed", reason=reason)
 
 
-def stage_identify(node, config, config_path, paths, bundle, sim_to_driver, driver_joint_order, *, no_confirm=False):
+def stage_identify(node, config, config_path, paths, bundle, sim_to_driver, driver_joint_order, *, no_confirm=False,
+                   reference_contract=None, reference_sha256=None):
     if not bundle.identify_segments:
         raise PipelineError("identify refused: rebuild the plan to freeze identification segments")
     recording = RunPaths(paths.root / "identification")
@@ -1324,13 +1534,23 @@ def stage_identify(node, config, config_path, paths, bundle, sim_to_driver, driv
     shutil.copy2(paths.root / "preflight.json", recording.root / "preflight.json")
     identification_bundle = replace(bundle, segments=bundle.identify_segments, standstill_segments=(), identify_segments=())
     result = stage_run(node, config, recording, identification_bundle, sim_to_driver, driver_joint_order,
-                       no_confirm=no_confirm)
+                       no_confirm=no_confirm, stage_name="identify")
     if not result['ok']:
         _write_manifest_status(paths, "failed", identification=result)
         raise PipelineError(f"identify failed: {result}")
     _prepare_conversion(config, recording.root)
-    subprocess.run([sys.executable, '-m', 'erd_recording.identify_cli', '--config', config_path,
-                    '--run-dir', str(paths.root)], check=True, env=clean_ros_subprocess_env())
+    command = [sys.executable, '-m', 'erd_recording.identify_cli', '--config', config_path, '--run-dir', str(paths.root)]
+    if reference_contract:
+        command += ['--reference-contract', reference_contract]
+    if reference_sha256:
+        command += ['--reference-sha256', reference_sha256]
+    fit = subprocess.run(command, env=clean_ros_subprocess_env(), capture_output=True, text=True)
+    if fit.returncode != 0:
+        # RR_12 B-1/B-2: an incomplete or lossy fit-input segment fails the
+        # stage; identification.json (if written) names the segments.
+        _write_manifest_status(paths, "failed", identification={"ok": False, "stdout": fit.stdout[-2000:],
+                                                                "stderr": fit.stderr[-2000:]})
+        raise PipelineError(f"identify failed:\nstdout={fit.stdout}\nstderr={fit.stderr}")
     _write_manifest_status(paths, 'planned', identification_completed=True)
     return result
 
@@ -1349,23 +1569,31 @@ def _prepare_conversion(config, root):
 # ---------------------------------------------------------------------------
 
 
-def stage_convert(config: LabConfig, config_path: str, paths: RunPaths, *, reference_contract: str | None) -> dict[str, Any]:
+def stage_convert(config: LabConfig, config_path: str, paths: RunPaths, *, reference_contract: str | None,
+                  reference_sha256: str | None = None) -> dict[str, Any]:
     """Run ``convert_cli`` as a subprocess with a cleaned environment (RR_04
     A-8: like ``plan``, it imports Pinocchio for the baselines/sign-convention
     gravity fit -- T1.0/T1.6's LD_LIBRARY_PATH conflict)."""
     _prepare_conversion(config, paths.root)
-    reference = reference_contract or config.consumer.reference_contract
+    if paths.standstill_bag_dir.is_dir():
+        from .bagio import write_recorder_losses
+
+        write_recorder_losses(config, paths.standstill_bag_dir,
+                              paths.raw_log_dir / "bag_standstill.rosbag2.stderr.log",
+                              paths.root / "recorder_losses_standstill.json")
     command = [sys.executable, "-m", "erd_recording.convert_cli", "--config", config_path,
               "--run-dir", str(paths.root)]
-    if reference:
-        command += ["--reference-contract", reference]
+    if reference_contract:
+        command += ["--reference-contract", reference_contract]
+    if reference_sha256:
+        command += ["--reference-sha256", reference_sha256]
     result = subprocess.run(command, env=clean_ros_subprocess_env(), capture_output=True, text=True)
     if result.returncode != 0:
         raise PipelineError(f"convert subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}")
     converted = json.loads(result.stdout.strip().splitlines()[-1])
     status = converted.get("status", "converted")
     _write_manifest_status(paths, status)
-    return json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {"ok": True}
+    return converted
 
 
 def stage_validate(paths: RunPaths) -> dict[str, Any]:
@@ -1375,8 +1603,19 @@ def stage_validate(paths: RunPaths) -> dict[str, Any]:
 
 
 def stage_report(paths: RunPaths, bundle: PlanBundle | None, run_result: dict[str, Any] | None,
-                 validation: dict[str, Any] | None) -> None:
-    lines = ["# Run report", "", f"Run folder: `{paths.root}`", ""]
+                 validation: dict[str, Any] | None, *, controller_name: str,
+                 position_count_rad: float = 0.0) -> dict[str, Any]:
+    """``report.md``, plus RR_12 A-2b: the monitor's sample-age statistics per
+    stage and the cancel latency (first over-threshold sample -> ``cancel``
+    event) of every abort in the run's bags, also merged into
+    ``monitor.json`` under ``cancel_latency``."""
+    from .reporting import cancel_latencies, latency_summary, tracking_suggestion
+
+    if bundle is None and paths.plan_dir.is_dir():
+        bundle = load_plan(paths.plan_dir)
+    if validation is None and paths.validation.is_file():
+        validation = json.loads(paths.validation.read_text(encoding="utf-8"))
+    lines = ["# Run report", "", f"Run folder: `{paths.root.name}`", ""]
     if bundle is not None:
         lines += ["## Plan", "", "| segment | kind | samples | duration (s) |", "|---|---|---|---|"]
         for segment in bundle.segments:
@@ -1385,12 +1624,85 @@ def stage_report(paths: RunPaths, bundle: PlanBundle | None, run_result: dict[st
         lines.append("")
     if run_result is not None:
         lines += ["## Run", "", f"ok: {run_result.get('ok')}", ""]
-    if validation is not None:
-        lines += ["## Validation", ""]
-        for check in validation.get("checks", []):
-            lines.append(f"- **{check.get('check')}**: ok={check.get('ok')}")
+
+    latencies: dict[str, Any] = {}
+    for name, bag in (("standstill", paths.standstill_bag_dir), ("identify", paths.root / "identification" / "bag"),
+                      ("run", paths.bag_dir)):
+        if bag.is_dir():
+            rows = cancel_latencies(bag, controller_name=controller_name)
+            if rows:
+                latencies[name] = {"cancels": rows, "summary": latency_summary(rows)}
+    monitor = {}
+    for path in (paths.root / "monitor.json", paths.root / "identification" / "monitor.json"):
+        if path.is_file():
+            monitor.update(json.loads(path.read_text(encoding="utf-8")))
+    if monitor or latencies:
+        lines += ["## Monitor (RR_12 A-2b)", "", "| stage | evaluations | age p50 (ms) | age p99 (ms) | age max (ms) | cancels |",
+                  "|---|---|---|---|---|---|"]
+        for stage, entry in monitor.items():
+            if not isinstance(entry, dict) or "evaluations" not in entry:
+                continue
+            age = entry.get("sample_age_ms", {})
+            lines.append(f"| {stage} | {entry['evaluations']} | {age.get('p50', float('nan')):.3f} | "
+                         f"{age.get('p99', float('nan')):.3f} | {age.get('max', float('nan')):.3f} | "
+                         f"{len(entry.get('cancels', []))} |")
         lines.append("")
+        for stage, entry in latencies.items():
+            lines += [f"Cancel latency, {stage}:", "", "| segment | condition | latency (ms) | reason |", "|---|---|---|---|"]
+            for row in entry["cancels"]:
+                latency = "n/a" if row["latency_ms"] is None else f"{row['latency_ms']:.2f}"
+                lines.append(f"| {row['segment']} | {row['condition']} | {latency} | {row['reason'][:80]} |")
+            lines.append("")
+        if latencies:
+            target = paths.root / "monitor.json"
+            data = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else {}
+            data["cancel_latency"] = latencies
+            target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    suggestion = None
+    if paths.bag_dir.is_dir():
+        suggestion = tracking_suggestion(paths.bag_dir, controller_name=controller_name,
+                                         count_rad=position_count_rad)
+    if suggestion is not None:
+        lines += ["## Rung-4a abort threshold (RR_14 P-3)", "",
+                  f"Largest tracking error over the excitation segments: {suggestion['max_abs_error_rad']:.4g} rad "
+                  f"(`{suggestion['segment']}`).", "",
+                  f"Suggested `--abort-tracking-rad {suggestion['suggested_rad']:.3g}` "
+                  f"({suggestion['rule']}{'; floored' if suggestion['floored'] else ''}). "
+                  "Meaningful only for a `--ladder 0.1` run.", ""]
+        print(f"report: suggested --abort-tracking-rad {suggestion['suggested_rad']:.3g} "
+              f"(max |e| {suggestion['max_abs_error_rad']:.4g} rad in {suggestion['segment']})")
+    if validation is not None:
+        lines += ["## Validation", "", f"status: **{validation.get('status')}**", ""]
+        for check in validation.get("checks", []):
+            lines.append(f"- **{check.get('check')}**: ok={check.get('ok')}"
+                         + (f" ({check.get('status')})" if check.get("status") else "")
+                         + (f" -- simulator limit: {check['simulator_limit']}" if check.get("simulator_limit") else ""))
+        for warning in validation.get("warnings", []):
+            lines.append(f"- warning **{warning['warning']}**: {warning.get('detail', '')}")
+        lines.append("")
+    evaluation = paths.root / "evaluation" / "report.md"
+    if evaluation.is_file():
+        lines += ["## Evaluation", "", evaluation.read_text(encoding="utf-8")]
     paths.report.write_text("\n".join(lines), encoding="utf-8")
+    return {"cancel_latency": latencies, "monitor": monitor, "tracking_suggestion": suggestion}
+
+
+def stage_evaluate(config: LabConfig, paths: RunPaths, *, checkpoints: str | None) -> dict[str, Any]:
+    """RR_12 C-4 (offline, not in ``all``): ``evaluate_on.py`` for every
+    checkpoint of ``consumer.checkpoints`` (or ``--checkpoints``) on this
+    run's dataset, in the consumer environment."""
+    summary = checkpoints or config.consumer.checkpoints
+    if not summary:
+        raise PipelineError("evaluate: no --checkpoints and consumer.checkpoints is null")
+    if not config.consumer.python:
+        raise PipelineError("evaluate: consumer.python is null")
+    command = [sys.executable, "-m", "erd_recording.evaluate_cli", "--run-dir", str(paths.root), "--robot", config.robot,
+               "--checkpoints", str(Path(summary).expanduser()), "--consumer-repo", config.consumer.repo,
+               "--consumer-python", config.consumer.python]
+    result = subprocess.run(command, env=clean_ros_subprocess_env(), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise PipelineError(f"evaluate failed:\nstdout={result.stdout}\nstderr={result.stderr}")
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -1404,17 +1716,32 @@ def _parse_args(argv: list[str]) -> Any:
     parser = argparse.ArgumentParser(prog="record_<robot>")
     parser.add_argument("--config", required=True)
     parser.add_argument("stage", choices=["plan", "show", "preflight", "standstill", "identify", "run",
-                                          "convert", "validate", "report", "all"])
+                                          "convert", "validate", "report", "evaluate", "all"])
     parser.add_argument("--ladder", type=float, default=None)
     parser.add_argument("--only", default=None)
     parser.add_argument("--no-confirm", action="store_true")
-    parser.add_argument("--resume", default=None)
-    parser.add_argument("--reuse-identification", default=None)
+    # RR_12 C-5: `--reuse-identification` is gone; identification stays in the
+    # session that uses it (RR_01 S8.3 freshness rule). RR_14 P-5: so is the
+    # never-implemented `--resume`.
     parser.add_argument("--reference-contract", default=None)
+    parser.add_argument("--reference-sha256", default=None,
+                        help="pin for --reference-contract (the config's pin only covers its own reference)")
     parser.add_argument("--accept-unverified", action="store_true")
     parser.add_argument("--n-candidates", type=int, default=None)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--run-dir", default=None,
+                        help="offline stages only: an existing run folder, e.g. one copied from another machine")
+    parser.add_argument("--abort-tracking-rad", type=float, default=None,
+                        help="rung 4a only: lower the monitor's tracking threshold; needs --ladder <= 0.1")
+    parser.add_argument("--recorder-log-level", default="info", choices=["debug", "info", "warn", "error"],
+                        help="ros2 bag record --log-level (debug: per-topic loss lines, very verbose)")
+    parser.add_argument("--checkpoints", default=None, help="evaluate: chain summary CSV (default consumer.checkpoints)")
     return parser.parse_args(argv)
+
+
+_ROS_STAGES = frozenset({"preflight", "standstill", "identify", "run"})
+#: RR_12 C-3: stages that may run on a copied run folder (`--run-dir`).
+_OFFLINE_STAGES = frozenset({"convert", "validate", "report", "evaluate"})
 
 
 def _run_all(robot: str, argv: list[str] | None = None) -> int:
@@ -1422,12 +1749,32 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
     config = load_lab_config(args.config)
     if config.robot != robot:
         raise PipelineError(f"{args.config} is a {config.robot!r} config, not {robot!r}")
-    profile = profile_for(config.robot)
-    paths = make_run_dir(config, run_id=args.run_id)
-    sim_to_driver = config.description.sim_to_driver()
-
     stages = ["plan", "preflight", "standstill", "identify", "run", "convert", "validate", "report"] \
         if args.stage == "all" else [args.stage]
+    # RR_10 item 6: only stages that join the ROS graph need the shell's
+    # domain to match; an offline convert/validate re-run does not. Checked
+    # before the run directory exists, so a refusal leaves nothing behind.
+    if any(stage in _ROS_STAGES for stage in stages):
+        check_environment_domain(config)
+    try:
+        check_abort_override(args.abort_tracking_rad, args.ladder)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from None
+    profile = profile_for(config.robot)
+    if args.run_dir:
+        if not set(stages) <= _OFFLINE_STAGES:
+            raise PipelineError(f"--run-dir is for the offline stages {sorted(_OFFLINE_STAGES)} only")
+        paths = RunPaths(Path(args.run_dir).expanduser().resolve())
+        if not paths.plan_dir.is_dir():
+            raise PipelineError(f"--run-dir {paths.root}: not a run folder (no plan/)")
+    else:
+        paths = make_run_dir(config, run_id=args.run_id)
+    sim_to_driver = config.description.sim_to_driver()
+    if not args.run_dir:
+        # RR_12 A-3c/A-4: what was live for this session, in the manifest.
+        _write_manifest_fields(paths, hardware=config.hardware, safety_vendor_checksum=config.safety.vendor_checksum,
+                               **({"abort_tracking_rad_override": args.abort_tracking_rad, "ladder": args.ladder}
+                                  if args.abort_tracking_rad is not None else {}))
 
     bundle = None
     rclpy_started = False
@@ -1448,7 +1795,7 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 bundle = stage_plan(config, args.config, paths, n_candidates=args.n_candidates,
                                     ladder_scale=args.ladder)
                 continue
-            if not rclpy_started:
+            if not rclpy_started and stage in _ROS_STAGES:
                 # RR_06 P3-1 item 9, live finding: rclpy.init()'s own
                 # default signal handling (SignalHandlerOptions.ALL) installs
                 # its own SIGINT/SIGTERM handling that calls rclpy.shutdown()
@@ -1466,7 +1813,10 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
                 rclpy_started = True
                 node = RecordingNode(profile, config)
-            if node.abort_requested:
+                node.recorder_log_level = args.recorder_log_level
+                if args.abort_tracking_rad is not None:
+                    node.excitation_tracking_rad = args.abort_tracking_rad
+            if node is not None and node.abort_requested:
                 cancel_and_stop(node, paths, reason="SIGINT/SIGTERM received")
                 return 130
             if stage == "preflight":
@@ -1489,7 +1839,8 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 if bundle is None:
                     bundle = load_plan(paths.plan_dir)
                 stage_identify(node, config, args.config, paths, bundle, sim_to_driver,
-                               profile.driver_joint_order, no_confirm=args.no_confirm)
+                               profile.driver_joint_order, no_confirm=args.no_confirm,
+                               reference_contract=args.reference_contract, reference_sha256=args.reference_sha256)
             elif stage == "run":
                 if bundle is None:
                     bundle = load_plan(paths.plan_dir)
@@ -1498,11 +1849,15 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 if not run_result["ok"]:
                     raise PipelineError(f"run failed: {run_result}")
             elif stage == "convert":
-                stage_convert(config, args.config, paths, reference_contract=args.reference_contract)
+                stage_convert(config, args.config, paths, reference_contract=args.reference_contract,
+                              reference_sha256=args.reference_sha256)
             elif stage == "validate":
                 validation = stage_validate(paths)
             elif stage == "report":
-                stage_report(paths, bundle, run_result, validation)
+                stage_report(paths, bundle, run_result, validation, controller_name=profile.controller_name,
+                             position_count_rad=profile.position_count_rad)
+            elif stage == "evaluate":
+                print(json.dumps(stage_evaluate(config, paths, checkpoints=args.checkpoints)))
     except Exception as exc:
         _write_manifest_status(paths, "failed", error=str(exc))
         raise

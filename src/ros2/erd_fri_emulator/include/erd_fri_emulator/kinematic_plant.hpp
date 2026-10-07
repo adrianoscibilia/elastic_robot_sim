@@ -47,6 +47,10 @@ public:
   /// the resulting sample.
   Sample step(const JointArray & commanded_position);
 
+  /// Places the plant at rest at `position` (RR_10: the emulator starts
+  /// where the operator left the real robot, the lab config's home).
+  void reset(const JointArray & position);
+
   int n_joints() const { return static_cast<int>(model_.nv); }
   const JointArray & current_position() const { return q_; }
 

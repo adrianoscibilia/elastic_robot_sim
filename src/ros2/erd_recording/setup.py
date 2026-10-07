@@ -26,6 +26,8 @@ setup(
             "record_iiwa = erd_recording.pipeline:main_iiwa",
             "record_ur10 = erd_recording.pipeline:main_ur10",
             "show_plan = erd_recording.cli:show_plan_main",
+            "erd_link_test = erd_recording.link_test:link_test_main",
+            "erd_monitor_test = erd_recording.link_test:monitor_test_main",
         ],
     },
 )

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <csignal>
 #include <netinet/in.h>
+#include <optional>
 #include <random>
 #include <string>
 
@@ -58,6 +59,8 @@ struct EmulatorOptions
   double jitter_us{0.0};
   double send_period_s{0.001};
   unsigned seed{0};
+  // Start pose (RR_10); unset keeps the plant's all-zero start.
+  std::optional<JointArray> initial_position;
 };
 
 /// The Sunrise/robot side of FRI 1.11 over UDP (RR_01 S3.5). Binds

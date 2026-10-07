@@ -154,3 +154,69 @@ def evaluate_abort_conditions(
         reasons.append("the RTDE sidecar process has exited")
 
     return reasons
+
+
+# ---------------------------------------------------------------------------
+# Preflight on hardware: real (RR_12 A-3) and the A-4 override
+# ---------------------------------------------------------------------------
+
+
+def check_active_controllers(states: Mapping[str, str], expected: Sequence[str]) -> dict:
+    """RR_12 A-3a: the set of **active** controllers must equal ``expected``
+    (the JTC and the broadcasters the recording needs). Anything else active
+    -- e.g. a second commanding controller -- refuses, as does a missing one."""
+    active = sorted(name for name, state in states.items() if state == "active")
+    unexpected = sorted(set(active) - set(expected))
+    missing = sorted(set(expected) - set(active))
+    return {"ok": not unexpected and not missing, "active": active, "expected": sorted(expected),
+            "unexpected_active": unexpected, "missing": missing,
+            "all": {name: states[name] for name in sorted(states)}}
+
+
+def parse_software_version(text: str) -> tuple[int, ...]:
+    """``"3.15.7.106331"`` -> ``(3, 15, 7, 106331)``."""
+    try:
+        return tuple(int(part) for part in str(text).strip().split("."))
+    except ValueError:
+        raise ValueError(f"software version {text!r} is not dotted integers") from None
+
+
+def check_software_version(reported: Sequence[int] | None, configured: str) -> dict:
+    """RR_12 A-3b (UR): the controller's ``get_robot_software_version``
+    (major, minor, bugfix, build) must equal ``connection.software_version``
+    on every component the config states (a 3-part config ignores the build)."""
+    expected = parse_software_version(configured)
+    if reported is None:
+        return {"ok": False, "reason": "get_robot_software_version did not answer", "configured": configured}
+    reported = tuple(int(v) for v in reported)
+    ok = reported[: len(expected)] == expected
+    return {"ok": ok, "reported": ".".join(map(str, reported)), "configured": configured,
+            "compared_components": len(expected)}
+
+
+#: RR_12 A-4: the deliberate-abort override exists only at small amplitude.
+ABORT_OVERRIDE_MAX_LADDER = 0.1
+
+#: The plan segment kinds that excite the arm (everything else is an
+#: approach, a return or a hold).
+EXCITATION_KINDS = frozenset({"excitation", "excitation_commissioning", "identify_excitation", "identify_sweep"})
+
+
+def segment_tracking_rad(kind: str | None, *, file_rad: float, excitation_override: float | None) -> float:
+    """RR_14 P-3: the monitor's tracking threshold for one segment. The
+    ``--abort-tracking-rad`` override applies inside excitation segments
+    only; approaches, returns and holds keep the lab file's value."""
+    if excitation_override is not None and kind in EXCITATION_KINDS:
+        return float(excitation_override)
+    return float(file_rad)
+
+
+def check_abort_override(tracking_rad: float | None, ladder: float | None) -> None:
+    """Refuse ``--abort-tracking-rad`` unless ``--ladder <= 0.1`` is also given."""
+    if tracking_rad is None:
+        return
+    if not tracking_rad > 0:
+        raise ValueError(f"--abort-tracking-rad must be positive, got {tracking_rad}")
+    if ladder is None or ladder > ABORT_OVERRIDE_MAX_LADDER:
+        raise ValueError(f"--abort-tracking-rad is accepted only with --ladder <= {ABORT_OVERRIDE_MAX_LADDER} "
+                         f"(got --ladder {ladder}); RR_12 A-4: rung 4a only")

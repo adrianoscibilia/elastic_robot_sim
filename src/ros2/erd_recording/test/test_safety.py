@@ -3,6 +3,8 @@ without a ROS environment (see erd_recording/safety.py's module docstring)."""
 
 from __future__ import annotations
 
+import pytest
+
 from erd_recording.safety import (
     FRI_COMMANDING_ACTIVE,
     MonitorSample,
@@ -121,3 +123,64 @@ def test_monitor_flags_dead_bag_or_sidecar():
     reasons = evaluate_abort_conditions(sample, tracking_rad=0.05)
     assert any("bag" in r for r in reasons)
     assert any("sidecar" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# RR_12 A-3: preflight on hardware: real; A-4: the deliberate-abort override
+# ---------------------------------------------------------------------------
+
+from erd_recording.safety import (  # noqa: E402
+    check_abort_override,
+    check_active_controllers,
+    check_software_version,
+)
+
+IIWA_EXPECTED = ("erd_arm_controller", "joint_state_broadcaster", "erd_state_broadcaster")
+
+
+def test_active_controller_set_equal_to_expected_passes():
+    states = {name: "active" for name in IIWA_EXPECTED}
+    states["some_other_controller"] = "inactive"
+    result = check_active_controllers(states, IIWA_EXPECTED)
+    assert result["ok"], result
+    assert result["active"] == sorted(IIWA_EXPECTED)
+
+
+def test_an_extra_active_controller_refuses():
+    states = {name: "active" for name in IIWA_EXPECTED}
+    states["forward_position_controller"] = "active"
+    result = check_active_controllers(states, IIWA_EXPECTED)
+    assert not result["ok"]
+    assert result["unexpected_active"] == ["forward_position_controller"]
+
+
+def test_a_missing_expected_controller_refuses():
+    states = {name: "active" for name in IIWA_EXPECTED}
+    states["erd_state_broadcaster"] = "inactive"
+    result = check_active_controllers(states, IIWA_EXPECTED)
+    assert not result["ok"]
+    assert result["missing"] == ["erd_state_broadcaster"]
+
+
+def test_software_version_matches_on_the_configured_components():
+    assert check_software_version((3, 15, 7, 106331), "3.15.7.106331")["ok"]
+    assert check_software_version((3, 15, 8, 1), "3.15.8")["ok"]  # 3-part config ignores the build
+
+
+def test_software_version_mismatch_refuses():
+    result = check_software_version((3, 15, 8, 106331), "3.15.7.106331")
+    assert not result["ok"]
+    assert result["reported"] == "3.15.8.106331"
+    assert not check_software_version(None, "3.15.7")["ok"]
+
+
+@pytest.mark.parametrize("tracking,ladder", [(0.005, None), (0.005, 0.25), (0.005, 1.0), (0.0, 0.1), (-0.01, 0.05)])
+def test_abort_override_refused_without_small_ladder(tracking, ladder):
+    with pytest.raises(ValueError):
+        check_abort_override(tracking, ladder)
+
+
+@pytest.mark.parametrize("ladder", [0.1, 0.05])
+def test_abort_override_accepted_at_ladder_up_to_0_1(ladder):
+    check_abort_override(0.005, ladder)
+    check_abort_override(None, None)  # no override: nothing to check

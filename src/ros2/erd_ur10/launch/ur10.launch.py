@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
@@ -113,7 +113,34 @@ def _launch_setup(context, *args, **kwargs):
         }.items(),
     )
 
-    return [driver]
+    # RR_12 A-3a: on hardware: real, preflight refuses any active controller
+    # outside the profile's expected set. ur_control.launch.py activates
+    # three more in the same spawner call as the ones erd needs (removing
+    # them from the controllers file kills that call, RR_11 S3.6), so they
+    # are deactivated here once the spawner has activated all of them.
+    # force_torque_sensor_broadcaster stays: joint_state_broadcaster is
+    # chained to it and cannot run without it.
+    extras = " ".join(EXTRA_ACTIVE_CONTROLLERS)
+    deactivate_extras = ExecuteProcess(
+        cmd=["bash", "-c",
+             "is_active() { echo \"$1\" | grep -qE \"^$2 +.* active\"; }; "
+             "for i in $(seq 1 120); do "
+             "  listed=$(ros2 control list_controllers 2>/dev/null); ready=1; "
+             f"  for c in scaled_joint_trajectory_controller {extras}; do is_active \"$listed\" $c || ready=0; done; "
+             "  [ $ready = 1 ] && break; sleep 1; "
+             "done; "
+             "for attempt in 1 2 3 4 5; do "
+             f"  ros2 control switch_controllers --deactivate {extras} --strict "
+             f"  && echo 'erd_ur10: deactivated {extras} (RR_12 A-3a)' && exit 0; sleep 2; "
+             "done; echo 'erd_ur10: could not deactivate the extra controllers; preflight will refuse' >&2; exit 1"],
+        output="screen",
+    )
+    return [driver, deactivate_extras]
+
+
+#: Controllers ur_robot_driver 3.9 activates that the recording must not run
+#: with (RR_12 A-3a); none of them is needed by erd.
+EXTRA_ACTIVE_CONTROLLERS = ("gravity_update_controller", "friction_model_controller", "tcp_pose_broadcaster")
 
 
 def generate_launch_description() -> LaunchDescription:

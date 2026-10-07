@@ -15,6 +15,7 @@ from erd_recording.config import (
     SceneBox,
     SceneCylinder,
     SceneSphere,
+    check_environment_domain,
     load_lab_config,
 )
 
@@ -270,3 +271,97 @@ def test_unset_path_variable_refused(monkeypatch):
     monkeypatch.delenv("ERD_DATA_ROOT", raising=False)
     with pytest.raises(ConfigError, match="ERD_DATA_ROOT"):
         load_lab_config(FIXTURE)
+
+
+def test_environment_domain_must_match_config():
+    """RR_10 item 6: a shell on another ROS domain than the config is refused;
+    an unset ROS_DOMAIN_ID counts as ROS's default, 0."""
+    config = load_lab_config(FIXTURE)
+    assert config.connection.ros_domain_id == SIMULATED_ROS_DOMAIN_ID
+    check_environment_domain(config, {"ROS_DOMAIN_ID": str(SIMULATED_ROS_DOMAIN_ID)})
+    with pytest.raises(ConfigError, match="ROS_DOMAIN_ID=0"):
+        check_environment_domain(config, {"ROS_DOMAIN_ID": str(REAL_ROS_DOMAIN_ID)})
+    with pytest.raises(ConfigError, match="ROS_DOMAIN_ID=0"):
+        check_environment_domain(config, {})
+    with pytest.raises(ConfigError, match="not an integer"):
+        check_environment_domain(config, {"ROS_DOMAIN_ID": "eighty-seven"})
+
+
+# ---------------------------------------------------------------------------
+# RR_12 A-3c (safety.vendor_checksum), C-1 (reference pin), C-6 (lab files)
+# ---------------------------------------------------------------------------
+
+LAB = Path(__file__).resolve().parents[1] / "config" / "lab"
+
+
+def _as_real(raw: dict) -> dict:
+    raw["hardware"] = "real"
+    raw["connection"]["ros_domain_id"] = REAL_ROS_DOMAIN_ID
+    return raw
+
+
+def test_safety_block_is_required(tmp_path):
+    raw = _raw()
+    del raw["safety"]
+    with pytest.raises(ConfigError, match="safety"):
+        load_lab_config(_write(tmp_path, raw))
+
+
+def test_real_hardware_refused_without_vendor_checksum(tmp_path):
+    raw = _as_real(_raw())
+    raw["safety"]["vendor_checksum"] = None
+    with pytest.raises(ConfigError, match="safety.vendor_checksum"):
+        load_lab_config(_write(tmp_path, raw))
+
+
+def test_vendor_checksum_is_loaded(tmp_path):
+    raw = _as_real(_raw())
+    raw["safety"]["vendor_checksum"] = "0x1A2B3C4D"
+    assert load_lab_config(_write(tmp_path, raw)).safety.vendor_checksum == "0x1A2B3C4D"
+
+
+def test_real_hardware_refuses_an_unpinned_reference(tmp_path):
+    raw = _as_real(_raw())
+    raw["consumer"]["reference_sha256"] = None
+    with pytest.raises(ConfigError, match="reference_sha256"):
+        load_lab_config(_write(tmp_path, raw))
+
+
+def _filled_real_lab_file(name: str) -> dict:
+    """``iiwa.yaml``/``ur10.yaml`` as T2.0-lab will leave them: every null
+    measured value filled and both reviewed flags true."""
+    raw = yaml.safe_load((LAB / f"{name}.yaml").read_text(encoding="utf-8"))
+    sim = yaml.safe_load((LAB / f"{name}_sim.yaml").read_text(encoding="utf-8"))
+    for key in ("position", "velocity", "acceleration", "jerk", "effort"):
+        raw["limits"][key] = sim["limits"][key]
+    raw["limits"]["reviewed"] = True
+    raw["scene"]["reviewed"] = True
+    raw["safety"]["vendor_checksum"] = "0xDEADBEEF"
+    if name == "ur10":
+        raw["connection"]["kinematics_params_file"] = None  # ignorable until T2.5
+    return raw
+
+
+@pytest.mark.parametrize("name,sha,cap", [
+    ("iiwa", "c64f7aef2e1e0f4625c1fea7d72ef052f8e045a0e09b257c2ebf04225bb5ea25", 90.0),
+    ("ur10", "cc8867e909b0e9804df29b4645cabb954991fe99c7c0d2e6d0639b6fbf214a2c", 11.0),
+])
+def test_real_lab_files_load_once_t2_0_fills_them(tmp_path, name, sha, cap):
+    with pytest.raises(ConfigError, match="refused"):
+        load_lab_config(LAB / f"{name}.yaml")  # as checked in: not reviewed yet
+    config = load_lab_config(_write(tmp_path, _filled_real_lab_file(name)))
+    assert config.hardware == "real"
+    assert config.consumer.reference_sha256 == sha
+    assert config.consumer.reference_contract.endswith(".contract.json")
+    assert "/data/identification/r6-" in config.consumer.reference_contract
+    assert config.consumer.checkpoints.endswith(".summary.csv")
+    assert config.excitation.probe.enabled is False
+    assert config.excitation.probe.max_top_hz == cap
+    assert config.excitation.probe.from_training_config.startswith("/")
+
+
+def test_sim_lab_files_keep_the_synthetic_reference():
+    for name in ("iiwa_sim", "ur10_sim", "iiwa_mock", "ur10_mock"):
+        config = load_lab_config(LAB / f"{name}.yaml")
+        assert "synthetic_" in config.consumer.reference_contract
+        assert config.consumer.reference_sha256

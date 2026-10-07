@@ -573,6 +573,9 @@ class ProbeSpec:
     from_training_config: str | None
     acceleration_fraction: float
     budget: str
+    #: RR_12 S4.4: the real probe's top frequency cap (iiwa 90 Hz, UR10 11 Hz),
+    #: applied on top of the SG bound; ``None`` leaves only the SG bound.
+    max_top_hz: float | None = None
 
 
 @dataclass(frozen=True)
@@ -606,6 +609,17 @@ class ConsumerSpec:
     python: str | None
     reference_contract: str | None
     checkpoints: str | None
+    #: RR_12 C-1: sha256 of ``reference_contract``; ``convert`` refuses a
+    #: reference whose bytes differ, and ``hardware: real`` refuses an unpinned one.
+    reference_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class SafetySpec:
+    #: RR_12 A-3c: the vendor safety-configuration checksum live on the
+    #: controller (Sunrise / PolyScope), copied into every run's manifest.
+    #: Required key; ``null`` is refused for ``hardware: real``.
+    vendor_checksum: str | None
 
 
 @dataclass(frozen=True)
@@ -637,11 +651,14 @@ def _load_excitation(raw: Mapping[str, Any], source: str, rate_hz: float) -> Exc
     position_window = {
         str(joint): (float(pair[0]), float(pair[1])) for joint, pair in position_window_raw.items()
     }
+    max_top_hz = probe_raw.get("max_top_hz")
     probe = ProbeSpec(
         enabled=bool(probe_raw.get("enabled", False)),
-        from_training_config=probe_raw.get("from_training_config"),
+        from_training_config=_expand_path(probe_raw.get("from_training_config"),
+                                          "excitation.probe.from_training_config", source),
         acceleration_fraction=float(probe_raw.get("acceleration_fraction", 0.2)),
         budget=str(probe_raw.get("budget", "split")),
+        max_top_hz=None if max_top_hz is None else float(max_top_hz),
     )
     if probe.budget not in ("split", "additive"):
         raise ConfigError(f"{source}.excitation.probe.budget must be 'split' or 'additive'")
@@ -684,6 +701,8 @@ def _check_probe_sg_bound(probe: ProbeSpec, rate_hz: float, source: str) -> None
     which raises the same way if the resolved comb still violates it.
     """
     bound = PROBE_SG_BOUND_FRACTION * rate_hz
+    if probe.max_top_hz is not None:
+        bound = min(bound, probe.max_top_hz)
     training_path = Path(probe.from_training_config).expanduser()
     if not training_path.is_file():
         return
@@ -699,7 +718,7 @@ def _check_probe_sg_bound(probe: ProbeSpec, rate_hz: float, source: str) -> None
     if top_hz > bound:
         raise ConfigError(
             f"{source}.excitation.probe: the training config's probe top {top_hz:g} Hz exceeds "
-            f"the real SG bound {bound:g} Hz (0.09 x {rate_hz:g} Hz); cap it or disable the probe"
+            f"the real bound {bound:g} Hz (0.09 x {rate_hz:g} Hz, or probe.max_top_hz); cap it or disable the probe"
         )
 
 
@@ -720,7 +739,14 @@ def _load_consumer(raw: Mapping[str, Any], source: str) -> ConsumerSpec:
         python=_expand_path(block.get("python"), "consumer.python", source),
         reference_contract=_expand_path(block.get("reference_contract"), "consumer.reference_contract", source),
         checkpoints=_expand_path(block.get("checkpoints"), "consumer.checkpoints", source),
+        reference_sha256=None if block.get("reference_sha256") is None else str(block["reference_sha256"]).lower(),
     )
+
+
+def _load_safety(raw: Mapping[str, Any], source: str) -> SafetySpec:
+    block = _require_mapping(raw, "safety", source)
+    value = _require(block, "vendor_checksum", f"{source}.safety")
+    return SafetySpec(vendor_checksum=None if value is None else str(value))
 
 
 def _load_recording(raw: Mapping[str, Any], source: str) -> RecordingSpec:
@@ -763,6 +789,7 @@ class LabConfig:
     identification: IdentificationSpec
     consumer: ConsumerSpec
     recording: RecordingSpec
+    safety: SafetySpec
     source_path: Path
     raw: Mapping[str, Any]
 
@@ -815,12 +842,13 @@ def load_lab_config(path: str | Path) -> LabConfig:
     identification = _load_identification(raw, source)
     consumer = _load_consumer(raw, source)
     recording = _load_recording(raw, source)
+    safety = _load_safety(raw, source)
 
     config = LabConfig(
         robot=robot, hardware=hardware, operator=operator, connection=connection,
         description=description, limits=limits, scene=scene, poses=poses,
         excitation=excitation, identification=identification, consumer=consumer,
-        recording=recording, source_path=source_path, raw=raw,
+        recording=recording, safety=safety, source_path=source_path, raw=raw,
     )
 
     _check_domain_separation(config, source)
@@ -843,6 +871,32 @@ def _check_domain_separation(config: LabConfig, source: str) -> None:
         )
 
 
+def check_environment_domain(config: LabConfig, environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a ROS-talking ``record_*`` stage whose shell's ``ROS_DOMAIN_ID``
+    differs from ``connection.ros_domain_id`` (RR_10 item 6).
+
+    The config-level rule above only checks the YAML against its own
+    ``hardware``; this one catches the shell: a terminal sourced with
+    ``workspace_setup.sh --real`` (domain 0) driving ``iiwa_sim.yaml`` would
+    otherwise reach a real robot's graph. An unset variable is domain 0, as
+    in ROS itself.
+    """
+    env = os.environ if environ is None else environ
+    text = env.get("ROS_DOMAIN_ID", "").strip()
+    try:
+        actual = int(text) if text else REAL_ROS_DOMAIN_ID
+    except ValueError:
+        raise ConfigError(f"ROS_DOMAIN_ID={text!r} is not an integer") from None
+    expected = config.connection.ros_domain_id
+    if actual != expected:
+        fix = "source workspace_setup.sh --real" if expected == REAL_ROS_DOMAIN_ID \
+            else "source workspace_setup.sh (without --real)"
+        raise ConfigError(
+            f"{config.source_path}: connection.ros_domain_id is {expected} but this shell has "
+            f"ROS_DOMAIN_ID={actual}. Fix: {fix} in a fresh terminal (RR_01 S9 separation)"
+        )
+
+
 def _check_real_preconditions(config: LabConfig, raw: Mapping[str, Any], source: str) -> None:
     problems: list[str] = []
     if not config.limits.reviewed:
@@ -857,8 +911,11 @@ def _check_real_preconditions(config: LabConfig, raw: Mapping[str, Any], source:
     # UR kinematics file before calibration is asked for by T2.5 not T2.0, and
     # the probe's training config when the probe is off -- checked above).
     ignorable = {".consumer.python", ".consumer.reference_contract", ".consumer.checkpoints",
-                 ".connection.kinematics_params_file", ".excitation.probe.from_training_config"}
+                 ".consumer.reference_sha256", ".connection.kinematics_params_file",
+                 ".excitation.probe.from_training_config", ".excitation.probe.max_top_hz"}
     null_paths = [p for p in null_paths if p not in ignorable]
+    if config.consumer.reference_contract and not config.consumer.reference_sha256:
+        problems.append("consumer.reference_sha256 must pin consumer.reference_contract (RR_12 C-1)")
     if null_paths:
         problems.append(f"null value(s) at: {', '.join(sorted(null_paths))}")
     if problems:

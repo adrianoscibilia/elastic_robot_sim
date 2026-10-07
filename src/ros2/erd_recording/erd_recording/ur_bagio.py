@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from .bagio import decode_dynamic_joint_state, read_bag_topic
+from .bagio import decode_dynamic_joint_state, read_bag_topic, read_events, read_header_stamped, write_controller_state, write_recorder_losses
 from .profile import profile_for
 
 
@@ -73,26 +73,69 @@ def align_rtde(sidecar: pd.DataFrame, driver_q: np.ndarray, driver_stamps_ns: np
               'wall_seconds_per_robot_second': slope,
               'affine_residual_p99_s': float(np.percentile(np.abs(affine_residual),99)),
               'max_anchor_interval_s': float(np.max(np.diff(anchor_t))),
+              # RR_12 B-3: per-segment anchor spacing is checked downstream.
+              'anchor_timestamps': [float(v) for v in anchor_t],
               'gaps': gaps, 'reader_missing_cycles': sum(g['class'] == 'sidecar_only' for g in gaps),
               'unclassified_cycles': sum(g['class'] not in ('sidecar_only','controller_skipped') for g in gaps),
               'controller_missing_cycles': sum(g['class'] == 'controller_skipped' for g in gaps)}
     return aligned_ns, report
 
 
+#: RR_15: the RTDE fields a mock driver cannot supply. They are zero (no
+#: current or torque channels: the mock rows of SIMULATOR_LIMITS) or NaN (no
+#: temperature, no robot-side target), never invented.
+MOCK_ZERO_FIELDS = ('actual_current', 'target_current', 'target_moment', 'joint_control_output')
+MOCK_NAN_FIELDS = ('target_q', 'target_qd', 'joint_temperatures')
+
+
+def mock_sidecar(stamps_ns: np.ndarray, decoded: list, driver_joint_order, *, dt: float = 0.008):
+    """``hardware: mock`` has no RTDE server (no sidecar runs): build the
+    sidecar-shaped frame from the driver's ``/dynamic_joint_states`` on a
+    uniform ``dt`` grid of the controller-manager clock (explicitly
+    synthetic, as the iiwa mock's resampling), with the status fields from
+    the mock's GPIO and :data:`MOCK_ZERO_FIELDS`/:data:`MOCK_NAN_FIELDS`."""
+    stamps_ns = np.asarray(stamps_ns, dtype=np.int64)
+    seconds = (stamps_ns - stamps_ns[0]) * 1e-9
+    grid = np.arange(0.0, seconds[-1] + 1e-12, dt)
+    frame = {'timestamp': grid}
+    for j, name in enumerate(driver_joint_order):
+        for field, interface in (('actual_q', 'position'), ('actual_qd', 'velocity')):
+            frame[f'{field}{j}'] = np.interp(grid, seconds, [d[name][interface] for d in decoded])
+        for field in MOCK_ZERO_FIELDS:
+            frame[f'{field}{j}'] = np.zeros(len(grid))
+        for field in MOCK_NAN_FIELDS:
+            frame[f'{field}{j}'] = np.full(len(grid), np.nan)
+    status = {'robot_mode': ('gpio', 'robot_mode'), 'safety_status': ('gpio', 'safety_mode'),
+              'speed_scaling': ('speed_scaling', 'speed_scaling_factor')}
+    for column, (joint, interface) in status.items():
+        values = np.asarray([d.get(joint, {}).get(interface, np.nan) for d in decoded], dtype=float)
+        frame[column] = np.interp(grid, seconds, values)
+    frame['target_speed_fraction'] = np.ones(len(grid))  # no speed slider on mock
+    aligned = stamps_ns[0] + np.rint(grid * 1e9).astype(np.int64)
+    report = {'sidecar_rows': len(grid), 'clock_mapping': f'mock: controller-manager clock resampled to {dt} s',
+              'wall_seconds_per_robot_second': 1.0, 'anchor_timestamps': [], 'gaps': [],
+              'reader_missing_cycles': 0, 'unclassified_cycles': 0, 'controller_missing_cycles': 0,
+              'mock_fields': {'zero': list(MOCK_ZERO_FIELDS), 'nan': list(MOCK_NAN_FIELDS),
+                              'constant': {'target_speed_fraction': 1.0},
+                              'from_gpio': {k: '/'.join(v) for k, v in status.items()}}}
+    return pd.DataFrame(frame), aligned, report
+
+
 def prepare_ur_conversion(config, run_dir: Path):
     from control_msgs.msg import DynamicJointState
-    from erd_msgs.msg import RunEvent
     profile = profile_for(config.robot)
-    sidecar = pd.read_parquet(run_dir / 'rtde.parquet')
-    q, stamps = [], []
-    for _, msg in read_bag_topic(run_dir / 'bag', '/dynamic_joint_states', DynamicJointState):
-        decoded = decode_dynamic_joint_state(msg)
-        q.append([decoded[j]['position'] for j in profile.driver_joint_order])
-        stamps.append(msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec)
-    aligned, report = align_rtde(sidecar, np.asarray(q), np.asarray(stamps, dtype=np.int64))
+    stamps, _, messages = read_header_stamped(run_dir / 'bag', '/dynamic_joint_states', DynamicJointState)
+    decoded = [decode_dynamic_joint_state(msg) for msg in messages]
+    if config.hardware == 'mock':
+        sidecar, aligned, report = mock_sidecar(stamps, decoded, profile.driver_joint_order)
+    else:
+        sidecar = pd.read_parquet(run_dir / 'rtde.parquet')
+        q = [[d[j]['position'] for j in profile.driver_joint_order] for d in decoded]
+        aligned, report = align_rtde(sidecar, np.asarray(q), stamps)
     raw = sidecar.copy()
     raw['t'] = raw['timestamp']
-    raw['bag_stamp_ns'] = aligned
+    raw['stamp_ns'] = aligned       # RTDE robot time mapped onto the driver's header clock
+    raw['bag_stamp_ns'] = aligned   # kept for raw files read by older code
     for i, sim in enumerate(config.joint_order):
         driver = config.description.sim_to_driver()[sim]
         j = profile.driver_joint_order.index(driver)
@@ -100,8 +143,9 @@ def prepare_ur_conversion(config, run_dir: Path):
                               ('commanded_position','target_q')]:
             raw[f'{prefix}{i}'] = sidecar[f'{field}{j}']
     raw.to_parquet(run_dir / 'raw.parquet', index=False)
-    events = [{'stamp_ns': e.header.stamp.sec * 10**9 + e.header.stamp.nanosec,
-               'segment_id': e.segment_id, 'kind': e.kind, 'plan_digest': e.plan_digest}
-              for _, e in read_bag_topic(run_dir / 'bag', '/erd/events', RunEvent)]
+    events = read_events(run_dir / 'bag')
     (run_dir / 'events.json').write_text(json.dumps(events, indent=2))
     (run_dir / 'rtde_alignment.json').write_text(json.dumps(report, indent=2))
+    write_recorder_losses(config, run_dir / 'bag', run_dir / 'raw' / 'bag.rosbag2.stderr.log',
+                          run_dir / 'recorder_losses.json', djs_header=stamps)
+    write_controller_state(config, run_dir / 'bag', stamps, run_dir / 'controller_state.parquet')
