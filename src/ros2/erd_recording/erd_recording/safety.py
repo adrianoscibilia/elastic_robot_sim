@@ -102,6 +102,12 @@ class MonitorSample:
 FRI_COMMANDING_ACTIVE = 4
 
 
+def format_rad(value: float) -> str:
+    """A tracking error or threshold with 3 significant digits (RR_16 Q-2):
+    ``6.31e-04``."""
+    return f"{float(value):.2e}"
+
+
 def evaluate_abort_conditions(
     sample: MonitorSample, *, tracking_rad: float, torque_fraction: float | None = None,
     stale_sample_budget_s: float = STALE_SAMPLE_BUDGET_S, speed_scaling_floor: float = SPEED_SCALING_FLOOR,
@@ -121,8 +127,10 @@ def evaluate_abort_conditions(
                 continue
             error = abs(measured - reference)
             if error > tracking_rad:
-                reasons.append(f"tracking error {joint}: |{measured:.4f} - {reference:.4f}| "
-                               f"= {error:.4f} rad > {tracking_rad} rad")
+                # RR_16 Q-2 (F-3): 3 significant digits, so a rung-4a reason
+                # never reads "0.0006 rad > 0.000624 rad".
+                reasons.append(f"tracking error {joint}: |{measured:.6f} - {reference:.6f}| "
+                               f"= {format_rad(error)} rad > {format_rad(tracking_rad)} rad")
 
     if sample.measured_effort is not None and sample.effort_limit is not None and torque_fraction is not None:
         for joint, effort in sample.measured_effort.items():
@@ -211,12 +219,26 @@ def segment_tracking_rad(kind: str | None, *, file_rad: float, excitation_overri
     return float(file_rad)
 
 
-def check_abort_override(tracking_rad: float | None, ladder: float | None) -> None:
-    """Refuse ``--abort-tracking-rad`` unless ``--ladder <= 0.1`` is also given."""
+#: RR_16 Q-2 (F-2): the only stage the override may reach. `identify` runs
+#: excitation kinds too, and `all` would include it.
+ABORT_OVERRIDE_STAGES = frozenset({"run"})
+
+
+def check_abort_override(tracking_rad: float | None, ladder: float | None, *, file_rad: float,
+                         stage: str) -> None:
+    """Refuse ``--abort-tracking-rad`` unless it *lowers* the lab file's
+    ``limits.abort.tracking_rad`` (RR_16 Q-2, F-1), the stage is ``run``
+    (F-2) and ``--ladder <= 0.1`` is also given (RR_12 A-4)."""
     if tracking_rad is None:
         return
     if not tracking_rad > 0:
         raise ValueError(f"--abort-tracking-rad must be positive, got {tracking_rad}")
+    if not tracking_rad < file_rad:
+        raise ValueError(f"--abort-tracking-rad {format_rad(tracking_rad)} rad must be below the lab file's "
+                         f"limits.abort.tracking_rad {format_rad(file_rad)} rad; it may only lower the threshold")
+    if stage not in ABORT_OVERRIDE_STAGES:
+        raise ValueError(f"--abort-tracking-rad is accepted only with the stage(s) {sorted(ABORT_OVERRIDE_STAGES)}, "
+                         f"not {stage!r}; RR_12 A-4: rung 4a is a `run`")
     if ladder is None or ladder > ABORT_OVERRIDE_MAX_LADDER:
         raise ValueError(f"--abort-tracking-rad is accepted only with --ladder <= {ABORT_OVERRIDE_MAX_LADDER} "
                          f"(got --ladder {ladder}); RR_12 A-4: rung 4a only")

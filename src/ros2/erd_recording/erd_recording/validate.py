@@ -387,9 +387,21 @@ SIMULATOR_LIMITS = {
 }
 
 
+#: RR_16 Q-3 (F-6): every ``hardware`` value a lab file may name. Anything
+#: else is refused, never given the non-real (lenient) treatment.
+HARDWARE_VALUES = frozenset({"real", "mock", "emulator", "ursim"})
+
+
+def require_hardware(hardware: object) -> str:
+    """``hardware`` if it is one of :data:`HARDWARE_VALUES`, else ``ValueError``."""
+    if hardware not in HARDWARE_VALUES:
+        raise ValueError(f"hardware must be one of {sorted(HARDWARE_VALUES)}, got {hardware!r}")
+    return str(hardware)
+
+
 def simulator_limit(check: str, hardware: str) -> str | None:
     """The listed reason a simulator fails ``check``; ``None`` on real hardware."""
-    if hardware == "real":
+    if require_hardware(hardware) == "real":
         return None
     return SIMULATOR_LIMITS.get((hardware, check))
 
@@ -398,7 +410,9 @@ def finalize_checks(checks: Sequence[Mapping[str, Any]], *, hardware: str, robot
     """RR_12 C-2c: on ``hardware: real`` a ``null`` check is an error; only a
     pair in :data:`NOT_APPLICABLE_ALLOWED` may stay ``not_applicable``.
     Off real hardware nulls stay visible but don't fail, and a failure on
-    :data:`SIMULATOR_LIMITS` is marked, not counted (RR_14 P-2b)."""
+    :data:`SIMULATOR_LIMITS` is marked, not counted (RR_14 P-2b). An unknown
+    ``hardware`` is refused (RR_16 Q-3)."""
+    require_hardware(hardware)
     final = []
     for check in checks:
         entry = dict(check)
@@ -428,9 +442,12 @@ def validate_dataset(
     session_health: Mapping[str, Any] | None = None, identification_freshness: Mapping[str, Any] | None = None,
     reference_tracking: Mapping[str, Any] | None = None, envelopes: Mapping[str, Any] | None = None,
     noise: Mapping[str, Any] | None = None, sign_convention: Mapping[str, Any] | None = None,
-    hardware: str = "mock", robot: str = "",
+    hardware: str, robot: str = "",
 ) -> dict[str, Any]:
-    """Assemble every S8.3 check into one ``validation.json``-shaped report."""
+    """Assemble every S8.3 check into one ``validation.json``-shaped report.
+    ``hardware`` has no default (RR_16 Q-3, F-6): a caller that forgets it
+    must fail, not get the mock limits."""
+    require_hardware(hardware)
     checks = [
         check_uniform_grid(frame, nominal_dt=nominal_dt),
         check_no_nan_and_ranges(frame, n_dof=n_dof, position_lower=position_lower, position_upper=position_upper),

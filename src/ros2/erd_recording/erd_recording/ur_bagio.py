@@ -15,8 +15,16 @@ def align_rtde(sidecar: pd.DataFrame, driver_q: np.ndarray, driver_stamps_ns: np
     lookup = {}
     for i, row in enumerate(driver_q):
         lookup.setdefault(tuple(row), []).append(i)
+    # An anchor is a position seen exactly once on *both* clocks. RR_19: at a
+    # standstill the position flickers between a few exact values, and the
+    # bag stops before the sidecar, so a value can occur once in the driver
+    # (cut by the bag's end) but several times in the sidecar; mapping those
+    # rows to one driver sample made the anchors nonmonotonic (rr19_ur10_sim).
+    seen = {}
+    for row in map(tuple, q):
+        seen[row] = seen.get(row, 0) + 1
     anchors = [(i, lookup[tuple(row)][0]) for i, row in enumerate(q)
-               if len(lookup.get(tuple(row), [])) == 1]
+               if len(lookup.get(tuple(row), [])) == 1 and seen[tuple(row)] == 1]
     if len(anchors) < 10:
         raise ValueError('RTDE alignment requires at least 10 unique moving actual_q anchors')
     ri, di = np.asarray(anchors).T

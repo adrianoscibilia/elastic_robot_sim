@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from .bagio import data_topic_losses, losses_in_window, robot_clock_samples, segment_completeness, segment_skips
+from .bagio import (data_topic_losses, losses_in_window, robot_clock_samples, segment_completeness,
+                    segment_skip_verdict, segment_skips)
 from .contract import contract_source, differentiation_from_reference, real_baselines, real_contract
 from .convert import ur10_dataset_frame, write_real_dataset
 from .identification import MotorSideFit
@@ -53,7 +54,7 @@ def convert_ur(config, root: Path, reference):
         lo, hi, lo_ns, hi_ns = bounds[sid]
         bracketed = raw.iloc[lo:hi]
         complete = segment_completeness(robot_clock_samples(bracketed), len(segment.trajectory.time),
-                                        clock_ratio=window_clock_ratio(bracketed, clock_ratio))
+                                        clock_ratio=window_clock_ratio(bracketed, clock_ratio, hardware=config.hardware))
         data_losses = data_topic_losses(losses, lo_ns, hi_ns)
         if config.hardware == 'mock':  # no RTDE: the mock frame is built on the driver's own clock
             anchors = {'ok': True, 'max_anchor_interval_s': None}
@@ -67,7 +68,7 @@ def convert_ur(config, root: Path, reference):
         valid = (not gaps or allowed) and complete['ok'] and data_losses == 0 and anchors['ok']
         checks[sid] = {'ok': valid, 'samples': len(frame), 'gaps': gaps,
                        'interpolated_controller_cycles': len(gaps) if allowed else 0, 'completeness': complete,
-                       'data_topic_losses': data_losses, 'data_topic_skips': segment_skips(losses, lo_ns, hi_ns), 'losses_by_topic': losses_in_window(losses, lo_ns, hi_ns),
+                       'data_topic_losses': data_losses, 'data_topic_skips': segment_skips(losses, lo_ns, hi_ns), 'skip_verdict': segment_skip_verdict(losses, lo_ns, hi_ns), 'losses_by_topic': losses_in_window(losses, lo_ns, hi_ns),
                        'max_anchor_interval_s': anchors['max_anchor_interval_s'],
                        'max_anchor_interval_limit_s': MAX_ANCHOR_INTERVAL_S, 'duration_s': (hi_ns - lo_ns) * 1e-9}
         if not valid: continue

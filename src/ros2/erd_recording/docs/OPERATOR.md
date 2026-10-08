@@ -116,10 +116,15 @@ done
   the monitor threshold at 5 mrad; reports cancel latency and sample ages.
 * Rung 4a on the real robot uses the normal pipeline instead:
   `record_iiwa ... run --ladder 0.1 --abort-tracking-rad <x>`. The override
-  is refused above `--ladder 0.1`, lowers only the monitor's threshold (the
-  JTC keeps the lab file's path tolerance), acts **inside excitation
-  segments only** (approaches and returns keep the lab file's threshold),
-  and is written into `manifest.yaml`.
+  is refused above `--ladder 0.1`, at or above the lab file's
+  `limits.abort.tracking_rad` (it may only *lower* the threshold), and with
+  any stage but `run` (`all` and `identify` refuse: RR_16 Q-2). It lowers
+  only the monitor's threshold (the JTC keeps the lab file's path
+  tolerance), acts **inside excitation segments only** (approaches and
+  returns keep the lab file's threshold), and is written into
+  `manifest.yaml`. `run` alone needs the plan and preflight of the same
+  run folder, so give all three the same `--run-id`:
+  `plan --ladder 0.1`, `preflight`, `run --ladder 0.1 --abort-tracking-rad <x>`.
 * `<x>` (RR_14 P-3, amends RR_12 S4.6 rung 4a): 0.5 x the largest tracking
   error of the rung-4 `--ladder 0.1` run, and at least 4 encoder counts
   (iiwa 2.4e-7 rad, UR10 1.9e-6 rad). `report` on that run prints it:
@@ -143,6 +148,10 @@ Besides RR_01 S5's items, `preflight` on `hardware: real` refuses when:
   `connection.software_version`;
 * `safety.vendor_checksum` is empty. It is copied into every run's
   `manifest.yaml` and the dataset contract.
+
+If A-3a refuses with `friction_model_controller` active on the UR10, run
+`ros2 control switch_controllers --deactivate friction_model_controller` and
+repeat preflight.
 
 At L1/L2 the same items are listed with `would_pass` but don't gate.
 
@@ -171,7 +180,35 @@ URDF).
 
 Before every hardware session, run these four with **the exact code that
 goes to the laptop** (one robot stack at a time, domain 87). Each must end
-`status: synthetic` in `manifest.yaml` and `validation.json`:
+`status: synthetic` in `manifest.yaml` and `validation.json`.
+
+**Code digest and build stamp (RR_16 Q-4(i), RR_18 R-4).** Every run writes
+`code_digest` into `manifest.yaml` (the recording code) and `validation.json`
+(the analysing code; `recording_code_digest` repeats the manifest's). The
+method is `erd-src-digest/2`: every file under `src/ros2` except `*.md`, plus
+`workspace_setup.sh` and `src/elastic_sim/**/*.py`. The block also records,
+per `src/ros2/erd.repos` entry, the commit checked out under
+`ros2_ws/src/external/` (`external_repos`: `checked_out`, `matches_pin`,
+`dirty_tracked_files`). After pulling, always rebuild:
+
+```bash
+source workspace_setup.sh --build        # writes ros2_ws/install/.erd_build_digest
+ros2 run erd_recording erd_code_digest   # last line: method erd-src-digest/2  code_digest <16 hex>
+                                         #   build stamp <16 hex> (matches)  installed modules match
+```
+
+On peepo and on the laptop: the method must be `/2` on both, the two
+`code_digest` values equal, and equal to the four runs' `code_digest.value`;
+`iiwa_ros2`'s `checked_out` must be the same commit on both. It exits
+non-zero (`REFUSED: ...`), and `record_*` (any ROS stage), `erd_link_test`
+and `erd_monitor_test` refuse to start, when
+* the build stamp is missing or differs from the source digest (a source
+  change -- C++, `CMakeLists.txt`, `.msg`, launch/config, `elastic_sim` --
+  pulled but not rebuilt), or
+* an installed Python module of `erd_recording`, `erd_ur10` or `erd_iiwa`
+  differs from its source.
+
+The refusal names the stamp; `source workspace_setup.sh --build` clears it.
 
 ```bash
 record_iiwa --config $ERD_LAB/iiwa_mock.yaml all --no-confirm   # iiwa.launch.py hardware:=mock
@@ -190,10 +227,71 @@ check, listed under `simulator_limits`), or is the iiwa's allowed
 * emulator: nothing; the iiwa L2 `sign convention` must be true on A2 and A4
   (the sim poses give 52 / 31 N*m of gravity range).
 
+**Rung-4a sessions only (RR_16 Q-4(ii)):** add an L2 rehearsal of the
+deliberate abort on the same digest. First a `--ladder 0.1` run; `report`
+prints the value (`report: suggested --abort-tracking-rad <x>`):
+
+```bash
+C="--config $ERD_LAB/iiwa_sim.yaml"
+for stage in "plan --ladder 0.1" preflight "run --ladder 0.1 --no-confirm" report; do
+  ros2 run erd_recording record_iiwa $C $stage --run-id <id>_ladder01; done   # prints <x>
+for stage in "plan --ladder 0.1" preflight "run --ladder 0.1 --abort-tracking-rad <x> --no-confirm" report; do
+  ros2 run erd_recording record_iiwa $C $stage --run-id <id>_a4; done
+```
+
+The `run` of `<id>_a4` must end `failed` with `failed_segment:
+excitation_0_ladder` and `stop_confirmed: true` in `manifest.yaml`; its
+`report` prints the cancel latency. UR10: the same with `record_ur10` and
+`ur10_sim.yaml`.
+
 The list is never consulted on `hardware: real`. A failing simulator run
 ends `invalid`. Contracts written from mock/emulator/URSim data say
 `"source": "synthetic_mock"` with `real.hardware`; `evaluate` refuses a
 contract whose `source` and hardware disagree.
+
+## Recorder losses (RR_16 Q-1)
+
+Every bag is recorded through `erd_recording.bag_record`: `ros2 bag
+record`'s own `record` verb (same options, same bag), with only the
+`rosbag2_recorder` logger at DEBUG. Each bag's `raw/*.rosbag2.stderr.log`
+therefore holds rosbag2's "Subscribed to topic" lines and one "Messages lost
+on transport layer for topic '...'" line per loss event, with its time
+(about 1 kB per bag otherwise). `recorder_losses*.json` reads them
+(`attribution: "events"`):
+* a topic's **first** event, of **1** message, logged within 10 ms after
+  its first recorded message (or within 10 ms of its "Subscribed" line),
+  with no counted miss up to 10 ms later and before the bag's first segment,
+  is a `startup_artefact` (RR_18 R-1; on the UR10 the first message can come
+  0.1-0.8 s after subscribing);
+* misses the bag's own count finds and no event explains are publisher
+  skips (never sent). They invalidate a segment only if there are more than
+  one and more than 1 % of its expected updates, or a run of them leaves a
+  gap of more than 3 nominal periods between recorded updates (RR_18 R-3,
+  RR_19 D-12). `validation.json`/`identification.json` print each segment's
+  `skip_verdict`, including `largest_gap_ms`;
+* every contiguous run of misses that overlaps `[t_e - 8.51 s, t_e]` of an
+  event is a transport loss, charged whole however long the stall (RR_18
+  R-2), and invalidates its segments.
+
+Without the DEBUG lines, a rosbag2 total, or when the events don't add up to
+the total, it falls back to counting (`attribution: "count_fallback"`, fail
+closed; there, more than 3 skips in a segment invalidate it).
+`--recorder-log-level debug` is a **diagnostic** switch only (one global
+level for every logger, ~0.5 MB/s of rcl lines); no other level is accepted.
+
+**Recorder start (RR_18 R-5).** Each bag waits for rosbag2's "Subscribed to
+topic" line of every listed topic, and >= 2 s past "Recording...", before
+the first goal. `/erd/rtde_status` is listed only in bags whose stage starts
+the RTDE sidecar (UR10 `identify`, `run`, link test; never `standstill`), and
+its line is confirmed within 5 s once the sidecar reports rows. A topic still
+missing after 15 s stops the bag and fails the stage with `rosbag2 start
+failed (...): no "Subscribed to topic" line for [...]`: no goal was sent.
+Check the stack (`ros2 topic list`) and rerun.
+
+**Monitor sample age (rung 3, RR_18 R-6).** `report` prints, per stage of
+`monitor.json`, the age p99/max against the robot's bound and `pass`/`FAIL`:
+iiwa p99 <= 10 ms; UR10 p99 <= 16 ms (2 periods at 125 Hz) and max < 50 ms
+(the stale budget).
 
 ## The live safety monitor and stopping a run (RR_04 A-1)
 

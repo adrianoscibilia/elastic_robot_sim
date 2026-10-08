@@ -114,6 +114,17 @@ def _spin_for(node: Any, seconds: float, stop: dict[str, bool]) -> None:
         rclpy.spin_once(node, timeout_sec=0.1)
 
 
+def _installed_code_digest() -> dict:
+    """RR_16 Q-4(i), RR_18 R-4: the run's code digest; a missing or stale
+    build stamp, or a stale installed module, refuses."""
+    from .code_digest import code_digest, refusal
+
+    digest = code_digest()
+    if refusal(digest):
+        raise SystemExit(refusal(digest))
+    return digest
+
+
 def link_test_main(argv: list[str] | None = None) -> int:
     from .env_guard import assert_environment
 
@@ -134,17 +145,19 @@ def link_test_main(argv: list[str] | None = None) -> int:
     config = load_lab_config(args.config)
     check_environment_domain(config)
     profile = profile_for(config.robot)
+    digest = _installed_code_digest()
     paths = make_run_dir(config, run_id=args.run_id or time.strftime("link_test_%H%M%S"))
-    _write_manifest_fields(paths, stage="link_test", hardware=config.hardware, duration_s=args.duration_s,
+    _write_manifest_fields(paths, stage="link_test", hardware=config.hardware, code_digest=digest, duration_s=args.duration_s,
                            safety_vendor_checksum=config.safety.vendor_checksum)
     stop = {"requested": False}
     previous = signal.signal(signal.SIGINT, lambda *_: stop.update(requested=True))
     rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
     node = RecordingNode(profile, config)
     try:
-        node.start_bag(paths.bag_dir)
-        if profile.has_ur_status_topics:
-            node.start_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
+        sidecar = node.launch_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
+        node.start_bag(paths.bag_dir, sidecar=sidecar)
+        if sidecar:
+            node.wait_for_sidecar_rows()
         _spin_for(node, args.duration_s, stop)
     finally:
         node.stop_bag()
@@ -175,6 +188,9 @@ def link_test_main(argv: list[str] | None = None) -> int:
     losses = write_recorder_losses(config, paths.bag_dir, paths.raw_log_dir / "bag.rosbag2.stderr.log",
                                    paths.root / "recorder_losses.json")
     result["recorder_losses"] = {"rosbag2_transport_lost": losses["rosbag2_transport_lost"],
+                                 "attribution": losses["attribution"],
+                                 "startup_artefacts": losses.get("startup_artefacts"),
+                                 "transport_events": losses.get("transport_events"),
                                  "missing_by_topic": {t: e["missing"] for t, e in losses["topics"].items()},
                                  "unattributed": losses["unattributed"]}
     (paths.root / "link_test.json").write_text(json.dumps(result, indent=2))
@@ -236,8 +252,9 @@ def monitor_test_main(argv: list[str] | None = None) -> int:
         return 2
     check_environment_domain(config)
     profile = profile_for(config.robot)
+    digest = _installed_code_digest()
     paths = make_run_dir(config, run_id=args.run_id or time.strftime("monitor_test_%H%M%S"))
-    _write_manifest_fields(paths, stage="monitor_test", hardware=config.hardware, injections=args.injections,
+    _write_manifest_fields(paths, stage="monitor_test", hardware=config.hardware, code_digest=digest, injections=args.injections,
                            step_rad=args.step_rad, step_s=args.step_s, threshold_rad=args.threshold_rad)
     rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
     node = RecordingNode(profile, config)

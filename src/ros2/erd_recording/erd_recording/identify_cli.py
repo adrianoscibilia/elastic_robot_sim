@@ -12,12 +12,13 @@ from .env_guard import assert_environment
 assert_environment(require_ros=False, require_pinocchio=True)
 from elastic_sim.assets import AssetRegistry
 from elastic_sim import identification as idn
-from .bagio import (data_topic_losses, segment_skips, event_delivery, event_window, iiwa_cycle_health, losses_in_window,
+from .bagio import (data_topic_losses, segment_skip_verdict, segment_skips, event_delivery, event_window, iiwa_cycle_health, losses_in_window,
                     robot_clock_samples, segment_completeness)
 from .config import load_lab_config
 from .contract import load_reference, differentiation_from_reference, resolve_reference
 from .identification import choose_ur_tau_source, fit_linear_per_joint, identify_motor_side, fit_sweep_friction
 from .planning import load_plan
+from .validate import require_hardware
 
 
 def block(frame, prefix, n):
@@ -72,21 +73,24 @@ def robot_clock_ratio(config, run_dir):
     return 1.0 / float(json.loads(path.read_text())['wall_seconds_per_robot_second'])
 
 
-def window_clock_ratio(frame, run_ratio):
-    """RR_15 refinement of D-4 (URSim only, i.e. ``run_ratio != 1``): the
+def window_clock_ratio(frame, run_ratio, *, hardware):
+    """RR_15 refinement of D-4 (URSim only; RR_16 Q-3 gates it on
+    ``hardware == 'ursim'``, not on the ratio, and every other value gets 1.0): the
     robot clock's rate inside this window -- RTDE robot time elapsed over
     the aligned wall time elapsed. URSim's rate drifts by about +-1 % between
     windows (0.926-0.944 on rr15_ur10_sim_c), enough to fail a 5 s hold
     against the whole-run ratio. Robot time, not a sample count: a window
     with missing robot samples or a hold cut short still fails."""
-    if run_ratio == 1.0 or 'timestamp' not in frame or 'stamp_ns' not in frame or len(frame) < 2:
+    if require_hardware(hardware) != 'ursim':
+        return 1.0
+    if 'timestamp' not in frame or 'stamp_ns' not in frame or len(frame) < 2:
         return run_ratio
     robot = float(frame['timestamp'].iloc[-1] - frame['timestamp'].iloc[0])
     wall = float(frame['stamp_ns'].iloc[-1] - frame['stamp_ns'].iloc[0]) * 1e-9
     return robot / wall if robot > 0 and wall > 0 else run_ratio
 
 
-def segment_health(segments, frames, bounds, losses, *, clock_ratio=1.0):
+def segment_health(segments, frames, bounds, losses, *, hardware, clock_ratio=1.0):
     """RR_12 B-1/B-2 per fit-input segment: robot-clock completeness against
     the plan, losses on the two data topics, and the event-stamped duration."""
     table = {}
@@ -94,11 +98,11 @@ def segment_health(segments, frames, bounds, losses, *, clock_ratio=1.0):
         sid = segment.segment_id
         lo, hi = bounds[sid]
         complete = segment_completeness(robot_clock_samples(frames[sid]), len(segment.trajectory.time),
-                                        clock_ratio=window_clock_ratio(frames[sid], clock_ratio))
+                                        clock_ratio=window_clock_ratio(frames[sid], clock_ratio, hardware=hardware))
         lost = data_topic_losses(losses, lo, hi)
         table[sid] = {**complete, 'kind': segment.kind, 'duration_s': (hi - lo) * 1e-9,
                       'planned_duration_s': float(segment.trajectory.duration),
-                      'data_topic_losses': lost, 'data_topic_skips': segment_skips(losses, lo, hi), 'losses_by_topic': losses_in_window(losses, lo, hi),
+                      'data_topic_losses': lost, 'data_topic_skips': segment_skips(losses, lo, hi), 'skip_verdict': segment_skip_verdict(losses, lo, hi), 'losses_by_topic': losses_in_window(losses, lo, hi),
                       'ok': complete['ok'] and lost == 0}
     return table
 
@@ -224,7 +228,8 @@ def identify(config, root, reference):
     frames, bounds = windows(raw, events, selected)
     losses_path = recording / 'recorder_losses.json'
     losses = json.loads(losses_path.read_text()) if losses_path.is_file() else None
-    health = segment_health(selected, frames, bounds, losses, clock_ratio=robot_clock_ratio(config, recording))
+    health = segment_health(selected, frames, bounds, losses, hardware=config.hardware,
+                                clock_ratio=robot_clock_ratio(config, recording))
     n = len(config.joint_order)
     diff = differentiation_from_reference(reference, rate_real=config.rate_hz, probe_top_real=0., reference_path=reference['_path'])
     sg, poly, dt = diff['sg_window'], diff['sg_poly'], 1 / config.rate_hz
@@ -354,6 +359,8 @@ def _loss_summary(losses):
     if not losses:
         return None
     return {'rosbag2_transport_lost': losses.get('rosbag2_transport_lost'),
+            'attribution': losses.get('attribution'), 'startup_artefacts': losses.get('startup_artefacts'),
+            'transport_events': losses.get('transport_events'), 'publisher_skips': losses.get('publisher_skips'),
             'unattributed': losses.get('unattributed'),
             'missing_by_topic': {t: e['missing'] for t, e in losses.get('topics', {}).items()},
             'source': 'identification/recorder_losses.json'}

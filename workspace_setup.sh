@@ -12,7 +12,8 @@
 # Options (combine freely):
 #   --deps    install system packages with sudo: ROS 2 Jazzy if missing, the
 #             stack's apt/rosdep dependencies, python3-venv, git, netcat
-#   --build   incremental `colcon build` before sourcing
+#   --build   incremental `colcon build` before sourcing; writes the build
+#             stamp ros2_ws/install/.erd_build_digest (RR_18 R-4)
 #   --clean   delete ros2_ws/{build,install,log} and rebuild from scratch
 #   --test    run both test invocations (ROS-sourced packages, then the
 #             ROS-free erd_recording suite) after building
@@ -234,8 +235,18 @@ _erd_main() {
     rm -rf "$ERD_WS/build" "$ERD_WS/install" "$ERD_WS/log"
   fi
   if (( build )) || [[ ! -f "$ERD_WS/install/setup.bash" ]]; then
-    _erd_log "colcon build in $ERD_WS"
+    # RR_18 R-4(b): the build stamp is the source digest taken *before* the
+    # build; record_*, erd_link_test, erd_monitor_test and erd_code_digest
+    # refuse when it is missing or differs from the sources.
+    local digester="$ERD_REPO_ROOT/src/ros2/erd_recording/erd_recording/code_digest.py" built_from
+    built_from="$(/usr/bin/python3 "$digester" --source-digest --repo-root "$ERD_REPO_ROOT")" \
+      || { _erd_err "computing the source digest failed"; return 1; }
+    rm -f "$ERD_WS/install/.erd_build_digest"
+    _erd_log "colcon build in $ERD_WS (source digest $built_from)"
     _erd_build || { _erd_err "colcon build failed"; return 1; }
+    /usr/bin/python3 "$digester" --repo-root "$ERD_REPO_ROOT" --write-stamp "$ERD_WS/install" \
+      --digest "$built_from" >/dev/null || { _erd_err "writing the build stamp failed"; return 1; }
+    _erd_log "build stamp ros2_ws/install/.erd_build_digest = $built_from"
   fi
 
   # shellcheck disable=SC1091

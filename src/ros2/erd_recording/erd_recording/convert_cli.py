@@ -251,13 +251,18 @@ def recorder_loss_summary(run_dir: Path) -> dict[str, Any]:
         if path.is_file():
             report = json.loads(path.read_text())
             summary[name] = {"rosbag2_transport_lost": report.get("rosbag2_transport_lost"),
+                             "attribution": report.get("attribution", "count (before RR_16 Q-1)"),
+                             "startup_artefacts": report.get("startup_artefacts"),
+                             "transport_events": report.get("transport_events"),
+                             "publisher_skips": report.get("publisher_skips"),
                              "unattributed": report.get("unattributed"),
                              "missing_by_topic": {t: e["missing"] for t, e in report.get("topics", {}).items()}}
     return summary
 
 
 def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str, Any]) -> dict[str, Any]:
-    from .bagio import data_topic_losses, losses_in_window, robot_clock_samples, segment_completeness, segment_skips
+    from .bagio import (data_topic_losses, losses_in_window, robot_clock_samples, segment_completeness,
+                        segment_skip_verdict, segment_skips)
 
     reference_contract_path = reference_contract["_path"]
     n_dof = len(config.joint_order)
@@ -308,6 +313,7 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
         segment_checks[segment.segment_id] = {"ok": ok, "lost_cycles": lost, "samples": len(window),
                                                "completeness": complete, "data_topic_losses": data_losses,
                                                "data_topic_skips": segment_skips(losses, lo_ns, hi_ns),
+                                               "skip_verdict": segment_skip_verdict(losses, lo_ns, hi_ns),
                                                "losses_by_topic": losses_in_window(losses, lo_ns, hi_ns),
                                                "duration_s": (hi_ns - lo_ns) * 1e-9}
         if config.hardware != "mock":
@@ -438,6 +444,16 @@ def _finish_validation(config: LabConfig, run_dir: Path, validation: dict[str, A
     validation["recorder_losses"] = recorder_loss_summary(run_dir)
     validation["event_delivery"] = event_delivery(events)
     validation["hardware"] = config.hardware
+    # RR_16 Q-4(i): the analysing code, and the code the run was recorded with.
+    from .code_digest import code_digest
+
+    validation["code_digest"] = code_digest()
+    manifest_path = run_dir / "manifest.yaml"
+    if manifest_path.is_file():
+        import yaml
+
+        recorded = (yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}).get("code_digest") or {}
+        validation["recording_code_digest"] = recorded.get("value") if isinstance(recorded, dict) else None
     # RR_14 P-2: `synthetic` only when every check passed or is on the
     # simulator-limits list; a failing simulator run is `invalid` like a real one.
     if not validation["ok"]:

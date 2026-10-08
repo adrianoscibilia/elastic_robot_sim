@@ -28,6 +28,7 @@ setup(
             "show_plan = erd_recording.cli:show_plan_main",
             "erd_link_test = erd_recording.link_test:link_test_main",
             "erd_monitor_test = erd_recording.link_test:monitor_test_main",
+            "erd_code_digest = erd_recording.code_digest:main",
         ],
     },
 )

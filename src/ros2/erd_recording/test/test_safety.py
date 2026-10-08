@@ -174,13 +174,46 @@ def test_software_version_mismatch_refuses():
     assert not check_software_version(None, "3.15.7")["ok"]
 
 
+FILE_RAD = 0.05
+
+
 @pytest.mark.parametrize("tracking,ladder", [(0.005, None), (0.005, 0.25), (0.005, 1.0), (0.0, 0.1), (-0.01, 0.05)])
 def test_abort_override_refused_without_small_ladder(tracking, ladder):
     with pytest.raises(ValueError):
-        check_abort_override(tracking, ladder)
+        check_abort_override(tracking, ladder, file_rad=FILE_RAD, stage="run")
 
 
 @pytest.mark.parametrize("ladder", [0.1, 0.05])
 def test_abort_override_accepted_at_ladder_up_to_0_1(ladder):
-    check_abort_override(0.005, ladder)
-    check_abort_override(None, None)  # no override: nothing to check
+    check_abort_override(0.005, ladder, file_rad=FILE_RAD, stage="run")
+    check_abort_override(None, None, file_rad=FILE_RAD, stage="all")  # no override: nothing to check
+
+
+# RR_16 Q-2 (F-1, F-2): the override may only lower the file's threshold, and only in `run`.
+
+@pytest.mark.parametrize("tracking", [FILE_RAD, 0.6, 0.0500001])
+def test_abort_override_refused_at_or_above_the_file_value(tracking):
+    with pytest.raises(ValueError, match="below the lab file"):
+        check_abort_override(tracking, 0.1, file_rad=FILE_RAD, stage="run")
+
+
+@pytest.mark.parametrize("stage", ["all", "identify", "standstill", "preflight"])
+def test_abort_override_refused_outside_run(stage):
+    with pytest.raises(ValueError, match="accepted only with the stage"):
+        check_abort_override(0.000624, 0.1, file_rad=FILE_RAD, stage=stage)
+
+
+def test_abort_override_accepted_with_run_ladder_0_1_below_the_file_value():
+    check_abort_override(0.000624, 0.1, file_rad=FILE_RAD, stage="run")
+
+
+def test_cancel_reason_has_three_significant_digits():
+    from erd_recording.reporting import _TRACKING
+    from erd_recording.safety import MonitorSample, evaluate_abort_conditions
+
+    sample = MonitorSample(measured_position={"A1": 0.100631}, reference_position={"A1": 0.1})
+    reasons = evaluate_abort_conditions(sample, tracking_rad=0.000624)
+    assert len(reasons) == 1
+    assert "6.31e-04 rad > 6.24e-04 rad" in reasons[0], reasons[0]
+    # report's cancel-latency reader still finds the threshold the cancel names
+    assert float(_TRACKING.search(reasons[0]).group(1)) == pytest.approx(0.000624)

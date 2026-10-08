@@ -1,28 +1,36 @@
 # erd.lab/1 -- KUKA LBR iiwa 14 R820, REAL ROBOT.
 #
-# The reviewed template (RR_01 S4, RR_04 B-4): `hardware: real`, domain 0.
-# `load_lab_config` REFUSES this file as-is -- `limits.reviewed`/
-# `scene.reviewed` are false and several measured values are still `null` or
-# placeholders, on purpose, until T2.0 fills them in. Do not flip `reviewed`
-# to true without measuring the cell and reviewing every value below.
+# DRAFT 2026-10-08 (ROS 2 chat) from the owner's measurements in the cell.
+# The loader refuses it until the OWNER reviews it: set `limits.reviewed` and
+# `scene.reviewed` to true yourself, and paste `safety.vendor_checksum`.
 #
-# Known facts filled in from I-10/I-12 (pendant photos, 2026-09-29) and the
-# ICube station project; everything else needs T2.0. Per-joint
-# position/velocity/acceleration/jerk limits are `null` (the loader accepts
-# that: RR_01 S4's own template shows the same). Scene coordinates cannot be
-# `null` structurally (the loader parses them as numbers immediately, unlike
-# the per-joint limits), so they carry an obvious zero-ish placeholder
-# instead, guarded by `scene.reviewed: false` -- never trust these numbers.
+#   * robot driven from peepo directly: peepo 192.170.1.200, robot 192.170.1.147;
+#   * Sunrise app = the owner's ICube-derived app, copied with TS = 1 ms,
+#     POSITION chosen in its dialog; its start-up ptp goes to INITIAL_POSITION,
+#     which is `poses.home` below (so preflight finds the robot at home);
+#   * workspace = the safe side of a virtual wall through P1/P2 and above a
+#     virtual floor at z = 66 mm (smartPAD, World = iiwa_base, Flange):
+#       P1 (-363.89, -467.28, 66) mm, P2 (559.6, 193.9, 66) mm,
+#       inside example P_EX (-319, 459, 406) mm.
+#     Both are `box` objects, NOT floor/wall types: those inflate `clearance`
+#     away from the robot (config._expand_object; logged for after the
+#     code freeze). The robot base axis is 168 mm from the wall line.
+#   * limits = the values the emulator runs used (inside the KUKA axis limits
+#     with >= 11 deg margin); standstill poses and the excitation window were
+#     checked offline against the two virtual surfaces (FK on the bare asset's
+#     collision meshes: all moving links >= 7 cm from the wall and >= 8 cm above
+#     the floor at the poses; straight joint paths home <-> pose >= 5 cm).
+#     `record_iiwa plan` is the authoritative check.
 schema: erd.lab/1
 robot: kuka_lbr_iiwa_14_r820
 hardware: real                          # mock | emulator | real
 operator: {confirm_each_trajectory: true}
 
 connection:
-  robot_ip: 192.170.10.2                # KONI (I-10)
-  client_ip: 192.170.10.5               # this PC on the KONI network, via the USB adapter (I-10)
+  robot_ip: 192.170.1.147               # owner, 2026-10-08 (the ICube bringup's robot_ip)
+  client_ip: 192.170.1.200              # peepo on the FRI network (owner, 2026-10-08)
   fri_port: 30200
-  fri_send_period_ms: 1                 # must equal ErdFri.java's setSendPeriodMilliSec (RR_01 S3.3)
+  fri_send_period_ms: 1                 # must equal the Sunrise app's send period (TS = 1 in the owner's 1 ms copy)
   sunrise_version: 1.11.0.7             # I-12
   ros_domain_id: 0                      # real always uses domain 0 (RR_01 S9)
 
@@ -37,40 +45,40 @@ description:
     extra_collision:                    # measure; margin for the MF if the URDF mesh lacks it
       - {shape: cylinder, height: 0.03, radius: 0.045, parent: iiwa_link_ee, xyz: [0, 0, 0.015], rpy: [0, 0, 0]}
 
-limits:                                 # real caps for excitation -- T2.0 measures and reviews every one
-  reviewed: false
+limits:                                 # proposed 2026-10-08: emulator-run values, inside KUKA's axis limits
+  reviewed: false                       # OWNER: set true once you have checked every value below
   position:
-    iiwa_A1: null
-    iiwa_A2: null
-    iiwa_A3: null
-    iiwa_A4: null
-    iiwa_A5: null
-    iiwa_A6: null
-    iiwa_A7: null
+    iiwa_A1: [-2.7, 2.7]
+    iiwa_A2: [-1.9, 1.9]
+    iiwa_A3: [-2.7, 2.7]
+    iiwa_A4: [-1.9, 1.9]
+    iiwa_A5: [-2.7, 2.7]
+    iiwa_A6: [-1.9, 1.9]
+    iiwa_A7: [-3.0, 3.0]
   velocity:
-    iiwa_A1: null
-    iiwa_A2: null
-    iiwa_A3: null
-    iiwa_A4: null
-    iiwa_A5: null
-    iiwa_A6: null
-    iiwa_A7: null
+    iiwa_A1: 0.6
+    iiwa_A2: 0.6
+    iiwa_A3: 0.6
+    iiwa_A4: 0.6
+    iiwa_A5: 0.8
+    iiwa_A6: 0.8
+    iiwa_A7: 0.8
   acceleration:
-    iiwa_A1: null
-    iiwa_A2: null
-    iiwa_A3: null
-    iiwa_A4: null
-    iiwa_A5: null
-    iiwa_A6: null
-    iiwa_A7: null
+    iiwa_A1: 1.5
+    iiwa_A2: 1.5
+    iiwa_A3: 1.5
+    iiwa_A4: 1.5
+    iiwa_A5: 2.0
+    iiwa_A6: 2.0
+    iiwa_A7: 2.0
   jerk:
-    iiwa_A1: null
-    iiwa_A2: null
-    iiwa_A3: null
-    iiwa_A4: null
-    iiwa_A5: null
-    iiwa_A6: null
-    iiwa_A7: null
+    iiwa_A1: 20.0
+    iiwa_A2: 20.0
+    iiwa_A3: 20.0
+    iiwa_A4: 20.0
+    iiwa_A5: 20.0
+    iiwa_A6: 20.0
+    iiwa_A7: 20.0
   effort:                               # N*m [S-13, verify against the pendant/Sunrise project before T2.0]
     iiwa_A1: 320
     iiwa_A2: 320
@@ -82,23 +90,28 @@ limits:                                 # real caps for excitation -- T2.0 measu
   approach: {velocity: 0.1, acceleration: 0.2}   # conservative; T2.1 (ladder step 3) tunes these
   abort: {tracking_rad: 0.03, torque_fraction: 0.6, stop_timeout_s: 3.0}   # conservative; RR_01 S9
 
-scene:                                  # ALL PLACEHOLDER until T2.0 measures the real cell
-  reviewed: false
+scene:                                  # owner's measurements, 2026-10-08: virtual floor + virtual wall (see header)
+  reviewed: false                       # OWNER: set true once you have checked the two objects below
   frame: iiwa_base
-  clearance: 0.05                       # wider than the mock/sim templates' 0.03 until the cell is measured
+  clearance: 0.03
   objects:
-    - {id: floor, type: floor, z: 0.0}                                                            # PLACEHOLDER
-    - {id: table, type: table, top_z: 0.0, centre_xy: [0.0, 0.0], size_xy: [1.0, 1.0], thickness: 0.05}  # PLACEHOLDER
-    - {id: wall_behind, type: wall, point: [-1.0, 0.0, 0.0], normal: "-x", size: [3.0, 3.0], thickness: 0.2}  # PLACEHOLDER
-    - {id: ceiling, type: ceiling, z: 3.0}                                                         # PLACEHOLDER
-  allowed_contacts: [[iiwa_link_0, table]]   # base on its mount
+    # Virtual floor: top face at z = 0.066 (box 6 x 6 x 0.2 m below it).
+    - {id: floor_66mm, type: box, size: [6.0, 6.0, 0.2], xyz: [0.0, 0.0, -0.034]}
+    # Virtual wall through P1/P2: yaw = atan2(P2 - P1) = 0.621356 rad; the box's
+    # local +y face lies on the P1-P2 line, facing the robot (local +y = safe
+    # side, (-0.5821, 0.8131)); 6 m long, 0.2 m thick, z -1 .. 3 m.
+    - {id: wall_p1_p2, type: box, size: [6.0, 0.2, 4.0], xyz: [0.156075, -0.217995, 1.0], rpy: [0.0, 0.0, 0.621356]}
+  allowed_contacts: [[iiwa_link_0, floor_66mm], [iiwa_link_0, wall_p1_p2]]   # the fixed base sits below 66 mm, 123 mm from the wall line
 
-poses:                                  # PLACEHOLDER (same shape as iiwa_mock.yaml) until T2.0 measures the cell
-  home: [0.0, 0.3, 0.0, -1.2, 0.0, 0.8, 0.0]
+poses:                                  # 2026-10-08
+  home: [0.0, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]   # the Sunrise app's INITIAL_POSITION (0, -45, 0, 80, 0, 35, 0 deg)
+  # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,
+  # 11.3 / +1.8 -> ranges 40.2 and 25.9 N*m for the sign check. A6 gets < 0.5 N*m
+  # in any pose with nothing on the flange: not testable, by design.
   standstill:
-    - [0.0, 0.3, 0.0, -1.2, 0.0, 0.8, 0.0]
-    - [0.5, 0.2, 0.3, -1.0, 0.2, 0.9, 0.3]
-    - [-0.5, 0.4, -0.3, -1.4, -0.2, 0.7, -0.3]
+    - [0.0, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]     # home
+    - [0.0, -0.7854, 0.0, -1.3963, 0.0, -1.5708, 0.0]   # (0, -45, 0, -80, 0, -90, 0 deg): forearm up
+    - [0.0, -0.2618, 0.0, -0.3491, 0.0, 0.5236, 0.0]    # (0, -15, 0, -20, 0, 30, 0 deg): nearly upright
 
 excitation:
   trajectories: 10
@@ -109,7 +122,14 @@ excitation:
   velocity_fraction: 0.6
   max_acceleration: 1.5
   centre_jitter: 1.0
-  position_window: {}
+  position_window:                      # keeps the excitation on the safe side of the wall
+    iiwa_A1: [-1.2, 0.4]                #   (98 % of random configurations in this box clear
+    iiwa_A2: [-1.1, -0.1]               #   both surfaces by 3 cm, vs 42 % for the full limits)
+    iiwa_A3: [-0.8, 0.8]
+    iiwa_A4: [0.3, 1.7]
+    iiwa_A5: [-1.2, 1.2]
+    iiwa_A6: [-1.2, 1.2]
+    iiwa_A7: [-2.5, 2.5]
   candidates: 48
   regime:
     enabled: true

@@ -4,6 +4,7 @@
 #include "erd_iiwa/erd_fri_client.hpp"
 
 #include <cstring>
+#include <limits>
 #include "friClientData.h"
 
 namespace erd_iiwa
@@ -31,8 +32,17 @@ void ErdFriClientImpl::capture_sample()
   std::memcpy(
     sample_.commanded_position.data(), state.getCommandedJointPosition(),
       kNumJoints * sizeof(double));
-  std::memcpy(sample_.ipo_position.data(), state.getIpoJointPosition(),
-      kNumJoints * sizeof(double));
+  // The real controller sends IPO positions only in the commanding states;
+  // in MONITORING_* LBRState::getIpoJointPosition() throws FRIException (not a
+  // std::exception), which controller_manager reports as "Unknown exception
+  // thrown during read" and deactivates the hardware. Our emulator always sent
+  // them, so L2 never hit this (found on the real iiwa, 2026-10-08).
+  if (sdk_data_->monitoringMsg.ipoData.has_jointPosition) {
+    std::memcpy(sample_.ipo_position.data(), state.getIpoJointPosition(),
+        kNumJoints * sizeof(double));
+  } else {
+    sample_.ipo_position.fill(std::numeric_limits<double>::quiet_NaN());
+  }
   std::memcpy(
     sample_.measured_torque.data(), state.getMeasuredTorque(), kNumJoints * sizeof(double));
   std::memcpy(

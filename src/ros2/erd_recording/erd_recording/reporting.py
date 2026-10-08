@@ -18,6 +18,39 @@ from .safety import EXCITATION_KINDS, FRI_COMMANDING_ACTIVE, SPEED_SCALING_FLOOR
 
 _TRACKING = re.compile(r"tracking error .*?> ([0-9.eE+-]+) rad")
 
+#: RR_12 section 4.6, rung 3: ``monitor.json`` sample-age p99 <= 10 ms, set
+#: from the iiwa's 1 kHz (RR_11: p99 1.28 ms).
+IIWA_MONITOR_P99_MS = 10.0
+#: RR_18 R-6 (F-19): at 125 Hz a UR10 sample is up to 8 ms old before any
+#: delay (URSim: p99 9.0-9.6 ms, max 14.6 ms), so its bound is two nominal
+#: periods, and the max must stay below the monitor's stale budget.
+UR_MONITOR_P99_PERIODS = 2
+
+
+def monitor_age_bound(robot: str, *, stale_budget_ms: float | None = None) -> dict[str, Any]:
+    """The rung-3 monitor sample-age bound for ``robot`` (RR_18 R-6)."""
+    from .profile import profile_for
+
+    if robot == "kuka_lbr_iiwa_14_r820":
+        return {"p99_ms": IIWA_MONITOR_P99_MS, "max_below_ms": None, "rule": "RR_12 4.6: p99 <= 10 ms"}
+    period_ms = 1e3 / profile_for(robot).rate_hz
+    budget = STALE_SAMPLE_BUDGET_S * 1e3 if stale_budget_ms is None else float(stale_budget_ms)
+    p99 = UR_MONITOR_P99_PERIODS * period_ms
+    return {"p99_ms": p99, "max_below_ms": budget,
+            "rule": f"RR_18 R-6: p99 <= {UR_MONITOR_P99_PERIODS} nominal periods ({p99:g} ms), "
+                    f"max < stale budget ({budget:g} ms)"}
+
+
+def judge_monitor_age(entry: dict[str, Any], robot: str) -> dict[str, Any]:
+    """One ``monitor.json`` stage entry against :func:`monitor_age_bound`.
+    No aged samples is a fail (nothing was measured)."""
+    bound = monitor_age_bound(robot, stale_budget_ms=entry.get("stale_budget_ms"))
+    age = entry.get("sample_age_ms") or {}
+    p99, peak = age.get("p99"), age.get("max")
+    ok = p99 is not None and p99 <= bound["p99_ms"] and (
+        bound["max_below_ms"] is None or (peak is not None and peak < bound["max_below_ms"]))
+    return {**bound, "p99": p99, "max": peak, "pass": bool(ok)}
+
 
 def classify_cancel(reason: str) -> str:
     """The monitor condition a cancel's reason string names."""

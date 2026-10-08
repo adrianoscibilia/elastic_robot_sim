@@ -7,7 +7,6 @@ is plain Python.
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import signal
 import subprocess
@@ -51,6 +50,13 @@ from .bagio import decode_dynamic_joint_state  # noqa: E402
 from .config import LabConfig, check_environment_domain, load_lab_config  # noqa: E402
 from .planning import PlanBundle, load_plan  # noqa: E402
 from .profile import RobotProfile, profile_for  # noqa: E402
+from .bag_record import (  # noqa: E402
+    PRODUCTION_LOG_LEVEL,
+    SIDECAR_STATUS_TOPIC,
+    SIDECAR_SUBSCRIBE_TIMEOUT_S,
+    SUBSCRIBE_TIMEOUT_S,
+    wait_for_bag_start,
+)
 from .safety import (  # noqa: E402
     EXCITATION_KINDS,
     FRI_COMMANDING_ACTIVE,
@@ -87,16 +93,11 @@ _STATUS_ORDER = ("planned", "recorded", "converted", "valid", "failed", "synthet
 _MONITOR_POLL_PERIOD_S = 0.01
 
 
-#: RR_13 B-2: segments start this long after rosbag2's "Recording..." line,
-#: past its start-up receive stall (seen at 1.10-1.44 s).
-RECORDER_STARTUP_S = 2.0
-_ROSBAG2_RECORDING = re.compile(r"\[(\d+\.\d+)\] \[rosbag2_recorder\]: Recording\.\.\.")
-
-
-def bag_topics_for(profile: RobotProfile) -> list[str]:
+def bag_topics_for(profile: RobotProfile, *, sidecar: bool = False) -> list[str]:
     """RR_04 A-11: the base topics plus the JTC ``controller_state``, the
     ``follow_joint_trajectory`` action's hidden topics, and -- UR10 only --
-    speed scaling / robot mode / safety mode / the sidecar status."""
+    speed scaling / robot mode / safety mode, and the sidecar status only
+    when the stage starts the sidecar (RR_18 R-5)."""
     topics = list(_BASE_BAG_TOPICS)
     topics.append(f"/{profile.controller_name}/controller_state")
     action = f"/{profile.controller_name}/{profile.controller_action}"
@@ -106,8 +107,9 @@ def bag_topics_for(profile: RobotProfile) -> list[str]:
             "/speed_scaling_state_broadcaster/speed_scaling",
             "/io_and_status_controller/robot_mode",
             "/io_and_status_controller/safety_mode",
-            "/erd/rtde_status",
         ]
+        if sidecar:
+            topics.append(SIDECAR_STATUS_TOPIC)
     return topics
 
 
@@ -455,6 +457,7 @@ class RecordingNode(Node):
         self._bag_process: subprocess.Popen | None = None
         self._bag_stdout_file = None
         self._bag_stderr_file = None
+        self._bag_stderr_path: Path | None = None
         self._sidecar_process: subprocess.Popen | None = None
 
     def destroy_node(self) -> None:
@@ -983,12 +986,27 @@ class RecordingNode(Node):
 
     # -- bag lifecycle (RR_04 A-11) ----------------------------------------
 
-    #: RR_13 B-2: `ros2 bag record --log-level`; `debug` adds rosbag2's
-    #: per-topic loss line at ~800 log lines/s, so it is a diagnostic setting.
-    recorder_log_level = "info"
+    #: RR_16 Q-1(a): ``None`` (production) records through
+    #: :mod:`erd_recording.bag_record` with only the ``rosbag2_recorder``
+    #: logger at DEBUG, so every bag's stderr log carries rosbag2's per-topic
+    #: "Messages lost on transport layer" events. A value is one *global*
+    #: level for every logger (``--recorder-log-level``, diagnostic only:
+    #: ``debug`` writes ~0.5 MB/s of rcl lines; no other level is accepted,
+    #: since below DEBUG the "Subscribed to topic" lines R-5 waits for vanish).
+    recorder_log_level: str | None = None
 
-    def start_bag(self, bag_dir: Path, *, extra_topics: list[str] | None = None) -> None:
-        topics = bag_topics_for(self.profile) + list(extra_topics or [])
+    def sidecar_expected(self) -> bool:
+        """Does a stage that records RTDE start the sidecar here? (Never on
+        mock: there is no RTDE server, RR_06 P3-1 item 2.)"""
+        return self.profile.has_ur_status_topics and self.config.hardware != "mock"
+
+    def start_bag(self, bag_dir: Path, *, sidecar: bool = False, extra_topics: list[str] | None = None) -> None:
+        """Start the recorder and block until it has subscribed to every
+        listed topic but the sidecar's and is >= 2 s past "Recording...".
+        A topic still missing after 15 s stops the bag and raises (RR_18 R-5).
+        ``sidecar``: the stage will start the RTDE sidecar, so the bag also
+        lists ``/erd/rtde_status`` (confirmed by :meth:`confirm_sidecar_topic`)."""
+        topics = bag_topics_for(self.profile, sidecar=sidecar) + list(extra_topics or [])
         bag_dir.parent.mkdir(parents=True, exist_ok=True)
         log_dir = bag_dir.parent / "raw"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -1000,10 +1018,12 @@ class RecordingNode(Node):
             "/dynamic_joint_states", "/joint_states", f"/{self.profile.controller_name}/controller_state"])
         self._bag_stdout_file = open(log_dir / f"{bag_dir.name}.rosbag2.stdout.log", "wb")
         self._bag_stderr_file = open(log_dir / f"{bag_dir.name}.rosbag2.stderr.log", "wb")
+        # RR_16 Q-1(a): ros2bag's own `record` verb (same parser, same
+        # StorageOptions/RecordOptions), with a per-logger level.
+        level = [] if self.recorder_log_level is None else ["--erd-global-log-level", self.recorder_log_level]
         self._bag_process = subprocess.Popen(
-            ["ros2", "bag", "record", "-s", "mcap", "-o", str(bag_dir), "--include-hidden-topics",
-            "--log-level", self.recorder_log_level,
-            "--qos-profile-overrides-path", str(qos_path), *topics],
+            [sys.executable, "-m", "erd_recording.bag_record", "-s", "mcap", "-o", str(bag_dir),
+             "--include-hidden-topics", *level, "--qos-profile-overrides-path", str(qos_path), "--topics", *topics],
             stdout=self._bag_stdout_file, stderr=self._bag_stderr_file,
         )
         # RR_01 S3.6 pre-roll. RR_13, two findings that a blind 1 s missed:
@@ -1015,18 +1035,28 @@ class RecordingNode(Node):
         #   controller_state) lose ~175 messages each. l2_iiwa_emustop's first
         #   goals fell inside that window.
         # So: wait for every topic subscribed and >= 2 s past "Recording...".
-        stderr_log = log_dir / f"{bag_dir.name}.rosbag2.stderr.log"
-        deadline = time.time() + 15.0
-        while time.time() < deadline and self._bag_process.poll() is None:
-            text = stderr_log.read_text(errors="replace")
-            started = _ROSBAG2_RECORDING.search(text)
-            if ("All requested topics are subscribed" in text and started
-                    and time.time() >= float(started.group(1)) + RECORDER_STARTUP_S):
-                break
-            time.sleep(0.05)
-        else:
-            self.get_logger().warning("rosbag2 did not report every topic subscribed within 15 s")
+        # RR_18 R-5: per topic, from rosbag2's own "Subscribed to topic"
+        # lines, without the sidecar's topic (it appears only once the
+        # sidecar runs: every UR bag used to wait the full 15 s, F-14); a
+        # topic still missing fails the stage instead of warning.
+        self._bag_stderr_path = log_dir / f"{bag_dir.name}.rosbag2.stderr.log"
+        state = wait_for_bag_start(lambda: self._bag_stderr_path.read_text(errors="replace"),
+                                   [topic for topic in topics if topic != SIDECAR_STATUS_TOPIC],
+                                   timeout_s=SUBSCRIBE_TIMEOUT_S, alive=lambda: self._bag_process.poll() is None)
+        if not state["ok"]:
+            self.stop_bag()
+            raise PipelineError(f"rosbag2 start failed ({state['reason']}): no \"Subscribed to topic\" line for "
+                                f"{state['missing']}; bag stopped, no goal sent")
 
+    def confirm_sidecar_topic(self) -> None:
+        """RR_18 R-5: after D-6's wait for RTDE rows, the bag must have
+        subscribed to ``/erd/rtde_status`` within 5 s, before the first goal."""
+        state = wait_for_bag_start(lambda: self._bag_stderr_path.read_text(errors="replace"), [SIDECAR_STATUS_TOPIC],
+                                   timeout_s=SIDECAR_SUBSCRIBE_TIMEOUT_S, startup_s=0.0,
+                                   alive=lambda: self._bag_process is not None and self._bag_process.poll() is None)
+        if not state["ok"]:
+            raise PipelineError(f"rosbag2 did not subscribe to {SIDECAR_STATUS_TOPIC} ({state['reason']}); "
+                                "no goal sent")
     def bag_alive(self) -> bool:
         return self._bag_process is None or self._bag_process.poll() is None
 
@@ -1106,6 +1136,15 @@ class RecordingNode(Node):
     # the launch file) --------------------------------------------------
 
     def start_sidecar(self, output_path: Path, *, robot_ip: str) -> None:
+        """Launch the RTDE sidecar and block until it reports rows (D-6)."""
+        if self.launch_sidecar(output_path, robot_ip=robot_ip):
+            self._wait_for_sidecar_rows()
+
+    def launch_sidecar(self, output_path: Path, *, robot_ip: str) -> bool:
+        """Start the sidecar process without waiting for rows (RR_19: a stage
+        launches it just before the recorder, so its RTDE connect overlaps the
+        bag's 2 s start wait; the rows are awaited after ``start_bag``, by
+        :meth:`wait_for_sidecar_rows`). False when this stack has no sidecar."""
         # RR_06 P3-1 item 2, live finding: there is no real RTDE server to
         # connect to at hardware=mock (confirmed live: the sidecar process
         # starts, fails to connect, and exits almost immediately, which the
@@ -1115,8 +1154,8 @@ class RecordingNode(Node):
         # `sidecar_alive()` already treats "never started" (`None`) as
         # alive, so skipping the start here is enough -- no change needed
         # at the monitor end.
-        if not self.profile.has_ur_status_topics or self.config.hardware == "mock":
-            return
+        if not self.sidecar_expected():
+            return False
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # RR_06 P3-1 item 11, live findings, two of them:
         # 1. `ros2 run <pkg> <exe>` launches the real executable as a
@@ -1150,14 +1189,20 @@ class RecordingNode(Node):
             "-p", f"output_path:={output_path}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        return True
+
+    def wait_for_sidecar_rows(self) -> None:
+        """D-6, then RR_18 R-5: the sidecar reports RTDE rows, and the bag has
+        subscribed to its status topic, before the first goal."""
         self._wait_for_sidecar_rows()
+        self.confirm_sidecar_topic()
 
     def _wait_for_sidecar_rows(self, *, timeout_s: float = SIDECAR_STARTUP_TIMEOUT_S) -> None:
         """RR_15: the sidecar connects to RTDE ~0.5 s after it starts; a first
         segment that begins sooner (an identify hold at the home pose has a
         ~50 ms approach) loses its first rows (rr15_ur10_sim: hold_0 began
         0.24 s before the first RTDE row, 565 of 588 samples). Block until
-        its `/erd/rtde_status` (1 Hz) reports rows."""
+        its `/erd/rtde_status` (10 Hz since RR_19) reports rows."""
         from std_msgs.msg import String
 
         state = {"rows": 0}
@@ -1475,11 +1520,15 @@ def stage_run(node: RecordingNode, config: LabConfig, paths: RunPaths, bundle: P
         effort_limit = {sim_to_driver[sim]: float(arrays["effort"][i])
                         for i, sim in enumerate(config.joint_order) if sim in sim_to_driver}
 
-    node.start_bag(paths.bag_dir)
     completed_segments: list[str] = []
     try:
-        if node.profile.has_ur_status_topics:
-            node.start_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
+        # RR_18 R-5: the sidecar's RTDE connect (~0.5 s) and first 1 Hz status
+        # overlap the bag's >= 2 s start wait; its rows (D-6) and the bag's
+        # /erd/rtde_status subscription are confirmed after it, before any goal.
+        sidecar = node.launch_sidecar(paths.rtde_parquet, robot_ip=config.connection.robot_ip)
+        node.start_bag(paths.bag_dir, sidecar=sidecar)
+        if sidecar:
+            node.wait_for_sidecar_rows()
         if not node.wait_for_stationary(duration_s=0.5, velocity_tolerance=0.01, timeout_s=5.0):
             raise PipelineError("run refused: fresh stationary joint states unavailable")
         for segment in segments_to_run:
@@ -1603,13 +1652,13 @@ def stage_validate(paths: RunPaths) -> dict[str, Any]:
 
 
 def stage_report(paths: RunPaths, bundle: PlanBundle | None, run_result: dict[str, Any] | None,
-                 validation: dict[str, Any] | None, *, controller_name: str,
+                 validation: dict[str, Any] | None, *, controller_name: str, robot: str,
                  position_count_rad: float = 0.0) -> dict[str, Any]:
     """``report.md``, plus RR_12 A-2b: the monitor's sample-age statistics per
     stage and the cancel latency (first over-threshold sample -> ``cancel``
     event) of every abort in the run's bags, also merged into
     ``monitor.json`` under ``cancel_latency``."""
-    from .reporting import cancel_latencies, latency_summary, tracking_suggestion
+    from .reporting import cancel_latencies, judge_monitor_age, latency_summary, tracking_suggestion
 
     if bundle is None and paths.plan_dir.is_dir():
         bundle = load_plan(paths.plan_dir)
@@ -1636,16 +1685,23 @@ def stage_report(paths: RunPaths, bundle: PlanBundle | None, run_result: dict[st
     for path in (paths.root / "monitor.json", paths.root / "identification" / "monitor.json"):
         if path.is_file():
             monitor.update(json.loads(path.read_text(encoding="utf-8")))
+    monitor_bounds: dict[str, Any] = {}
     if monitor or latencies:
-        lines += ["## Monitor (RR_12 A-2b)", "", "| stage | evaluations | age p50 (ms) | age p99 (ms) | age max (ms) | cancels |",
-                  "|---|---|---|---|---|---|"]
+        lines += ["## Monitor (RR_12 A-2b; rung-3 bound RR_18 R-6)", "",
+                  "| stage | evaluations | age p50 (ms) | age p99 (ms) | age max (ms) | cancels | rung-3 bound | pass |",
+                  "|---|---|---|---|---|---|---|---|"]
         for stage, entry in monitor.items():
             if not isinstance(entry, dict) or "evaluations" not in entry:
                 continue
             age = entry.get("sample_age_ms", {})
+            verdict = monitor_bounds[stage] = judge_monitor_age(entry, robot)
+            bound = f"p99 <= {verdict['p99_ms']:g} ms" + (
+                f", max < {verdict['max_below_ms']:g} ms" if verdict["max_below_ms"] is not None else "")
             lines.append(f"| {stage} | {entry['evaluations']} | {age.get('p50', float('nan')):.3f} | "
                          f"{age.get('p99', float('nan')):.3f} | {age.get('max', float('nan')):.3f} | "
-                         f"{len(entry.get('cancels', []))} |")
+                         f"{len(entry.get('cancels', []))} | {bound} | {'pass' if verdict['pass'] else 'FAIL'} |")
+            print(f"report: monitor {stage}: age p99 {age.get('p99', float('nan')):.2f} ms, max "
+                  f"{age.get('max', float('nan')):.2f} ms against {bound}: {'pass' if verdict['pass'] else 'FAIL'}")
         lines.append("")
         for stage, entry in latencies.items():
             lines += [f"Cancel latency, {stage}:", "", "| segment | condition | latency (ms) | reason |", "|---|---|---|---|"]
@@ -1684,7 +1740,8 @@ def stage_report(paths: RunPaths, bundle: PlanBundle | None, run_result: dict[st
     if evaluation.is_file():
         lines += ["## Evaluation", "", evaluation.read_text(encoding="utf-8")]
     paths.report.write_text("\n".join(lines), encoding="utf-8")
-    return {"cancel_latency": latencies, "monitor": monitor, "tracking_suggestion": suggestion}
+    return {"cancel_latency": latencies, "monitor": monitor, "monitor_bounds": monitor_bounds,
+            "tracking_suggestion": suggestion}
 
 
 def stage_evaluate(config: LabConfig, paths: RunPaths, *, checkpoints: str | None) -> dict[str, Any]:
@@ -1732,9 +1789,11 @@ def _parse_args(argv: list[str]) -> Any:
     parser.add_argument("--run-dir", default=None,
                         help="offline stages only: an existing run folder, e.g. one copied from another machine")
     parser.add_argument("--abort-tracking-rad", type=float, default=None,
-                        help="rung 4a only: lower the monitor's tracking threshold; needs --ladder <= 0.1")
-    parser.add_argument("--recorder-log-level", default="info", choices=["debug", "info", "warn", "error"],
-                        help="ros2 bag record --log-level (debug: per-topic loss lines, very verbose)")
+                        help="rung 4a only: lower the monitor's tracking threshold; stage `run`, --ladder <= 0.1, below the lab file's tracking_rad")
+    parser.add_argument("--recorder-log-level", default=None, choices=["debug"],
+                        help="DIAGNOSTIC ONLY: global rosbag2 log level debug instead of the production "
+                             "rosbag2_recorder:=debug (~0.5 MB/s of rcl lines). Other levels are refused: they drop "
+                             "the \"Subscribed to topic\" lines the start wait needs (RR_18 R-5)")
     parser.add_argument("--checkpoints", default=None, help="evaluate: chain summary CSV (default consumer.checkpoints)")
     return parser.parse_args(argv)
 
@@ -1756,8 +1815,17 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
     # before the run directory exists, so a refusal leaves nothing behind.
     if any(stage in _ROS_STAGES for stage in stages):
         check_environment_domain(config)
+    # RR_16 Q-4(i), RR_18 R-4: the digest is only meaningful if the
+    # installed workspace was built from it; a missing or stale build stamp,
+    # or an installed module that differs from src/ros2, refuses.
+    from .code_digest import code_digest, refusal
+
+    digest = code_digest()
+    if any(stage in _ROS_STAGES for stage in stages) and refusal(digest):
+        raise PipelineError(refusal(digest))
     try:
-        check_abort_override(args.abort_tracking_rad, args.ladder)
+        check_abort_override(args.abort_tracking_rad, args.ladder, file_rad=config.limits.abort.tracking_rad,
+                             stage=args.stage)
     except ValueError as exc:
         raise PipelineError(str(exc)) from None
     profile = profile_for(config.robot)
@@ -1773,6 +1841,8 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
     if not args.run_dir:
         # RR_12 A-3c/A-4: what was live for this session, in the manifest.
         _write_manifest_fields(paths, hardware=config.hardware, safety_vendor_checksum=config.safety.vendor_checksum,
+                               code_digest=digest,
+                               recorder_log_level=args.recorder_log_level or PRODUCTION_LOG_LEVEL,
                                **({"abort_tracking_rad_override": args.abort_tracking_rad, "ladder": args.ladder}
                                   if args.abort_tracking_rad is not None else {}))
 
@@ -1782,7 +1852,13 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
     run_result = None
     validation = None
 
+    # RR_19: a signal before the node exists (during `plan`) was dropped, and
+    # `all` went on into preflight and motion; it is now remembered and stops
+    # the run before the next stage.
+    signalled = {"abort": False}
+
     def _handle_signal(signum, frame) -> None:  # noqa: ANN001
+        signalled["abort"] = True
         if node is not None:
             node.abort_requested = True
 
@@ -1816,8 +1892,11 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 node.recorder_log_level = args.recorder_log_level
                 if args.abort_tracking_rad is not None:
                     node.excitation_tracking_rad = args.abort_tracking_rad
-            if node is not None and node.abort_requested:
+            if node is not None and (node.abort_requested or signalled["abort"]):
                 cancel_and_stop(node, paths, reason="SIGINT/SIGTERM received")
+                return 130
+            if signalled["abort"]:
+                _write_manifest_status(paths, "failed", reason=f"SIGINT/SIGTERM received before {stage}")
                 return 130
             if stage == "preflight":
                 report = stage_preflight(node, config, paths)
@@ -1855,7 +1934,7 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                 validation = stage_validate(paths)
             elif stage == "report":
                 stage_report(paths, bundle, run_result, validation, controller_name=profile.controller_name,
-                             position_count_rad=profile.position_count_rad)
+                             robot=config.robot, position_count_rad=profile.position_count_rad)
             elif stage == "evaluate":
                 print(json.dumps(stage_evaluate(config, paths, checkpoints=args.checkpoints)))
     except Exception as exc:

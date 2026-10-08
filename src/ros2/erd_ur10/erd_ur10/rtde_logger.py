@@ -186,7 +186,9 @@ class RtdeLoggerNode(Node):
         # polled a blocking receive() and fell behind under jitter.
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
-        self.create_timer(1.0, self._publish_status)
+        # RR_19: 10 Hz, so `record_ur10`'s wait for the first rows (D-6) ends
+        # within 0.1 s of them, not up to 1 s later (RR_18 R-5's <= 3 s start).
+        self.create_timer(0.1, self._publish_status)
         self.create_timer(1.0, self._recorder.flush)
 
     def _reader_loop(self) -> None:

@@ -42,7 +42,7 @@ def test_a_shortened_hold_makes_the_segment_invalid():
     events = (_events("identify_hold_0", "identify_hold", 0, 5_070_000_000)
               + _events("identify_hold_1", "identify_hold", 10_000_000_000, 12_551_000_000))
     frames, bounds = windows(raw, events, [complete, short])
-    health = segment_health([complete, short], frames, bounds, losses=None)
+    health = segment_health([complete, short], frames, bounds, losses=None, hardware="emulator")
     assert health["identify_hold_0"]["ok"]
     assert not health["identify_hold_1"]["ok"]
     assert health["identify_hold_1"]["robot_clock_samples"] == 2551
@@ -139,9 +139,10 @@ def test_ursim_completeness_uses_the_window_clock_rate():
     frame = pd.DataFrame({"timestamp": np.arange(n) * 0.008,
                           "stamp_ns": np.rint(np.arange(n) * 0.008 / local * 1e9).astype(np.int64)})
     assert not segment_completeness(n, 626, clock_ratio=0.939)["ok"]
-    ratio = window_clock_ratio(frame, 0.939)
+    ratio = window_clock_ratio(frame, 0.939, hardware="ursim")
     assert abs(ratio - local) < 1e-9
     assert segment_completeness(n, 626, clock_ratio=ratio)["ok"]
     short = frame.iloc[: n // 2]  # a hold cut to half: still incomplete at its own rate
-    assert not segment_completeness(len(short), 626, clock_ratio=window_clock_ratio(short, 0.939))["ok"]
-    assert window_clock_ratio(frame, 1.0) == 1.0  # real/emulator/mock: never consulted
+    assert not segment_completeness(len(short), 626, clock_ratio=window_clock_ratio(short, 0.939, hardware="ursim"))["ok"]
+    for hardware in ("real", "emulator", "mock"):  # RR_16 Q-3: gated on hardware, not on the ratio
+        assert window_clock_ratio(frame, 0.939, hardware=hardware) == 1.0
