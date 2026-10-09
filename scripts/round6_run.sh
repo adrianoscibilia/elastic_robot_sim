@@ -31,16 +31,10 @@ SIM_DIR="${SIM_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 NN_DIR="${NN_DIR:-$(cd "$SIM_DIR/../dynamic_model_nn" && pwd)}"
 CMD="${1:-doctor}"
 
-pick_py() {
-  local d="$1"
-  [ -x "$d/.venv/bin/python" ] && { echo "$d/.venv/bin/python"; return; }
-  if command -v uv >/dev/null 2>&1 && [ -f "$d/pyproject.toml" ]; then echo "uv run --project $d python"; return; fi
-  command -v python3 >/dev/null 2>&1 && { echo python3; return; }
-  echo python
-}
-read -r -a SIM_PY <<< "${SIM_PY_CMD:-$(pick_py "$SIM_DIR")}"
-read -r -a NN_PY  <<< "${NN_PY_CMD:-$(pick_py "$NN_DIR")}"
-HELP=("${SIM_PY[@]}" "$SIM_DIR/scripts/launch_helpers.py")
+# pick_py, SIM_PY/NN_PY/HELP, tree_digest, git_heads, stage, doctor_machine,
+# the ticket, supervise and launch_detached (shared with round6_retrain.sh).
+LOCK="$SIM_DIR/runs/.launch.lock"
+source "$SIM_DIR/scripts/launch_lib.sh"
 
 declare -A CONFIG=(
   [iiwa_drive]="config/identification/kuka_lbr_iiwa_14_r820_table_round6_drive.yaml"
@@ -58,18 +52,7 @@ MIN_FREE_GB="${MIN_FREE_GB:-60}"
 JOBS="${JOBS:-$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))}"
 SCREEN_ROWS="${SCREEN_ROWS:-100000}"
 PRE_EPOCHS=(1 3)                      # the preflight's two epoch counts (fixed cost vs per-epoch rate)
-LOCK="$SIM_DIR/runs/.launch.lock"
 
-tree_digest() {
-  local d
-  for d in "$SIM_DIR" "$NN_DIR"; do
-    git -C "$d" rev-parse HEAD
-    git -C "$d" diff HEAD --binary
-    git -C "$d" ls-files -o --exclude-standard -z -- '*.py' '*.sh' '*.yaml' '*.yml' '*.toml' \
-      | (cd "$d" && xargs -0 -r sha256sum)
-  done 2>/dev/null | sha256sum | cut -c1-16
-}
-git_heads() { echo "sim=$(git -C "$SIM_DIR" rev-parse --short HEAD) nn=$(git -C "$NN_DIR" rev-parse --short HEAD)"; }
 stem_of() { ( cd "$SIM_DIR" && "${HELP[@]}" stem "${CONFIG[$1]}" 2>/dev/null ); }
 
 # ---------------------------------------------------------------- doctor ----
@@ -138,25 +121,7 @@ print(f'  info  {len(d)} rows, dof {d.dof}, sg_window {d.sg_window}')" "$ds" 2>"
   rm -rf "$tmp"
 
   echo "== machine"
-  local free; free=$(df -BG --output=avail "$SIM_DIR" | tail -1 | tr -dc '0-9')
-  [ "${free:-0}" -ge "$MIN_FREE_GB" ] && ok "${free}G free (need ${MIN_FREE_GB})" || bad "only ${free}G free, need ${MIN_FREE_GB}"
-  local masked=1 t
-  for t in sleep.target suspend.target hibernate.target hybrid-sleep.target; do
-    [ "$(systemctl is-enabled "$t" 2>/dev/null)" = masked ] || masked=0
-  done
-  if command -v systemd-inhibit >/dev/null && systemd-inhibit --what=sleep:idle --who=doctor --why=check true 2>/dev/null; then
-    ok "systemd-inhibit can block sleep"
-  elif [ $masked -eq 1 ]; then
-    ok "sleep/suspend/hibernate targets are masked"
-  elif [ "$context" = launch ]; then
-    bad "cannot inhibit sleep (systemd-inhibit refused, sleep targets not masked): the machine may suspend mid-run"
-  else
-    warn "cannot inhibit sleep from this session (launch will FAIL on this unless run where polkit allows it, or the sleep targets are masked)"
-  fi
-  command -v gsettings >/dev/null && echo "  info  GNOME idle sleep on AC: $(gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 2>/dev/null)"
-  command -v setsid >/dev/null && ok "setsid available (survives logout)" || bad "setsid missing"
-  command -v flock >/dev/null && ok "flock available (one run at a time)" || bad "flock missing"
-  if [ -z "${HOLDING_LOCK:-}" ] && [ -e "$LOCK" ] && ! flock -n "$LOCK" true; then bad "another run holds $LOCK"; fi
+  doctor_machine "$context" "$MIN_FREE_GB"
   echo "  info  $(git_heads), tree digest $(tree_digest), jobs $JOBS"
 
   echo
@@ -185,30 +150,6 @@ work() {
   fi
   STARTED=$(date +%s)
 
-  say() { printf '%s | %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" | tee -a "$STATUS"; }
-  stage_timeout() {
-    local t="" base="${1%-e[0-9]*}"
-    [ -f "$TIMEOUTS" ] && t=$(awk -F'\t' -v s="$1" -v b="$base" '$1==s||$1==b{print $2; exit}' "$TIMEOUTS")
-    if [ -n "$t" ]; then echo "${t}s"; elif [ "$MODE" = preflight ]; then echo "${PREFLIGHT_STAGE_TIMEOUT:-60m}"; else echo "${DEFAULT_STAGE_TIMEOUT:-4h}"; fi
-  }
-  stage() {
-    local name="$1" log="$2"; shift 2
-    [ -f "$RUN/$name.done" ] && { say "skip  $name"; return 0; }
-    local used=$(( ($(date +%s) - STARTED) / 3600 ))
-    if [ "$used" -ge "$DEADLINE_HOURS" ]; then say "SKIP  $name (past ${DEADLINE_HOURS}h)"; touch "$RUN/$name.failed"; return 1; fi
-    local free; free=$(df -BG --output=avail "$SIM_DIR" | tail -1 | tr -dc '0-9')
-    if [ "${free:-0}" -lt 10 ]; then say "HARD STOP before $name -- only ${free}G free (< 10 GB)"; HARD_STOP=1; return 1; fi
-    local limit; limit=$(stage_timeout "$name")
-    say "START $name (timeout $limit)"
-    local t0; t0=$(date +%s)
-    rm -f "$RUN/$name.failed"
-    if timeout --signal=INT --kill-after=180 "$limit" "$@" >>"$LOGS/$log" 2>&1; then
-      printf '%s\t%s\n' "$name" "$(( $(date +%s) - t0 ))" >> "$RUN/timing.tsv"
-      touch "$RUN/$name.done"; say "OK    $name ($(( $(date +%s) - t0 ))s)"; return 0
-    fi
-    local code=$?
-    say "FAIL  $name (exit $code) -- logs/$log"; touch "$RUN/$name.failed"; return 1
-  }
 
   cd "$SIM_DIR"
   say "=== $RUN_ID  variants=${VARIANT_LIST[*]} mode=$MODE trials=$TRIALS jobs=$JOBS pid=$$"
@@ -294,12 +235,7 @@ work() {
   local failed; failed=$(ls "$RUN" | grep -c '\.failed$')
   if [ "$MODE" = preflight ]; then
     if [ "$failed" -eq 0 ] && [ "$HARD_STOP" -eq 0 ]; then
-      {
-        echo "heads=$(git_heads | tr ' ' ',')"
-        echo "digest=$(tree_digest)"
-        echo "variants=${VARIANT_LIST[*]}"
-        echo "finished=$(date -Is)"
-      } > "$RUN/PREFLIGHT_OK"
+      write_ticket "$RUN/PREFLIGHT_OK" "variants=${VARIANT_LIST[*]}"
       say "PREFLIGHT GREEN -- ticket $RUN/PREFLIGHT_OK"
     else
       say "PREFLIGHT RED -- $failed stage(s) failed, hard stop $HARD_STOP; no launch ticket"
@@ -311,15 +247,6 @@ work() {
 }
 
 # ----------------------------------------------------------- launch ticket ---
-find_ticket() {
-  local heads digest t
-  heads="heads=$(git_heads | tr ' ' ',')"; digest="digest=$(tree_digest)"
-  for t in $(ls -1t "$SIM_DIR"/runs/*/PREFLIGHT_OK 2>/dev/null); do
-    grep -qx "$heads" "$t" && grep -qx "$digest" "$t" && grep -qx "variants=${VARIANT_LIST[*]}" "$t" \
-      && { dirname "$t"; return 0; }
-  done
-  return 1
-}
 
 write_timeouts() {
   local pre="$1" out="$2" tag plan pre_id stem first=1
@@ -344,18 +271,6 @@ write_timeouts() {
   rm -f "$plan"; return $rc
 }
 
-# ------------------------------------------------------------- supervisor ---
-supervise() {
-  local mode="$1" n=0 rc
-  while [ $n -lt 6 ]; do
-    n=$((n+1))
-    echo "--- supervisor attempt $n $(date)"
-    work "$mode"; rc=$?
-    [ $rc -eq 0 ] && break
-    [ $rc -eq 2 ] && { echo "hard stop, not retrying"; break; }
-    sleep 60
-  done
-}
 
 mkdir -p "$SIM_DIR/runs"
 case "$CMD" in
@@ -372,7 +287,7 @@ case "$CMD" in
   launch)
     if ! flock -n "$LOCK" true; then echo "refusing to launch: another preflight/run holds $LOCK"; exit 1; fi
     if ! doctor launch; then echo "refusing to launch: doctor says NO-GO"; exit 1; fi
-    ticket=$(find_ticket) || {
+    ticket=$(find_ticket "variants=${VARIANT_LIST[*]}") || {
       echo "refusing to launch: no green preflight for $(git_heads), digest $(tree_digest),"
       echo "variants '${VARIANT_LIST[*]}'. Run: bash scripts/round6_run.sh preflight"
       exit 1; }
@@ -381,18 +296,8 @@ case "$CMD" in
     write_timeouts "$ticket" "$SIM_DIR/runs/$RUN_ID/timeouts.tsv" \
       || { echo "refusing to launch: could not size stage timeouts from $ticket"; exit 1; }
     echo "ticket $ticket; stage timeouts:"; sed 's/^/  /' "$SIM_DIR/runs/$RUN_ID/timeouts.tsv"
-    boot="$SIM_DIR/runs/$RUN_ID.boot.log"
-    inhibit=(systemd-inhibit --what=sleep:idle:shutdown:handle-lid-switch
-             --who=round6 --why="round-6 unattended run" --mode=block)
     export VARIANTS="${VARIANT_LIST[*]}"
-    setsid nohup ionice -c2 -n0 "${inhibit[@]}" bash -c \
-      'echo -500 > /proc/self/oom_score_adj 2>/dev/null; exec bash "$0" run' \
-      "$SIM_DIR/scripts/round6_run.sh" \
-      </dev/null >>"$boot" 2>&1 &
-    disown
-    echo "launched RUN_ID=$RUN_ID"
-    echo "watch:  tail -f $SIM_DIR/runs/$RUN_ID/STATUS.md"
-    echo "boot :  $boot"
+    launch_detached "$SIM_DIR/scripts/round6_run.sh" round6 "round-6 unattended run"
     ;;
   *) echo "usage: $0 {doctor|preflight|launch}"; exit 2 ;;
 esac
