@@ -360,6 +360,10 @@ class ProbeDesign:
         return {"source": self.source, "lowest_hz": self.lowest_hz, "lines": self.lines, "span": list(self.span)}
 
 
+#: ``payload.mode`` values (FR_04 S-1); ``random`` is rounds 3-6.
+PAYLOAD_MODES = ("random", "fixed", "none")
+
+
 @dataclass(frozen=True)
 class PayloadSampling:
     """Randomized tool/payload rigidly attached to the flange.
@@ -386,10 +390,25 @@ class PayloadSampling:
     #: a 0.25 m box centred 0.02 m out intersects the last link, and every
     #: candidate trajectory self-collides (`R6_07`).  Same draws either way.
     offset_z_reference: str = "centre"
+    #: What is welded to the flange (FR_04 S-1).  ``random`` (rounds 3-6): the
+    #: draw itself.  ``fixed``: one declared body (``fixed_*``) on every
+    #: elastic robot.  ``none``: no body.  The draw is made in every mode and
+    #: keeps sizing what it sized in round 6 -- each robot's link-inertia
+    #: envelope (so its damping and time step) and its trajectories' collision
+    #: geometry -- so a ``fixed``/``none`` build has the same robots and
+    #: trajectories as the ``random`` one; only the attached body changes.
+    mode: str = "random"
+    fixed_mass: float = 0.0
+    fixed_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    fixed_size: float = 0.1
 
     def __post_init__(self) -> None:
         if self.per not in ("robot", "trajectory"):
             raise ValueError("payload.per must be 'robot' or 'trajectory'")
+        if self.mode not in PAYLOAD_MODES:
+            raise ValueError(f"payload.mode must be one of {PAYLOAD_MODES}, got {self.mode!r}")
+        if self.mode == "fixed" and (self.fixed_mass <= 0.0 or self.fixed_size <= 0.0):
+            raise ValueError("payload.mode: fixed needs payload.fixed with a positive mass and size")
         if self.offset_z_reference not in ("centre", "near_face"):
             raise ValueError("payload.offset_z_reference must be 'centre' or 'near_face'")
         for name in ("mass", "size"):
@@ -974,7 +993,9 @@ _EXCITATION_KEYS = {
 _REGIME_KEYS = {"enabled", "max_acceleration", "velocity_fraction"}
 
 
-_PAYLOAD_KEYS = {"enabled", "mass", "offset_x", "offset_y", "offset_z", "offset_z_reference", "size", "per"}
+_PAYLOAD_KEYS = {"enabled", "mass", "offset_x", "offset_y", "offset_z", "offset_z_reference", "size", "per", "mode",
+                 "fixed"}
+_PAYLOAD_FIXED_KEYS = {"mass", "offset", "size"}
 
 
 _DATASET_KEYS = {
@@ -1051,6 +1072,20 @@ _CONTROL_SEPARATION_KEYS = {"min_ratio", "action"}
 
 
 _VISUALIZATION_KEYS = {"enabled", "realtime_scale"}
+
+
+def _fixed_payload(raw: Any, source: str) -> dict[str, Any]:
+    """``payload.fixed`` (FR_04 S-1): the one body ``mode: fixed`` attaches."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{source}: payload.fixed must be a mapping {{mass, offset: [x, y, z], size}}")
+    _check_keys(raw, _PAYLOAD_FIXED_KEYS, "payload.fixed", source)
+    offset = [float(v) for v in raw.get("offset", [0.0, 0.0, 0.0])]
+    if len(offset) != 3:
+        raise ValueError(f"{source}: payload.fixed.offset must be [x, y, z]")
+    return {"fixed_mass": float(raw.get("mass", 0.0)), "fixed_offset": tuple(offset),
+            "fixed_size": float(raw.get("size", 0.1))}
 
 
 def _check_keys(mapping: Mapping[str, Any], allowed: set[str], block: str, source: Path) -> None:
@@ -1328,6 +1363,8 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
         size=(float(payload_size[0]), float(payload_size[1])),
         per=str(payload_cfg.get("per", "robot")),
         offset_z_reference=str(payload_cfg.get("offset_z_reference", "centre")),
+        mode=str(payload_cfg.get("mode", "random")),
+        **_fixed_payload(payload_cfg.get("fixed"), source),
     )
     try:
         tiers = build_tiers(rigid_reference, sampling, seed)

@@ -17,6 +17,13 @@ FR_03 retrain (``scripts/round6_retrain.sh``):
     launch_helpers.py retrain_plan PREFLIGHT_RUN PLAN_JSON [PARALLEL] > timeouts.tsv  # + projection.json
     launch_helpers.py gpu_fit PREFLIGHT_RUN PARALLEL         # PASS/FAIL line; exit 1 on FAIL
 
+FR_04 torque-free comparison (``scripts/round7_taufree.sh``):
+
+    launch_helpers.py taufree_spec SOURCE [BATCH]   # n:h:burn_in:windows of a variant, from an r7 contract or r6 manifest
+    launch_helpers.py taufree_chain R6_CHAIN OUT_YAML DATASET CONTRACT EPOCHS PATIENCE COUPLING CLASSES SEED...
+    launch_helpers.py taufree_classes PREFLIGHT_RUN PLAN_JSON   # the class list after the 72 h rule (Sec 3.5)
+    launch_helpers.py retrain_plan PREFLIGHT_RUN PLAN_JSON [PARALLEL]   # with "summary_stem": "taufree"
+
 Timeouts come from the preflight's measured rates, times three (never a flat
 18 h, `R5_09` F-1): a data stage is budgeted per bag, an NN stage per
 epoch-row (one training epoch over one row), each with a floor.
@@ -354,17 +361,22 @@ def retrain_plan(preflight_run: str, plan_path: str, parallel: str = "1") -> int
     epochs, seeds = int(plan["epochs"]), list(plan["seeds"])
     cap = int(plan.get("cap_s", 10**9))
     measured = _stage_seconds(run)
+    # FR_04: the same sizing for scripts/round7_taufree.sh (chain-<v>-taufree*.summary.csv), on a class subset.
+    stem = str(plan.get("summary_stem", "retrain"))
+    keep = set(plan["classes"]) if plan.get("classes") else None
 
     def clamp(seconds: float) -> int:
         return min(cap, max(FLOOR_S, int(math.ceil(SAFETY * seconds))))
 
     rates: dict[str, dict] = {}
     for tag in plan["preflight_variants"]:
-        seq = _summary_rates(run / f"chain-{tag}-retrain-s0.summary.csv")
+        seq = _summary_rates(run / f"chain-{tag}-{stem}-s0.summary.csv")
         par = {}
         for k in range(3):
-            for name, value in _summary_rates(run / f"chain-{tag}-retrain-p3-s{k}.summary.csv").items():
+            for name, value in _summary_rates(run / f"chain-{tag}-{stem}-p3-s{k}.summary.csv").items():
                 par.setdefault(name, []).append(value)
+        if keep is not None:
+            seq = {name: value for name, value in seq.items() if name in keep}
         rates[tag] = {name: {"s_epoch_p1": v["s_epoch"], "fixed_s": v["fixed"], "cuda_peak_mb": v["cuda_peak_mb"],
                              "s_epoch_p3": max((p["s_epoch"] for p in par.get(name, [])), default=None),
                              "source": "preflight"}
@@ -407,6 +419,16 @@ def retrain_plan(preflight_run: str, plan_path: str, parallel: str = "1") -> int
                 if key.startswith(f"{stage}-{ref}"):
                     out.append((f"{stage}-{tag}{key[len(stage) + 1 + len(ref):]}",
                                 clamp(seconds * scale * (len(seeds) if stage == "50-eval" else 1))))
+        # FR_04: the data stage builds the files; an unmeasured variant takes round 6's own data-stage ratio.
+        data = measured.get(f"10-data-{ref}")
+        if data is not None:
+            factor = 1.0
+            if ref != tag:
+                r6 = _stage_seconds(Path((plan.get("reference") or {}).get(tag, {}).get("round6_run", "")))
+                r6_ref = _stage_seconds(Path((plan.get("reference") or {}).get(tag, {}).get("round6_from_run", "")))
+                a, b = r6.get(f"10-data-{tag}"), r6_ref.get(f"10-data-{ref}")
+                factor = (a / b) if a and b else 3.0
+            out.append((f"10-data-{tag}", clamp(data * factor)))
     if "60-report" in measured:
         out.append(("60-report", clamp(measured["60-report"] * 4)))
     projection["wall_s"]["other_stages_upper"] = sum(s for n, s in out if not n.startswith("40-train")) / SAFETY
@@ -426,7 +448,7 @@ def gpu_fit(preflight_run: str, parallel: str) -> int:
 
     p = int(parallel)
     peaks = []
-    for path in Path(preflight_run).glob("chain-*-retrain*.summary.csv"):
+    for path in Path(preflight_run).glob("chain-*.summary.csv"):
         peaks += [v["cuda_peak_mb"] for v in _summary_rates(path).values() if v["cuda_peak_mb"]]
     if not peaks:
         print(f"FAIL no measured CUDA peak in {preflight_run}: run the preflight first")
@@ -442,6 +464,136 @@ def gpu_fit(preflight_run: str, parallel: str) -> int:
     print(f"{'PASS' if ok else 'FAIL'} PARALLEL_SEEDS={p}: need {need:.0f} MB = {p} x (largest measured peak "
           f"{max(peaks):.0f} MB x {UNMEASURED_SCALE} + {GPU_CONTEXT_MB:.0f} MB context), free {free:.0f} MB")
     return 0 if ok else 1
+
+
+# ---------------------------------------------------------- FR_04 taufree ---
+#: FR_04 Sec 3.5: chain name -> (class path, hyperparameters from this round-6 chain entry, extra kwargs, priority).
+TAUFREE_CLASSES = {
+    "lnn_tau_res": ("lnn_tau_res.LagrangianNN", "lnn_tau_res", {}, "required"),
+    "kalnn_tau_res": ("kalnn_tau_res.LagrangianNN", "kalnn_tau_res", {}, "required"),
+    "lnn_twomass": ("lnn_twomass.LagrangianNN", "lnn_tau_res", {"priors": True}, "required"),
+    "kalnn_twomass": ("kalnn_twomass.LagrangianNN", "kalnn_tau_res", {"priors": True}, "required"),
+    "lnn_res_hist": ("lnn_res_hist.LagrangianNN", "lnn_tau_res", {"window": True}, "required"),
+    "kalnn_res_hist": ("kalnn_res_hist.LagrangianNN", "kalnn_tau_res", {"window": True}, "optional"),
+    "lnn_elastic_qdq": ("lnn_tau_elastic.LagrangianNN", "lnn_tau_elastic", {"observer_inputs": "q_dq"}, "required"),
+    "kalnn_elastic_qdq": ("kalnn_tau_elastic.LagrangianNN", "kalnn_tau_elastic", {"observer_inputs": "q_dq"},
+                          "optional"),
+    "lnn_tau_elastic": ("lnn_tau_elastic.LagrangianNN", "lnn_tau_elastic", {}, "reference"),
+    "kalnn_tau_elastic": ("kalnn_tau_elastic.LagrangianNN", "kalnn_tau_elastic", {}, "reference"),
+}
+#: The 72 h rule (FR_04 Sec 3.5): drop the optional rows first, then classes 7-8.
+TAUFREE_DROPS = (("kalnn_res_hist", "kalnn_elastic_qdq"), ("lnn_elastic_qdq", "kalnn_elastic_qdq"))
+TAUFREE_BUDGET_S = 72 * 3600
+
+
+def _taufree_priors(source: str) -> dict:
+    """``transmission_priors`` of an r7 contract, or computed from a round-6 manifest as a no-payload build would.
+
+    For a round-6 manifest the plant (``payload.mode: none``) is the bare arm,
+    whose envelope is the manifest's own ``link_inertia.median``.
+    """
+    from elastic_sim.assets import AssetRegistry
+    from elastic_sim.round7 import transmission_priors
+
+    data = json.loads(Path(source).read_text(encoding="utf-8"))
+    if "transmission_priors" in data:
+        return data["transmission_priors"]
+    manifest = dict(data)
+    manifest["robots"] = [{**r, "plant_link_inertia_median": data["link_inertia"]["median"]} for r in data["robots"]]
+    return transmission_priors(manifest, AssetRegistry.for_repository(_REPO).load(data["asset"]))
+
+
+def taufree_spec(source: str, batch: str = "256") -> int:
+    """``name:n_dof:time_step:burn_in_s:windows`` for benchmark_twomass_coupling.py (windows from BATCH samples)."""
+    priors = _taufree_priors(source)
+    step, burn_in = float(priors["sample_time_step"]), float(priors["burn_in_s"])
+    windows = max(1, int(round(int(batch) / round(1.0 / step))))
+    print(f"{len(priors['joints'])}:{step:g}:{burn_in:g}:{windows}")
+    return 0
+
+
+def taufree_chain(src: str, out: str, dataset: str, contract: str, epochs: str, patience: str, coupling: str,
+                  classes: str, *seeds: str) -> int:
+    integrator = "trapezoidal"
+    if ":" in coupling:   # COUPLING[:INTEGRATOR], e.g. full:backward_euler (round7_taufree.sh INTEGRATOR=...)
+        coupling, integrator = coupling.split(":", 1)
+    """``chain-<v>-taufree.yaml`` (FR_04 Sec 3.5) from a round-6 chain and the r7 contract's priors.
+
+    Every class inherits its hyperparameters (``training_overrides``, KAN
+    kwargs) from the round-6 chain entry FR_04 names; the sequence classes get
+    the contract's per-joint priors, the sample step and the burn-in.
+    """
+    import yaml
+
+    config = yaml.safe_load(Path(src).read_text(encoding="utf-8"))
+    priors = json.loads(Path(contract).read_text(encoding="utf-8"))["transmission_priors"]
+    defaults = dict(config["defaults"])
+    defaults.update({"dataset_file": str(Path(dataset).resolve()), "epochs": int(epochs),
+                     "early_stopping_patience": int(patience), "selection": "val",
+                     "seeds": [int(v) for v in seeds], "stop_on_error": False})
+    parents = {run["base_name"]: run for run in config["runs"]}
+    sequence_kwargs = {"time_step": float(priors["sample_time_step"]), "burn_in_s": float(priors["burn_in_s"])}
+    prior_kwargs = {"stiffness_range": [j["stiffness_range"] for j in priors["joints"]],
+                    "damping_ratio_range": [j["damping_ratio_range"] for j in priors["joints"]],
+                    "coupling": coupling, "integrator": integrator}
+    runs = []
+    for name in [c for c in classes.replace(",", " ").split() if c]:
+        if name not in TAUFREE_CLASSES:
+            raise SystemExit(f"unknown FR_04 class {name!r}; known: {list(TAUFREE_CLASSES)}")
+        class_path, parent_name, extra, priority = TAUFREE_CLASSES[name]
+        parent = parents.get(parent_name)
+        if parent is None:
+            raise SystemExit(f"{src}: no {parent_name} run to inherit {name}'s hyperparameters from")
+        kwargs = {k: v for k, v in (parent.get("model_kwargs") or {}).items() if k.startswith("kan_")}
+        if extra.get("priors"):
+            kwargs.update(sequence_kwargs, **prior_kwargs)
+        if extra.get("window"):
+            kwargs.update(sequence_kwargs)
+        if "observer_inputs" in extra:
+            kwargs["observer_inputs"] = extra["observer_inputs"]
+        run = {"base_name": name, "class_path": class_path,
+               "training_overrides": dict(parent.get("training_overrides") or {}),
+               "_provenance": {**(parent.get("_provenance") or {}), "parent": parent_name, "priority": priority,
+                               "note": "parent's hyperparameters reused, no Optuna (FR_04 Sec 3.5)"}}
+        if kwargs:
+            run["model_kwargs"] = kwargs
+        runs.append(run)
+    header = f"# generated by launch_helpers.py taufree_chain from {src} (FR_04 S-5) -- do not hand-edit\n"
+    Path(out).write_text(header + yaml.safe_dump({"defaults": defaults, "runs": runs}, sort_keys=False),
+                         encoding="utf-8")
+    print(f"{out}: {len(runs)} classes x seeds {list(defaults['seeds'])}, burn-in {priors['burn_in_s']} s, "
+          f"coupling {coupling}, integrator {integrator}")
+    return 0
+
+
+def taufree_classes(preflight_run: str, plan_path: str) -> int:
+    """The class list the full run trains: all of Sec 3.5, minus the 72 h rule's drops at PARALLEL_SEEDS=3.
+
+    Prints the classes on the first line and one ``# ...`` line per decision.
+    """
+    import contextlib
+    import io
+
+    plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    classes = list(plan.get("classes") or TAUFREE_CLASSES)
+    notes = []
+    for drop in (None, *TAUFREE_DROPS):
+        if drop is not None:
+            dropped = [c for c in drop if c in classes]
+            classes = [c for c in classes if c not in drop]
+            notes.append(f"# dropped {dropped} (FR_04 Sec 3.5: projection above 72 h)")
+        trial = {**plan, "classes": classes}
+        Path(plan_path).write_text(json.dumps(trial), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            retrain_plan(preflight_run, plan_path, "3")
+        wall = json.loads((Path(preflight_run) / "projection.json").read_text())["wall_s"]["parallel_3"]
+        notes.append(f"# projected {wall / 3600:.1f} h at PARALLEL_SEEDS=3 with {len(classes)} classes")
+        if wall <= TAUFREE_BUDGET_S:
+            break
+    print(" ".join(classes))
+    for note in notes:
+        print(note)
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -474,6 +626,12 @@ def main(argv: list[str]) -> int:
         return retrain_plan(*args)
     if command == "gpu_fit":
         return gpu_fit(*args)
+    if command == "taufree_spec":
+        return taufree_spec(*args)
+    if command == "taufree_chain":
+        return taufree_chain(*args)
+    if command == "taufree_classes":
+        return taufree_classes(*args)
     raise SystemExit(f"unknown command {command!r}")
 
 

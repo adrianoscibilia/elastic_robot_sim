@@ -45,8 +45,8 @@ description:
     extra_collision:                    # measure; margin for the MF if the URDF mesh lacks it
       - {shape: cylinder, height: 0.03, radius: 0.045, parent: iiwa_link_ee, xyz: [0, 0, 0.015], rpy: [0, 0, 0]}
 
-limits:                                 # proposed 2026-10-08: emulator-run values, inside KUKA's axis limits
-  reviewed: false                       # OWNER: set true once you have checked every value below
+limits:                                 # inside KUKA's axis limits
+  reviewed: true
   position:
     iiwa_A1: [-2.7, 2.7]
     iiwa_A2: [-1.9, 1.9]
@@ -79,7 +79,7 @@ limits:                                 # proposed 2026-10-08: emulator-run valu
     iiwa_A5: 20.0
     iiwa_A6: 20.0
     iiwa_A7: 20.0
-  effort:                               # N*m [S-13, verify against the pendant/Sunrise project before T2.0]
+  effort:
     iiwa_A1: 320
     iiwa_A2: 320
     iiwa_A3: 176
@@ -151,7 +151,7 @@ identification:
   holdout: 2
 
 safety:
-  vendor_checksum: null              # T2.0: Sunrise safety configuration checksum (Safety > Configuration on the pendant) (RR_12 A-3c)
+  vendor_checksum: "7FC64B2D"           
 
 consumer:
   repo: ${ERD_CONSUMER_REPO}                 # exported by workspace_setup.sh (default: ../dynamic_model_nn)

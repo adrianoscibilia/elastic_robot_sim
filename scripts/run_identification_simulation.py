@@ -39,7 +39,8 @@ from elastic_sim import identification as idn
 from elastic_sim.assets import AssetRegistry, load_asset_spec
 from elastic_sim.controllers import CONTROLLER_MODES, ControllerDraw
 from elastic_sim.dataset import (
-    DEFAULT_CONFIG, RIGID_TIER, differentiation_policy, elastic_time_step, load_config, payload_for,
+    DEFAULT_CONFIG, RIGID_TIER, attached_payload, differentiation_policy, elastic_time_step, load_config,
+    payload_for,
     resolve_bag, rollout_frame, run_condition, sample_all_payloads,
 )
 from elastic_sim.dataset_bag import noise_seed
@@ -154,6 +155,10 @@ def main() -> None:
     print(f"config     : {_resolve(args.config)}")
     if payload is not None and not payload.is_empty:
         print(f"payload    : {payload.as_dict()}")
+    if config.payload.mode != "random":
+        attached = attached_payload(config, payload, tier)
+        print(f"attached   : {None if attached is None or attached.is_empty else attached.as_dict()} "
+              f"(payload.mode: {config.payload.mode}; the draw above sizes the robot and trajectory)")
 
     if args.seed is not None or args.base_frequency is not None or args.max_acceleration is not None:
         # Ad-hoc overrides: --seed replaces the derived trajectory seed
@@ -274,7 +279,8 @@ def main() -> None:
             print(f"    {name:20s} {ratio:6.2f}{flag}")
     seed = noise_seed(config, bag_name) if config.is_round6 else config.seed
     result = run_condition(asset, trajectory, tier, backend, friction, run_config, link_inertia=link_inertia,
-                           payload=payload, natural_frequency=natural_frequency, damping_ratio=damping_ratio,
+                           payload=attached_payload(config, payload, tier),
+                           natural_frequency=natural_frequency, damping_ratio=damping_ratio,
                            draw=draw, extras=extras if config.is_round6 or not tier.is_rigid else None,
                            seed=seed)
     _report_rollout(asset, result, friction, units)

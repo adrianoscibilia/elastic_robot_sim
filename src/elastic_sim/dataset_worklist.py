@@ -478,6 +478,24 @@ def payload_for(
     return payload_by_tier[tier.name] if config.payload.per == "robot" else payload_by_key[(tier.name, traj_index)]
 
 
+def attached_payload(config: DatasetConfig, drawn: Payload | None, tier: Tier) -> Payload | None:
+    """The body actually welded to ``tier``'s flange, given its drawn payload (FR_04 S-1).
+
+    ``payload.mode: random`` attaches the draw (rounds 3-6); ``fixed`` the
+    declared body on every elastic robot; ``none`` nothing.  The draw itself
+    (:func:`payload_for`) keeps sizing the robot and its trajectories in every
+    mode, so the three modes share robots and trajectories bit for bit.
+    """
+    mode = config.payload.mode
+    if mode == "random" or tier.is_rigid:
+        return drawn
+    if mode == "none":
+        return Payload()
+    sampling = config.payload
+    return Payload(mass=float(sampling.fixed_mass), offset=tuple(float(v) for v in sampling.fixed_offset),
+                   size=float(sampling.fixed_size))
+
+
 @dataclass(frozen=True)
 class ResolvedBag:
     """One ``(tier, trajectory index)`` bag's payload-aware trajectory and gains."""
@@ -772,7 +790,12 @@ def generate(
             transmission = tier.transmission(n_dof, tier_link_inertia)
             entry = {"name": tier.name, **describe_transmission(transmission, elastic_time_step(transmission, config))}
             if tier_payload is not None:
-                entry["payload"] = None if tier_payload.is_empty else tier_payload.as_dict()
+                attached = attached_payload(config, tier_payload, tier)
+                entry["payload"] = None if attached.is_empty else attached.as_dict()
+                if attached is not tier_payload:
+                    # FR_04 S-1: the round-6 draw that sized this robot, not attached.
+                    entry["sizing_payload"] = None if tier_payload.is_empty else tier_payload.as_dict()
+                    entry["plant_link_inertia_median"] = _envelope_for(attached)[0].tolist()
             robots.append(entry)
             if verbose:
                 print(f"robot {tier.name}: k [Nm/rad] {np.array2string(transmission.stiffness, precision=0, floatmode='fixed')}"
@@ -912,6 +935,18 @@ def generate(
                 validated[key] = True
             link_inertia_for_bag = _envelope_for(payload) if not tier.is_rigid else None
             link_inertia_max_for_bag = _envelope_max_for(payload) if not tier.is_rigid else None
+            # FR_04 S-1: the drawn payload sized the robot (damping, step) and
+            # the trajectory above; the plant carries what payload.mode attaches.
+            attached = attached_payload(config, payload, tier)
+            if attached is not payload and attached is not None and not attached.is_empty:
+                key_fixed = ("fixed", tier.name, traj_index)
+                if key_fixed not in validated:
+                    if not _collision_free(trajectory, attached):
+                        raise ValueError(
+                            f"tier {tier.name!r} trajectory {traj_index}: the fixed payload "
+                            f"{attached.as_dict()} collides on the round-6 trajectory; choose a smaller body"
+                        )
+                    validated[key_fixed] = True
             resolved_key = (tier.name if config.trajectories_per_robot else "", traj_index)
             gains = control_gains[resolved_key]
             draw = controller_draws[resolved_key]
@@ -937,7 +972,7 @@ def generate(
                 if (separation_ratio < config.control_separation.min_ratio
                         and not config.controller.is_model_free):
                     offending.append((bag, separation_ratio, separation_joint))
-            work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, payload,
+            work.append((asset, trajectory, tier, backend, friction, config, link_inertia_for_bag, attached,
                         split, bag, bag_index, traj_index, friction_index, gains, link_inertia_max_for_bag,
                         separation_ratio, separation_joint, draw, extras))
     except BaseException:
@@ -1098,6 +1133,16 @@ def generate(
             "median": link_inertia[0].tolist(), "floor": link_inertia[1].tolist(),
         },
         "robots": robots,
+        **({} if config.payload.mode == "random" else {"payload_mode": {
+            "mode": config.payload.mode,
+            "attached": (None if config.payload.mode == "none" else
+                         {"mass": float(config.payload.fixed_mass), "offset": list(config.payload.fixed_offset),
+                          "size": float(config.payload.fixed_size)}),
+            "sizing": ("the random draw (stream (seed, 2), as with mode: random) still sizes each robot's "
+                       "link-inertia envelope -- so its damping, time step and control separation -- and its "
+                       "trajectories' collision geometry; robots[].sizing_payload is that draw, "
+                       "robots[].plant_link_inertia_median the envelope of the plant as built (FR_04 S-1)"),
+        }}),
         "backend_comparison": summarize(comparison, config.comparison),
         "sampling_coverage": sampling_coverage,
         "provenance": {

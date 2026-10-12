@@ -15,6 +15,11 @@ the same optimized trajectories:
 * ``ablation_clean``-> ``<stem>_ablation_clean.parquet``: the noise block off and
   the clean target (Sec 6's noise ablation).
 
+``--taufree`` (FR_04, a ``payload.mode: none``/``fixed`` config) adds to every
+contract the ``audit_columns``, ``transmission_priors`` and
+``baselines.two_mass`` blocks (:mod:`elastic_sim.round7`), and writes the
+production file's ``<stem>.two_mass_reference.npz`` cross-test fixture.
+
 Every file gets the Sec 9 hard checks; the production file also the Sec 7
 gates, and the gain-shift file gate 4.  The report goes to
 ``<stem>.round6_checks.json``.  A file that fails is written as
@@ -54,6 +59,7 @@ from diagnose_controller_modes import _load_asset, _shrink, add_baselines_to_con
 from elastic_sim.dataset import PlantExtrasSampling, assign_splits, default_jobs, generate, load_config, write_dataset
 from elastic_sim.diagnostics import dataset_diagnostics
 from elastic_sim.round6_checks import check_dataset, gate_gainshift
+from elastic_sim.round7 import augment_contract
 
 VARIANTS = ("production", "gainshift", "ablation_off", "ablation_clean")
 SUFFIX = {"production": "", "gainshift": "_gainshift", "ablation_off": "_ablation_off",
@@ -81,7 +87,8 @@ def variant_config(config, variant: str):
 
 
 def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs: int, verbose: bool,
-                  save: bool, trajectory_cache: dict, production_manifest: dict | None = None) -> dict:
+                  save: bool, trajectory_cache: dict, production_manifest: dict | None = None,
+                  taufree: bool = False, priors: dict | None = None) -> dict:
     variant_cfg = variant_config(config, variant)
     frame, manifest, comparison = generate(variant_cfg, asset, verbose=verbose, jobs=jobs,
                                            trajectory_cache=trajectory_cache)
@@ -105,7 +112,11 @@ def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs
         write_dataset(frame, manifest, output, comparison, metadata_columns=variant_cfg.metadata_columns)
         add_baselines_to_contract(output, frame, diagnostics)
         report["file"] = str(output)
-    return {"report": report, "manifest": manifest}
+        if taufree:
+            # FR_04 S-2..S-4; a gain-shift twin takes the production file's priors (one burn-in per variant).
+            priors = augment_contract(output, frame, manifest, asset, priors=priors, fixture=variant == "production")
+            report["transmission_priors_burn_in_s"] = priors["burn_in_s"]
+    return {"report": report, "manifest": manifest, "priors": priors}
 
 
 def _print_report(report: dict) -> None:
@@ -132,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-save", action="store_true", help="build and check, write nothing")
     parser.add_argument("--refusal-ok", action="store_true",
                         help="exit 0 even when a file is refused (the launcher lists refusals, R6_04 Sec 4 step 8)")
+    parser.add_argument("--taufree", action="store_true",
+                        help="FR_04: also write audit_columns, transmission_priors and the two-mass baselines into "
+                             "each contract, and the production file's cross-test fixture (needs payload.mode "
+                             "fixed or none)")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -146,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     variants = list(dict.fromkeys(args.variants + (["ablation_off", "ablation_clean"] if args.ablations else [])))
     if "gainshift" in variants and "production" not in variants:
         parser.error("the gain-shift file is checked against the production file; build both")
+    if args.taufree and config.payload.mode == "random":
+        parser.error("--taufree needs a payload.mode: fixed or none config (FR_04 S-1)")
     jobs = default_jobs(config.backends) if args.jobs is None else args.jobs
     out_dir = Path(args.out_dir) if args.out_dir else _REPO / Path(config.output).parent
     stem = Path(config.output).stem
@@ -163,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             config, asset, variant, out_dir=out_dir, stem=stem, jobs=jobs, verbose=verbose, save=save,
             trajectory_cache=trajectory_cache,
             production_manifest=results.get("production", {}).get("manifest"),
+            taufree=args.taufree, priors=results.get("production", {}).get("priors"),
         )
         _print_report(results[variant]["report"])
 
