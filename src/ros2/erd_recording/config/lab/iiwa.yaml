@@ -90,8 +90,8 @@ limits:                                 # inside KUKA's axis limits
   approach: {velocity: 0.1, acceleration: 0.2}   # conservative; T2.1 (ladder step 3) tunes these
   abort: {tracking_rad: 0.03, torque_fraction: 0.6, stop_timeout_s: 3.0}   # conservative; RR_01 S9
 
-scene:                                  # owner's measurements, 2026-10-08: virtual floor + virtual wall (see header)
-  reviewed: false                       # OWNER: set true once you have checked the two objects below
+scene:                                  # STIIMA-Milan lab: virtual floor + virtual wall (see header)
+  reviewed: true
   frame: iiwa_base
   clearance: 0.03
   objects:
@@ -104,14 +104,14 @@ scene:                                  # owner's measurements, 2026-10-08: virt
   allowed_contacts: [[iiwa_link_0, floor_66mm], [iiwa_link_0, wall_p1_p2]]   # the fixed base sits below 66 mm, 123 mm from the wall line
 
 poses:                                  # 2026-10-08
-  home: [0.0, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]   # the Sunrise app's INITIAL_POSITION (0, -45, 0, 80, 0, 35, 0 deg)
+  home: [-0.7854, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]   # the Sunrise app's INITIAL_POSITION (0, -45, 0, 80, 0, 35, 0 deg)
   # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,
   # 11.3 / +1.8 -> ranges 40.2 and 25.9 N*m for the sign check. A6 gets < 0.5 N*m
   # in any pose with nothing on the flange: not testable, by design.
   standstill:
-    - [0.0, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]     # home
-    - [0.0, -0.7854, 0.0, -1.3963, 0.0, -1.5708, 0.0]   # (0, -45, 0, -80, 0, -90, 0 deg): forearm up
-    - [0.0, -0.2618, 0.0, -0.3491, 0.0, 0.5236, 0.0]    # (0, -15, 0, -20, 0, 30, 0 deg): nearly upright
+    - [-0.7854, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]     # home
+    - [-0.7854, -0.7854, 0.0, -1.3963, 0.0, -1.5708, 0.0]   # (-45, -45, 0, -80, 0, -90, 0 deg): forearm up
+    - [-0.7854, -0.2618, 0.0, -0.3491, 0.0, 0.5236, 0.0]    # (-45, -15, 0, -20, 0, 30, 0 deg): nearly upright
 
 excitation:
   trajectories: 10

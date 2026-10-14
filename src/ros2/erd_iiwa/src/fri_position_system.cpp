@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "erd_iiwa/fri_position_system.hpp"
 
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <set>
 #include "rclcpp/rclcpp.hpp"
@@ -26,6 +29,7 @@ void FriPositionSystem::invalidate()
   commanded_position_.fill(kNan);
   ipo_position_.fill(kNan);
   have_previous_ = false;
+  retimer_.reset();
   fri_time_sec_ = fri_time_nsec_ = kNan;
   fri_session_state_ = fri_command_mode_ = fri_connection_quality_ = kNan;
   fri_tracking_performance_ = fri_safety_state_ = fri_operation_mode_ = fri_drive_state_ = kNan;
@@ -131,6 +135,10 @@ hardware_interface::return_type FriPositionSystem::read(
     invalidate();
     return hardware_interface::return_type::OK;  // MONITORING_WAIT/IDLE: not yet an error
   }
+  // When this packet was read, on the controller manager's (steady) clock:
+  // the JTC samples its trajectory at about this time (command_retimer.hpp).
+  read_steady_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
   const auto & sample = client_->sample();
   position_ = sample.measured_position;
   effort_ = sample.measured_torque;              // raw, unfiltered (RR_01 S3.3)
@@ -176,9 +184,16 @@ hardware_interface::return_type FriPositionSystem::write(
     for (double v : position_command_) {
       all_finite = all_finite && std::isfinite(v);
     }
-    if (all_finite) {
-      client_->set_target_position(position_command_);
+    if (all_finite && std::isfinite(fri_time_sec_) && std::isfinite(fri_time_nsec_)) {
+      // Re-time onto the robot clock (command_retimer.hpp; real iiwa, 2026-10-12).
+      const std::int64_t robot_ns = static_cast<std::int64_t>(std::llround(fri_time_sec_)) * 1000000000LL +
+        static_cast<std::int64_t>(std::llround(fri_time_nsec_));
+      client_->set_target_position(retimer_.step(position_command_, read_steady_ns_, robot_ns));
+    } else {
+      retimer_.reset();
     }
+  } else {
+    retimer_.reset();
   }
   return hardware_interface::return_type::OK;
 }

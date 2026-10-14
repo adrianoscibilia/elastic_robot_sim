@@ -1,0 +1,181 @@
+# erd.lab/1 -- KUKA LBR iiwa 14 R820, REAL ROBOT -- FAST variant.
+#
+# DRAFT 2026-10-14 (ROS 2 chat): copy of the reviewed iiwa.yaml after the first
+# valid dataset (iiwa_real_all_01), with faster excitations. Changed: limits
+# velocity/acceleration/jerk and approach; excitation seed, base_frequency,
+# n_periods, velocity_fraction, max_acceleration, regime. Everything else is
+# identical to iiwa.yaml (scene, poses, window, safety, consumer, recording).
+# Both `reviewed` flags are reset: the OWNER re-reviews and sets them.
+# Before the first run, check that the Sunrise safety configuration's axis /
+# Cartesian velocity monitoring is above these values (else a safety stop).
+#
+# Original header:
+# DRAFT 2026-10-08 (ROS 2 chat) from the owner's measurements in the cell.
+# The loader refuses it until the OWNER reviews it: set `limits.reviewed` and
+# `scene.reviewed` to true yourself, and paste `safety.vendor_checksum`.
+#
+#   * robot driven from peepo directly: peepo 192.170.1.200, robot 192.170.1.147;
+#   * Sunrise app = the owner's ICube-derived app, copied with TS = 1 ms,
+#     POSITION chosen in its dialog; its start-up ptp goes to INITIAL_POSITION,
+#     which is `poses.home` below (so preflight finds the robot at home);
+#   * workspace = the safe side of a virtual wall through P1/P2 and above a
+#     virtual floor at z = 66 mm (smartPAD, World = iiwa_base, Flange):
+#       P1 (-363.89, -467.28, 66) mm, P2 (559.6, 193.9, 66) mm,
+#       inside example P_EX (-319, 459, 406) mm.
+#     Both are `box` objects, NOT floor/wall types: those inflate `clearance`
+#     away from the robot (config._expand_object; logged for after the
+#     code freeze). The robot base axis is 168 mm from the wall line.
+#   * limits = the values the emulator runs used (inside the KUKA axis limits
+#     with >= 11 deg margin); standstill poses and the excitation window were
+#     checked offline against the two virtual surfaces (FK on the bare asset's
+#     collision meshes: all moving links >= 7 cm from the wall and >= 8 cm above
+#     the floor at the poses; straight joint paths home <-> pose >= 5 cm).
+#     `record_iiwa plan` is the authoritative check.
+schema: erd.lab/1
+robot: kuka_lbr_iiwa_14_r820
+hardware: real                          # mock | emulator | real
+operator: {confirm_each_trajectory: true}
+
+connection:
+  robot_ip: 192.170.1.147               # owner, 2026-10-08 (the ICube bringup's robot_ip)
+  client_ip: 192.170.1.200              # peepo on the FRI network (owner, 2026-10-08)
+  fri_port: 30200
+  fri_send_period_ms: 1                 # must equal the Sunrise app's send period (TS = 1 in the owner's 1 ms copy)
+  sunrise_version: 1.11.0.7             # I-12
+  ros_domain_id: 0                      # real always uses domain 0 (RR_01 S9)
+
+description:
+  sim_asset: kuka_lbr_iiwa_14_r820        # the BARE asset (RR_04 A-6): planning, FK gate and baselines
+                                          # never use the `_table` variant, which is a different URDF root
+  joint_map: {joint_a1: iiwa_A1, joint_a2: iiwa_A2, joint_a3: iiwa_A3, joint_a4: iiwa_A4,
+              joint_a5: iiwa_A5, joint_a6: iiwa_A6, joint_a7: iiwa_A7}
+  base_frame: iiwa_base
+  tool:
+    mass: 0.0                           # nothing mounted (owner, Q-13); the Media Flange is part of the robot
+    extra_collision:                    # measure; margin for the MF if the URDF mesh lacks it
+      - {shape: cylinder, height: 0.03, radius: 0.045, parent: iiwa_link_ee, xyz: [0, 0, 0.015], rpy: [0, 0, 0]}
+
+limits:                                 # inside KUKA's axis limits
+  reviewed: true                       
+  position:
+    iiwa_A1: [-2.7, 2.7]
+    iiwa_A2: [-1.9, 1.9]
+    iiwa_A3: [-2.7, 2.7]
+    iiwa_A4: [-1.9, 1.9]
+    iiwa_A5: [-2.7, 2.7]
+    iiwa_A6: [-1.9, 1.9]
+    iiwa_A7: [-3.0, 3.0]
+  velocity:                             # FAST: was 0.6 / 0.8. KUKA max (S-13): 1.48 1.48 1.75 1.31 2.27 2.36 2.36
+    iiwa_A1: 1.0
+    iiwa_A2: 1.0
+    iiwa_A3: 1.0
+    iiwa_A4: 1.0                        # 76 % of A4's 1.31 rad/s, the tightest axis
+    iiwa_A5: 1.5
+    iiwa_A6: 1.5
+    iiwa_A7: 1.5
+  acceleration:                         # FAST: was 1.5 / 2.0
+    iiwa_A1: 4.0
+    iiwa_A2: 4.0
+    iiwa_A3: 4.0
+    iiwa_A4: 4.0
+    iiwa_A5: 6.0
+    iiwa_A6: 6.0
+    iiwa_A7: 6.0
+  jerk:                                 # FAST: was 20; a 1 Hz harmonic at 0.8 rad/s alone needs ~32 rad/s^3
+    iiwa_A1: 100.0
+    iiwa_A2: 100.0
+    iiwa_A3: 100.0
+    iiwa_A4: 100.0
+    iiwa_A5: 100.0
+    iiwa_A6: 100.0
+    iiwa_A7: 100.0
+  effort:
+    iiwa_A1: 320
+    iiwa_A2: 320
+    iiwa_A3: 176
+    iiwa_A4: 176
+    iiwa_A5: 110
+    iiwa_A6: 40
+    iiwa_A7: 40
+  approach: {velocity: 0.25, acceleration: 0.5}  # FAST: was 0.1 / 0.2 (approaches were ~2/3 of the 18 min run)
+  abort: {tracking_rad: 0.03, torque_fraction: 0.6, stop_timeout_s: 3.0}   # conservative; RR_01 S9
+
+scene:                                  # STIIMA-Milan lab: virtual floor + virtual wall (see header)
+  reviewed: true                       
+  frame: iiwa_base
+  clearance: 0.03
+  objects:
+    # Virtual floor: top face at z = 0.066 (box 6 x 6 x 0.2 m below it).
+    - {id: floor_66mm, type: box, size: [6.0, 6.0, 0.2], xyz: [0.0, 0.0, -0.034]}
+    # Virtual wall through P1/P2: yaw = atan2(P2 - P1) = 0.621356 rad; the box's
+    # local +y face lies on the P1-P2 line, facing the robot (local +y = safe
+    # side, (-0.5821, 0.8131)); 6 m long, 0.2 m thick, z -1 .. 3 m.
+    - {id: wall_p1_p2, type: box, size: [6.0, 0.2, 4.0], xyz: [0.156075, -0.217995, 1.0], rpy: [0.0, 0.0, 0.621356]}
+  allowed_contacts: [[iiwa_link_0, floor_66mm], [iiwa_link_0, wall_p1_p2]]   # the fixed base sits below 66 mm, 123 mm from the wall line
+
+poses:                                  # 2026-10-08
+  home: [-0.7854, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]   # the Sunrise app's INITIAL_POSITION (0, -45, 0, 80, 0, 35, 0 deg)
+  # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,
+  # 11.3 / +1.8 -> ranges 40.2 and 25.9 N*m for the sign check. A6 gets < 0.5 N*m
+  # in any pose with nothing on the flange: not testable, by design.
+  standstill:
+    - [-0.7854, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]     # home
+    - [-0.7854, -0.7854, 0.0, -1.3963, 0.0, -1.5708, 0.0]   # (-45, -45, 0, -80, 0, -90, 0 deg): forearm up
+    - [-0.7854, -0.2618, 0.0, -0.3491, 0.0, 0.5236, 0.0]    # (-45, -15, 0, -20, 0, 30, 0 deg): nearly upright
+
+excitation:
+  trajectories: 10
+  seed: 20261014                        # FAST: new trajectories (was 20261001)
+  base_frequency: 0.2                   # FAST: harmonics 0.2-1.0 Hz (was 0.1-0.5 Hz)
+  n_periods: 2                          # FAST: 2 x 5 s = still 10 s per excitation
+  n_harmonics: 5
+  velocity_fraction: 0.8                # FAST: of the limits above -> <= 0.8 rad/s (A1-A4), 1.2 (A5-A7); was 0.6 of 0.6/0.8
+  max_acceleration: 4.0                 # FAST: rad/s^2, <= every joint's acceleration limit; was 1.5
+  centre_jitter: 1.0
+  position_window:                      # keeps the excitation on the safe side of the wall
+    iiwa_A1: [-1.2, 0.4]                #   (98 % of random configurations in this box clear
+    iiwa_A2: [-1.1, -0.1]               #   both surfaces by 3 cm, vs 42 % for the full limits)
+    iiwa_A3: [-0.8, 0.8]
+    iiwa_A4: [0.3, 1.7]
+    iiwa_A5: [-1.2, 1.2]
+    iiwa_A6: [-1.2, 1.2]
+    iiwa_A7: [-2.5, 2.5]
+  candidates: 48
+  regime:
+    enabled: true
+    velocity_fraction: [0.5, 1.0]       # FAST: was [0.3, 1.0]
+    max_acceleration: [0.5, 1.0]        # FAST: was [0.25, 1.0]
+  probe:
+    enabled: false                      # commissioning; may switch on once the ladder (S7.2) is past step 6
+    # RR_12 S4.4: off until rung 7; capped at 90 Hz (= 0.09 x 1000 Hz).
+    from_training_config: ${ERD_REPO_ROOT}/config/identification/kuka_lbr_iiwa_14_r820_table_round6_drive.yaml
+    max_top_hz: 90.0
+    acceleration_fraction: 0.2
+    budget: split                       # never additive on hardware
+  settle_s: 2.0
+  amplitude_ladder: [0.1, 0.25, 0.5, 1.0]
+
+identification:
+  sweep_speeds: []                      # UR10-only fields; iiwa uses E-iiwa-1/2 instead (RR_01 S2.1)
+  sweep_range: {}
+  holdout: 2
+
+safety:
+  vendor_checksum: "7FC64B2D"           
+
+consumer:
+  repo: ${ERD_CONSUMER_REPO}                 # exported by workspace_setup.sh (default: ../dynamic_model_nn)
+  python: ${ERD_CONSUMER_PYTHON}   # confirmed consumer env, Python 3.11
+  # RR_12 S4.4: the round-6 `iiwa_drive` production contract (Q-1 = POSITION ->
+  # `drive`) and its sibling .manifest.json, copied to the same relative path
+  # on the laptop (T2.0-lab item 2). The synthetic reference stays in *_sim.yaml.
+  reference_contract: ${ERD_REPO_ROOT}/data/identification/r6-full-20260929-0049/iiwa_drive/kuka_lbr_iiwa_14_r820_table_round6_drive.contract.json
+  reference_sha256: c64f7aef2e1e0f4625c1fea7d72ef052f8e045a0e09b257c2ebf04225bb5ea25
+  checkpoints: ${ERD_REPO_ROOT}/runs/r6-full-20260929-0049/chain-iiwa_drive.summary.csv   # evaluate (peepo)
+
+recording:
+  output_root: ${ERD_DATA_ROOT}                # <repo>/data/real_robot, exported by workspace_setup.sh (gitignored)
+  standstill_s: 30
+  pre_roll_s: 2.0
+  post_roll_s: 2.0
+  max_lost_fraction: 0.001

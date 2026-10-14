@@ -3,12 +3,14 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "hardware_interface/system_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 
+#include "erd_iiwa/command_retimer.hpp"
 #include "erd_iiwa/erd_fri_client.hpp"
 
 namespace erd_iiwa
@@ -49,6 +51,8 @@ inline hardware_interface::return_type fri_read_return(
 /// (RR_01 S3.3). `read()` blocks on `ErdFriClient::step()` (receive + send
 /// the previous cycle's target), so the robot paces the loop 1:1; `write()`
 /// only stages the new target for the next cycle (see erd_fri_client.hpp).
+/// The staged target is the JTC output re-timed onto the robot's sample clock
+/// (command_retimer.hpp): the JTC samples on wall-clock time, the robot on its own.
 /// No filtering anywhere: `effort` is the raw measured torque, `velocity` is an
 /// unfiltered finite difference of the raw measured position, for the JTC's
 /// state interface only -- never part of the recorded/written signal.
@@ -81,6 +85,9 @@ private:
   std::array<double, kNumJoints> previous_position_{};
   bool have_previous_{false};
   bool has_been_active_{false};
+  // Re-times the JTC target onto the robot clock (command_retimer.hpp).
+  detail::CommandRetimer<static_cast<std::size_t>(kNumJoints)> retimer_;
+  std::int64_t read_steady_ns_{0};   // steady-clock time this cycle's packet was read
 
   // GPIO "fri" interfaces (RR_01 S3.3).
   double fri_time_sec_{0.0};

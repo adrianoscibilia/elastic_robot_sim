@@ -1024,6 +1024,12 @@ class RecordingNode(Node):
         self._bag_process = subprocess.Popen(
             [sys.executable, "-m", "erd_recording.bag_record", "-s", "mcap", "-o", str(bag_dir),
              "--include-hidden-topics", *level, "--qos-profile-overrides-path", str(qos_path), "--topics", *topics],
+            # Lab 2026-10-14 (iiwa_real_l010): with the terminal as its stdin,
+            # rosbag2's keyboard controls ("Press SPACE for pausing/resuming")
+            # put the shared TTY in non-canonical mode, so the operator's
+            # confirm prompt (`_confirm_trajectory`) read EOF at once. The
+            # recorder takes no input from us: give it none.
+            stdin=subprocess.DEVNULL,
             stdout=self._bag_stdout_file, stderr=self._bag_stderr_file,
         )
         # RR_01 S3.6 pre-roll. RR_13, two findings that a blind 1 s missed:

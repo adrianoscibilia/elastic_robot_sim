@@ -39,6 +39,32 @@ from .validate import (check_envelopes, check_noise, check_reference_tracking, c
 #: downstream by iiwa_dataset_frame) never runs off the edge of the segment.
 _SEGMENT_PAD_S = 0.5
 
+#: Sign of the KUKA torque channels relative to the model convention
+#: (tau = M(q) qdd + C(q, qd) qd + g(q), i.e. Pinocchio's gravity torque).
+#: Lab 2026-10-14 (`iiwa_real_all_01`, LBR iiwa 14 R820, no tool): at the
+#: standstill holds FRI's measured torque fits -1.14 x g(q) on A2 and
+#: -1.17 x g(q) on A4 (r^2 >= 0.999). The commanded torque (KUKA's own model
+#: torque in POSITION mode) has the same sign as the measured one, and the
+#: external torque is exactly measured - commanded, so all three KUKA
+#: channels share one convention and flip together. raw.parquet keeps
+#: KUKA's sign (RR_01 S2: raw); only the dataset and its checks are in the
+#: model convention. The iiwa emulator and mock already publish the model
+#: convention, hence real hardware only.
+_KUKA_TORQUE_COLUMNS = ("tau", "ft", "external_effort")
+KUKA_TORQUE_SIGN_REAL = -1.0
+
+
+def to_model_torque_sign(frame: pd.DataFrame, *, n_dof: int, hardware: str) -> pd.DataFrame:
+    """Return ``frame`` with the KUKA torque channels in the model sign
+    convention (see :data:`KUKA_TORQUE_SIGN_REAL`); unchanged off real hardware."""
+    if hardware != "real":
+        return frame
+    frame = frame.copy()
+    for prefix in _KUKA_TORQUE_COLUMNS:
+        columns = [f"{prefix}{j}" for j in range(n_dof) if f"{prefix}{j}" in frame.columns]
+        frame[columns] = KUKA_TORQUE_SIGN_REAL * frame[columns]
+    return frame
+
 
 def _event_segment_windows(
     bag_dir: Path, djs_stamps_ns: np.ndarray, excitation_segment_ids: list[str],
@@ -339,7 +365,7 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
         (run_dir / "validation.json").write_text(json.dumps({"ok": False, "status": "invalid",
                                                             "segments": segment_checks}, indent=2))
         raise RuntimeError("convert_cli: no excitation segment's window could be recovered from the bag/events")
-    windowed = pd.concat(rows, ignore_index=True)
+    windowed = to_model_torque_sign(pd.concat(rows, ignore_index=True), n_dof=n_dof, hardware=config.hardware)
 
     differentiation = differentiation_from_reference(
         reference_contract, rate_real=config.rate_hz, probe_top_real=0.0,
@@ -358,7 +384,8 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
                                sg_window=differentiation["sg_window"], sg_poly=differentiation["sg_poly"])
 
     # RR_12 C-2a: standstill-based checks from the identification holds.
-    holds = standstill_holds(config, run_dir, bundle)
+    holds = [to_model_torque_sign(h, n_dof=n_dof, hardware=config.hardware)
+             for h in standstill_holds(config, run_dir, bundle)]
     hold_frames = [iiwa_dataset_frame(h, n_dof=n_dof, sg_window=differentiation["sg_window"],
                                       sg_poly=differentiation["sg_poly"], time_step=time_step) for h in holds]
     sign = sign_convention_check(config, [h[[f"ft{j}" for j in range(n_dof)]].to_numpy(dtype=float) for h in holds],
@@ -376,7 +403,8 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
     }
     contract = real_contract(
         manifest, hardware=config.hardware, n_dof=n_dof, target_instrument="iiwa_joint_torque_sensor_raw",
-        target_semantics="joint torque sensor, raw, gravity included [Nm]",
+        target_semantics=("joint torque sensor, raw, gravity included [Nm]"
+                          + ("; KUKA sign negated to the model convention" if config.hardware == "real" else "")),
         q_side="motor", dq_side="motor", dq_source="position_derivative",
         tau_instrument="fri_commanded_torque",
         controller={"location": "drive", "vendor": "kuka_position_control", "model_free": False,
@@ -404,7 +432,12 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
         effort_limit=arrays["effort"], bag_digests=bag_digests, plan_digests=plan_digests,
         session_health=check_session_health_iiwa(session_windows),
         identification_freshness=not_applicable("identification freshness", config.robot),
-        reference_tracking=_mock_tracking_note(config, check_reference_tracking(tracking, commanded_tolerance=1e-6)),
+        # Lab 2026-10-14: erd_iiwa's CommandRetimer deliberately moves the
+        # command sent to FRI onto the robot clock (up to v x 3 ms off the
+        # JTC output), so commanded vs plan is reported, not judged -- as on
+        # the UR. Plan fidelity is judged on the JTC output (1e-9 rad).
+        reference_tracking=_mock_tracking_note(config, check_reference_tracking(
+            tracking, commanded_tolerance=1e-6, commanded_report_only=True)),
         envelopes=check_envelopes(frame, n_dof=n_dof, effort_limit=arrays["effort"],
                                   sg_window=differentiation["sg_window"], sg_poly=differentiation["sg_poly"],
                                   time_step=time_step),
