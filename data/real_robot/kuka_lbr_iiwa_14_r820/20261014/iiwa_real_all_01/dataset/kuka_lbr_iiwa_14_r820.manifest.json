@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "n_dof": 7,
+  "joint_names": [
+    "iiwa_A1",
+    "iiwa_A2",
+    "iiwa_A3",
+    "iiwa_A4",
+    "iiwa_A5",
+    "iiwa_A6",
+    "iiwa_A7"
+  ],
+  "signals": {
+    "target": "link_torque",
+    "target_source": "measured",
+    "target_kind": "joint_torque_sensor"
+  },
+  "differentiation": {
+    "sg_window": 5,
+    "sg_poly": 3
+  },
+  "split": "test",
+  "sample_time_step": 0.001,
+  "noise": {
+    "dq": {
+      "source": "position_derivative"
+    }
+  }
+}

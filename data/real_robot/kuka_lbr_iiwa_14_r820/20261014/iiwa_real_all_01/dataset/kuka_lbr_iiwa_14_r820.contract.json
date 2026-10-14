@@ -1,0 +1,107 @@
+{
+  "schema": "elastic_sim.identification/3",
+  "source": "real",
+  "n_dof": 7,
+  "input_columns": [
+    "q0..q6",
+    "dq0..dq6",
+    "tau0..tau6"
+  ],
+  "target_columns": [
+    "ft0..ft6"
+  ],
+  "target_kind": "per_joint_torque",
+  "target_instrument": "iiwa_joint_torque_sensor_raw",
+  "target_semantics": "joint torque sensor, raw, gravity included [Nm]; KUKA sign negated to the model convention",
+  "target_source": "measured",
+  "target_clean_column": null,
+  "inputs": {
+    "q": {
+      "side": "motor",
+      "measured": true
+    },
+    "dq": {
+      "side": "motor",
+      "measured": true,
+      "source": "position_derivative"
+    },
+    "tau": {
+      "kind": "commanded_motor_torque",
+      "noise_free": true,
+      "instrument": "fri_commanded_torque"
+    }
+  },
+  "controller": {
+    "location": "drive",
+    "vendor": "kuka_position_control",
+    "model_free": false,
+    "reference": "jtc_quintic",
+    "command_latency_cycles": 1
+  },
+  "differentiation": {
+    "sample_rate_hz": 1000.0,
+    "sg_window": 5,
+    "sg_poly": 3,
+    "sg_cutoff_hz": 90.0,
+    "reference_cutoff_hz": 90.0,
+    "reference_sample_rate_hz": 1000.0,
+    "cutoff_matched": true,
+    "window_floored": false,
+    "probe_top_hz": 0.0,
+    "derived_from": "data/identification/r6-full-20260929-0049/iiwa_drive/kuka_lbr_iiwa_14_r820_table_round6_drive.contract.json#sha256:c64f7aef2e1e0f4625c1fea7d72ef052f8e045a0e09b257c2ebf04225bb5ea25"
+  },
+  "split": "test",
+  "noise": null,
+  "friction_split": null,
+  "baselines": {
+    "statistic": "median over bags of the per-bag value (mirrors elastic_sim.diagnostics.bag_diagnostics's T-2 block and scripts/diagnose_controller_modes.add_baselines_to_contract), computed on the recorded state -- there is no separate link-side state on a real recording",
+    "splits": {
+      "all": {
+        "n_bags": 10,
+        "target_rms": 22.98485875626733,
+        "baseline_rms_mean": 22.44377992078656,
+        "baseline_rms_tau": 0.7700569434815057,
+        "baseline_rms_state": 0.700280271440515,
+        "baseline_rms_state_tau": 0.6371885872585806,
+        "baseline_rms_rigid": 3.53889456945074,
+        "link_friction_share": null,
+        "noise_share": null,
+        "differentiation_share": null
+      },
+      "test": {
+        "n_bags": 10,
+        "target_rms": 22.98485875626733,
+        "baseline_rms_mean": 22.44377992078656,
+        "baseline_rms_tau": 0.7700569434815057,
+        "baseline_rms_state": 0.700280271440515,
+        "baseline_rms_state_tau": 0.6371885872585806,
+        "baseline_rms_rigid": 3.53889456945074,
+        "link_friction_share": null,
+        "noise_share": null,
+        "differentiation_share": null
+      }
+    }
+  },
+  "real": {
+    "hardware": "real",
+    "robot_id": "kuka_lbr_iiwa_14_r820",
+    "sunrise_version": "1.11.0.7",
+    "safety_vendor_checksum": "7FC64B2D",
+    "reference": {
+      "path": "data/identification/r6-full-20260929-0049/iiwa_drive/kuka_lbr_iiwa_14_r820_table_round6_drive.contract.json",
+      "sha256": "c64f7aef2e1e0f4625c1fea7d72ef052f8e045a0e09b257c2ebf04225bb5ea25",
+      "asset": "kuka_lbr_iiwa_14_r820_table",
+      "synthetic": false,
+      "arm_check": {
+        "ok": true,
+        "reference_asset": "kuka_lbr_iiwa_14_r820_table",
+        "sim_asset": "kuka_lbr_iiwa_14_r820",
+        "compared": "joint names, types/axes, placements of joints 2..n, link inertias",
+        "problems": []
+      }
+    }
+  },
+  "contract_owner": "pending RR_02 CR-4",
+  "requires_consumer": "dynamic_model_nn dataset.py with the general ft0..ft{dof-1} branch",
+  "reference_synthetic": false
+}
