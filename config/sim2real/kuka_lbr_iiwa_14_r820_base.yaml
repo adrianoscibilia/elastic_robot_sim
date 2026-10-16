@@ -1,0 +1,20 @@
+# Shared base for the iiwa sim-to-real stages (S2R_01 §7, §9).
+# Stage configs (iiwa_s0_static.yaml ... iiwa_s4_twin.yaml) extend this file.
+# The parameter priors (S2R_01 §5 table) are added with the registry (T-2.1).
+schema: elastic_sim.sim2real/1
+asset: kuka_lbr_iiwa_14_r820
+plant_base: config/identification/kuka_lbr_iiwa_14_r820_table_round6_drive.yaml
+runs:
+  A:
+    path: data/real_robot/kuka_lbr_iiwa_14_r820/20261014/iiwa_real_all_01
+    sha256: b277535927041656978b4316ddffe79440e3cfb10e11cf2f1dc17259dffa7cfd
+  B:
+    path: data/real_robot/kuka_lbr_iiwa_14_r820/20261014/iiwa_fast_all_01
+    sha256: 9174356701f0d4b6756cf0585508b83446769b95f5f54c81f00546431279552d
+segments: [excitation, identify_excitation, hold]
+# Primary split (D-7 recommendation: B train -> A test).
+split:
+  train: ["B:excitation_[0-6]", "B:identify_hold_*", "A:identify_hold_*"]
+  val: ["B:excitation_[7-9]", "B:identify_excitation_0"]
+  test: ["A:excitation_*", "A:identify_excitation_0"]
+output: data/sim2real/kuka_lbr_iiwa_14_r820
