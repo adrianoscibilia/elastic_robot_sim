@@ -9,6 +9,7 @@ the joint's inertia, so the config never states a damping value.
 """
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -931,6 +932,11 @@ class DatasetConfig:
     #: is still made over the whole tier list, so a bag here is the bag of the
     #: full build.  The gain-shift file is the test robots this way (Sec 7).
     only_tiers: tuple[str, ...] | None = None
+    #: FR_04 D-2: ``transmission_priors.burn_in_override_s``, the contract's
+    #: ``burn_in_s`` in place of the Sec 3.1 rule's (``None``: the rule).  0
+    #: where every bag starts at rest and in static equilibrium (FMRR), so the
+    #: filter's quasi-static initial condition is exact at the bag start.
+    burn_in_override_s: float | None = None
 
     @property
     def is_round6(self) -> bool:
@@ -1240,6 +1246,22 @@ def _gate_spec(raw: Mapping[str, Any] | None, source: Path) -> GateSpec:
     )
 
 
+def _burn_in_override(block: Any, source: Path) -> float | None:
+    """``transmission_priors.burn_in_override_s`` (FR_04 D-2): a non-negative number of seconds, or absent."""
+    if block is None:
+        return None
+    if not isinstance(block, Mapping):
+        raise ValueError(f"transmission_priors in {source} must be a mapping")
+    _check_keys(block, {"burn_in_override_s"}, "transmission_priors", source)
+    value = block.get("burn_in_override_s")
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"transmission_priors.burn_in_override_s in {source} must be >= 0 s, got {value}")
+    return value
+
+
 def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig:
     """Read a YAML identification config into a :class:`DatasetConfig`.
 
@@ -1260,7 +1282,7 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
             "`transmission` block (see config/identification/kuka_lbr_iiwa_14_r820_table.yaml)"
         )
     known = {"schema_version", "asset", "backends", "rigid_reference", "transmission", "comparison",
-             "excitation", "dataset", "simulation", "visualization", "payload", "gates"}
+             "excitation", "dataset", "simulation", "visualization", "payload", "gates", "transmission_priors"}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown keys in {source}: {', '.join(unknown)}")
@@ -1489,6 +1511,7 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
         ),
         noise=_noise_model(sim_cfg.get("noise"), source),
         gates=_gate_spec(raw.get("gates"), source),
+        burn_in_override_s=_burn_in_override(raw.get("transmission_priors"), source),
         probe_design=_probe_design(exc_cfg.get("probe_design"), exc_cfg, source),
         auto_time_steps=tuple(key for key in ("max_time_step", "rigid_time_step")
                               if str(sim_cfg.get(key, "")).strip().lower() == "auto"),

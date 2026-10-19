@@ -71,9 +71,25 @@ def test_round7_configs_differ_from_round6_only_in_payload_mode_and_output(varia
     r7, r6 = (yaml.safe_load((_REPO / path).read_text(encoding="utf-8")) for path in R7[variant])
     assert r7["payload"].pop("mode") == "none"
     assert r7["dataset"].pop("output") != r6["dataset"].pop("output")
+    # FR_04 D-2: the FMRR burn-in override, a contract-only block; the arms keep the rule.
+    override = r7.pop("transmission_priors", None)
+    assert override == ({"burn_in_override_s": 0.0} if variant == "fmrr" else None)
     assert r7 == r6
     config = load_config(_REPO / R7[variant][0], check_bounds=False)
     assert config.payload.mode == "none" and config.payload.enabled
+    assert config.burn_in_override_s == (0.0 if variant == "fmrr" else None)
+
+
+def test_burn_in_override_parses(tmp_path):
+    raw = yaml.safe_load((_REPO / R6).read_text(encoding="utf-8"))
+    assert load_config(_REPO / R6, check_bounds=False).burn_in_override_s is None
+    raw["transmission_priors"] = {"burn_in_override_s": 2.5}
+    assert load_config(_write(tmp_path, raw), check_bounds=False).burn_in_override_s == 2.5
+    for bad, match in (({"burn_in_override_s": -1.0}, ">= 0"), ({"burn_in": 0.0}, "unknown transmission_priors"),
+                       ([0.0], "mapping")):
+        raw["transmission_priors"] = bad
+        with pytest.raises(ValueError, match=match):
+            load_config(_write(tmp_path, raw), check_bounds=False)
 
 
 def test_attached_payload_by_mode():
@@ -200,7 +216,16 @@ def test_transmission_priors_are_the_filter_side_ranges(tmp_path):
     assert np.allclose(first["mode_frequency_hz_range"], np.sqrt(k[:, 0] / m[0]) / (2 * np.pi))
     assert first["units"]["stiffness"] == "N/m" and first["damping_ratio_declared"] == [0.4, 1.2]
     f_min = float(np.sqrt(4000.0 / 70.0) / (2 * np.pi))
-    assert priors["burn_in_s"] == burn_in_seconds(0.05, f_min)
+    assert priors["burn_in_s"] == priors["burn_in_rule_s"] == burn_in_seconds(0.05, f_min)
+    assert priors["burn_in_override_s"] is None and priors["burn_in_source"] == "rule"
+    # FR_04 D-2: the config's override replaces burn_in_s; the rule's value stays beside it.
+    overridden = transmission_priors(manifest, asset, burn_in_override_s=0.0)
+    assert (overridden["burn_in_s"], overridden["burn_in_override_s"]) == (0.0, 0.0)
+    assert overridden["burn_in_rule_s"] == priors["burn_in_s"] and "static equilibrium" in overridden["burn_in_source"]
+    assert {k: v for k, v in overridden.items() if not k.startswith("burn_in")} == \
+        {k: v for k, v in priors.items() if not k.startswith("burn_in")}
+    with pytest.raises(ValueError, match="burn_in_override_s"):
+        transmission_priors(manifest, asset, burn_in_override_s=-0.1)
     robots[0].pop("plant_link_inertia_median")
     with pytest.raises(ValueError, match="plant_link_inertia_median"):
         transmission_priors(manifest, asset)
@@ -291,3 +316,66 @@ def test_contract_blocks_and_cross_test_fixture(fmrr_builds):
     sse = ((fixture["tau_s_diagonal_trapezoidal"][kept] - fixture["target"][kept]) ** 2).sum(axis=0)
     assert np.allclose(table["rigid_elastic_oracle_sse"].iloc[0], sse, rtol=1e-12)
     assert isinstance(pd.DataFrame(table), pd.DataFrame)
+
+
+@pytest.mark.slow
+def test_contract_carries_the_burn_in_override(fmrr_builds, tmp_path):
+    """FR_04 D-2: a config override of 0 reaches the contract and the masked baselines keep every row."""
+    import shutil
+
+    from elastic_sim.round7 import augment_contract
+
+    asset, builds = fmrr_builds
+    source, frame, manifest = builds["none"]
+    path = tmp_path / source.name
+    shutil.copy(source, path)
+    shutil.copy(source.with_suffix(".contract.json"), path.with_suffix(".contract.json"))
+    augment_contract(path, frame, manifest, asset, burn_in_override_s=0.0, fixture=False)
+    contract = json.loads(path.with_suffix(".contract.json").read_text(encoding="utf-8"))
+    priors = contract["transmission_priors"]
+    assert (priors["burn_in_s"], priors["burn_in_override_s"]) == (0.0, 0.0)
+    assert priors["burn_in_rule_s"] == transmission_priors(manifest, asset)["burn_in_s"] > 0
+    block = contract["baselines"]["two_mass"]
+    assert block["exclude_head_s"] == 0.0
+    for split in block["splits"].values():
+        assert split["n_rows"] == split["n_rows_unmasked"] > 0                 # 100 % of the rows kept
+
+
+def _taufree_inputs(tmp_path, burn_in_s, joints):
+    contract = {"transmission_priors": {
+        "sample_time_step": 0.004, "burn_in_s": burn_in_s, "burn_in_rule_s": 8.25,
+        "joints": [{"joint": f"j{i}", "stiffness_range": [1e3, 4e3], "damping_ratio_range": zeta}
+                   for i, zeta in enumerate(joints)]},
+        "baselines": {"two_mass": {"splits": {"train": {"n_bags": 2, "n_rows_unmasked": 5002}}}}}
+    chain = {"defaults": {"epochs": 300}, "runs": [
+        {"base_name": name, "class_path": f"{name}.LagrangianNN",
+         "model_kwargs": {"kan_hidden_dim": 4} if name.startswith("kalnn") else {}}
+        for name in ("lnn_tau_res", "kalnn_tau_res", "lnn_tau_elastic", "kalnn_tau_elastic")]}
+    (tmp_path / "contract.json").write_text(json.dumps(contract), encoding="utf-8")
+    (tmp_path / "chain.yaml").write_text(yaml.safe_dump(chain), encoding="utf-8")
+    return tmp_path / "contract.json", tmp_path / "chain.yaml"
+
+
+def test_taufree_chain_sets_zeta_max_history_and_whole_bag_windows(tmp_path, capsys):
+    import launch_helpers
+
+    contract, src = _taufree_inputs(tmp_path, 0.0, [[0.05, 0.16], [0.1, 0.32], [0.45, 1.08]])
+    out = tmp_path / "chain-taufree.yaml"
+    launch_helpers.taufree_chain(str(src), str(out), str(tmp_path / "d.parquet"), str(contract), "300", "30",
+                                 "full", "lnn_twomass kalnn_twomass lnn_res_hist lnn_tau_res", "0")
+    runs = {r["base_name"]: r.get("model_kwargs", {}) for r in yaml.safe_load(out.read_text())["runs"]}
+    for name in ("lnn_twomass", "kalnn_twomass"):
+        # FR_04 D-3: max(1.5 x prior zeta_hi, 1.0) per joint.
+        assert runs[name]["zeta_max"] == pytest.approx([1.0, 1.0, 1.62])
+        assert runs[name]["burn_in_s"] == 0.0 and "window_s" not in runs[name]   # D-2: whole bags
+        assert runs[name]["integrator"] == "trapezoidal"
+    assert runs["lnn_res_hist"]["history_s"] == 8.25 and "zeta_max" not in runs["lnn_res_hist"]
+    assert "zeta_max" not in runs["lnn_tau_res"] and "burn_in_s" not in runs["lnn_tau_res"]
+    assert launch_helpers.taufree_zeta_max({"joints": [{"damping_ratio_range": [0.2, 0.8]}]}) == pytest.approx([1.2])
+    # The coupling benchmark's spec: a zero burn-in times a whole train bag (5002 / 2 rows).
+    capsys.readouterr()
+    launch_helpers.taufree_spec(str(contract), "1024")
+    assert capsys.readouterr().out.strip() == "3:0.004:0:1:10.004"
+    contract, _ = _taufree_inputs(tmp_path, 1.65, [[0.05, 0.16]])
+    launch_helpers.taufree_spec(str(contract), "1024")
+    assert capsys.readouterr().out.strip() == "1:0.004:1.65:4:2.65"

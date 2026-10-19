@@ -6,7 +6,8 @@
 * ``transmission_priors`` (S-3): per joint, the stiffness prior of the
   manifest's ``transmission_sampling``, and the damping-ratio and mode
   frequency ranges over the dataset's robots, in the terms of the FR_04 Sec 0
-  filter (see :func:`transmission_priors`); plus the burn-in they give.
+  filter (see :func:`transmission_priors`); plus the burn-in they give, or the
+  config's ``transmission_priors.burn_in_override_s`` (FR_04 D-2).
 * ``baselines.two_mass`` (S-4): ``rigid_elastic_nominal`` and
   ``rigid_elastic_oracle`` per split, on the rows the consumer scores
   (each bag's first ``burn_in_s`` excluded), with the filter of
@@ -60,7 +61,8 @@ def _units(asset: Any) -> list[dict[str, str]]:
     return out
 
 
-def transmission_priors(manifest: Mapping[str, Any], asset: Any) -> dict[str, Any]:
+def transmission_priors(manifest: Mapping[str, Any], asset: Any, *,
+                        burn_in_override_s: float | None = None) -> dict[str, Any]:
     """The ``transmission_priors`` block (FR_04 S-3), from the manifest only.
 
     Stiffness: the declared prior, ``stiffness_nominal`` x ``stiffness_factor``.
@@ -76,6 +78,12 @@ def transmission_priors(manifest: Mapping[str, Any], asset: Any) -> dict[str, An
     (``*_declared``, ``*_manifest``) but do not describe the filter: on the
     FMRR y axis the declared ``zeta`` is 0.4-1.2 while the filter's is
     0.05-0.16 (FR_04 implementation report).
+
+    ``burn_in_s`` is the Sec 3.1 rule's (``burn_in_rule_s``, always written)
+    unless ``burn_in_override_s`` is given (the config's
+    ``transmission_priors.burn_in_override_s``, FR_04 D-2): 0 where every bag
+    starts at rest and in static equilibrium, so the filter's quasi-static
+    initial condition is exact at the bag start and no head needs masking.
     """
     names = list(manifest["joint_names"])
     n = len(names)
@@ -97,7 +105,10 @@ def transmission_priors(manifest: Mapping[str, Any], asset: Any) -> dict[str, An
     if nominal.size != n:
         raise ValueError("transmission_sampling.stiffness_nominal is needed for the stiffness prior")
     zeta_min, f_min = float(zeta.min()), float(frequency.min())
-    burn_in = burn_in_seconds(zeta_min, f_min)
+    burn_in_rule = burn_in_seconds(zeta_min, f_min)
+    if burn_in_override_s is not None and not burn_in_override_s >= 0.0:
+        raise ValueError(f"burn_in_override_s must be >= 0 s, got {burn_in_override_s}")
+    burn_in = burn_in_rule if burn_in_override_s is None else float(burn_in_override_s)
     units = _units(asset)
     joints = []
     for j, name in enumerate(names):
@@ -133,6 +144,11 @@ def transmission_priors(manifest: Mapping[str, Any], asset: Any) -> dict[str, An
         "frequency_min_hz": f_min,
         "burn_in_s": burn_in,
         "burn_in_rule": "max(3 / (zeta_min 2 pi f_min), 2 / f_min), rounded up to 0.05 s (FR_04 Sec 3.1)",
+        "burn_in_rule_s": burn_in_rule,
+        "burn_in_override_s": None if burn_in_override_s is None else float(burn_in_override_s),
+        "burn_in_source": ("rule" if burn_in_override_s is None else
+                           "config transmission_priors.burn_in_override_s (FR_04 D-2: every bag starts at rest "
+                           "and in static equilibrium, so the quasi-static initial condition is exact)"),
         "sample_time_step": float(manifest["sample_time_step"]),
     }
 
@@ -284,17 +300,20 @@ def baseline_block(table: pd.DataFrame, priors: Mapping[str, Any], *, coupling: 
 
 
 def augment_contract(output: Path, frame: pd.DataFrame, manifest: Mapping[str, Any], asset: Any, *,
-                     priors: Mapping[str, Any] | None = None, fixture: bool = True) -> dict[str, Any]:
+                     priors: Mapping[str, Any] | None = None, fixture: bool = True,
+                     burn_in_override_s: float | None = None) -> dict[str, Any]:
     """Write S-2, S-3 and S-4 into ``output``'s contract; return the priors used.
 
     ``priors`` given (the production file's) keeps a gain-shift twin on the
-    same burn-in and prior; otherwise they are computed from ``manifest``.
+    same burn-in and prior; otherwise they are computed from ``manifest``
+    (with ``burn_in_override_s``, the config's, in place of the rule's).
     With ``fixture``, the first elastic test bag's filter inputs and outputs go
     to ``<stem>.two_mass_reference.npz`` for the consumer's cross-test.
     """
     contract_path = output.with_suffix(".contract.json")
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    priors = dict(priors) if priors is not None else transmission_priors(manifest, asset)
+    priors = (dict(priors) if priors is not None
+              else transmission_priors(manifest, asset, burn_in_override_s=burn_in_override_s))
     first = None
     if fixture:
         bags = frame.groupby("bag", sort=False)[["split", "tier"]].first()

@@ -17,7 +17,8 @@ Writes, under ``--out-dir`` (default ``REFACTOR_SPECS/final_results``):
   run's own coupling and integrator, named in ``baseline_filter``), ``test_rmse_unmasked``;
 * ``data/model_comparison_taufree_summary.csv``: mean, sd, min, max per (variant, class);
 * ``data/taufree_qe.csv``: Q-E per (variant, two-mass class, seed, joint): corr and RMSE of the
-  latent deflection against the simulator's, learned K and zeta, the test robots' true K, the prior;
+  latent deflection against the simulator's, learned K and zeta, the test robots' true K and true
+  filter zeta, the prior, zeta's bounds (``zeta_high`` = the class's ``zeta_max``, FR_04 D-3);
 * ``data/taufree_s1_budget.csv``: the S-1 checks and the r7 budget per variant;
 * ``figures/taufree_fig1_rmse_vs_rigid.png``, ``taufree_fig2_per_joint_nrmse.png``,
   ``taufree_fig3_gain_vs_elastic_content.png``.
@@ -138,7 +139,14 @@ def variant_rows(run: Path, variant: str) -> tuple[list[dict], list[dict]]:
                        "true_K_max": _float(test, f"true_K_max_joint_{j}"),
                        "prior_K_low": _float(test, f"prior_K_low_joint_{j}"),
                        "prior_K_high": _float(test, f"prior_K_high_joint_{j}"),
-                       "learned_zeta": _float(test, f"learned_zeta_joint_{j}")})
+                       "learned_zeta": _float(test, f"learned_zeta_joint_{j}"),
+                       # FR_04 D-3: zeta's bounds (zeta_max above the prior) and the true filter zeta.
+                       "zeta_low": _float(test, f"zeta_low_joint_{j}"),
+                       "zeta_high": _float(test, f"zeta_high_joint_{j}"),
+                       "prior_zeta_high": _float(test, f"prior_zeta_high_joint_{j}"),
+                       "true_zeta_mean": _float(test, f"true_zeta_mean_joint_{j}"),
+                       "true_zeta_min": _float(test, f"true_zeta_min_joint_{j}"),
+                       "true_zeta_max": _float(test, f"true_zeta_max_joint_{j}")})
     return rows, qe
 
 

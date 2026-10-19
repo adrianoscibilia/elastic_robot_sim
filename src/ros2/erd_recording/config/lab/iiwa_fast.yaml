@@ -72,7 +72,7 @@ limits:                                 # inside KUKA's axis limits
     iiwa_A4: 1.0                        # 76 % of A4's 1.31 rad/s, the tightest axis
     iiwa_A5: 1.5
     iiwa_A6: 1.5
-    iiwa_A7: 1.5
+    iiwa_A7: 1.5 
   acceleration:                         # FAST: was 1.5 / 2.0
     iiwa_A1: 4.0
     iiwa_A2: 4.0

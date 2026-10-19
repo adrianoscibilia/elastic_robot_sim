@@ -114,7 +114,8 @@ def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs
         report["file"] = str(output)
         if taufree:
             # FR_04 S-2..S-4; a gain-shift twin takes the production file's priors (one burn-in per variant).
-            priors = augment_contract(output, frame, manifest, asset, priors=priors, fixture=variant == "production")
+            priors = augment_contract(output, frame, manifest, asset, priors=priors, fixture=variant == "production",
+                                      burn_in_override_s=config.burn_in_override_s)
             report["transmission_priors_burn_in_s"] = priors["burn_in_s"]
     return {"report": report, "manifest": manifest, "priors": priors}
 

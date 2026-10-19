@@ -7,6 +7,11 @@
 # collision geometry; the plant just carries no payload body.  The comments
 # below are round 6's, unchanged.
 #
+# FR_04 D-2 adds the transmission_priors block (contract only, the build is
+# unaffected): every FMRR bag starts at rest and in static equilibrium, so the
+# two-mass filter's quasi-static initial condition is exact at the bag start
+# and the contract's burn-in is 0 instead of the Sec 3.1 rule's 8.25 s.
+#
 # Round-6 production config for the FMRR Tecnobody gantry (R6_00).
 #
 # The soft member of the round-6 family; see
@@ -47,6 +52,10 @@ payload:
   offset_z: [-1.11, -1.04]
   size: [0.05, 0.15]
   per: robot
+
+transmission_priors:
+  # FR_04 D-2: the contract's burn_in_s (the rule's value stays as burn_in_rule_s).
+  burn_in_override_s: 0.0
 
 comparison:
   q_link_rms: 1.0e-4

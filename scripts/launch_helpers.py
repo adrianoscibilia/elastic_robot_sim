@@ -19,7 +19,7 @@ FR_03 retrain (``scripts/round6_retrain.sh``):
 
 FR_04 torque-free comparison (``scripts/round7_taufree.sh``):
 
-    launch_helpers.py taufree_spec SOURCE [BATCH]   # n:h:burn_in:windows of a variant, from an r7 contract or r6 manifest
+    launch_helpers.py taufree_spec SOURCE [BATCH]   # n:h:burn_in:windows:window_s of a variant, from an r7 contract or r6 manifest
     launch_helpers.py taufree_chain R6_CHAIN OUT_YAML DATASET CONTRACT EPOCHS PATIENCE COUPLING CLASSES SEED...
     launch_helpers.py taufree_classes PREFLIGHT_RUN PLAN_JSON   # the class list after the 72 h rule (Sec 3.5)
     launch_helpers.py retrain_plan PREFLIGHT_RUN PLAN_JSON [PARALLEL]   # with "summary_stem": "taufree"
@@ -484,6 +484,14 @@ TAUFREE_CLASSES = {
 #: The 72 h rule (FR_04 Sec 3.5): drop the optional rows first, then classes 7-8.
 TAUFREE_DROPS = (("kalnn_res_hist", "kalnn_elastic_qdq"), ("lnn_elastic_qdq", "kalnn_elastic_qdq"))
 TAUFREE_BUDGET_S = 72 * 3600
+#: FR_04 D-3: the two-mass classes' zeta upper bound, max(factor x prior zeta_hi, floor) per joint.
+TAUFREE_ZETA_MAX_FACTOR, TAUFREE_ZETA_MAX_FLOOR = 1.5, 1.0
+
+
+def taufree_zeta_max(priors: dict) -> list[float]:
+    """Per joint ``max(1.5 x damping_ratio_range[1], 1.0)``: the damping a two-mass class may buy (FR_04 D-3)."""
+    return [max(TAUFREE_ZETA_MAX_FACTOR * float(j["damping_ratio_range"][1]), TAUFREE_ZETA_MAX_FLOOR)
+            for j in priors["joints"]]
 
 
 def _taufree_priors(source: str) -> dict:
@@ -504,11 +512,23 @@ def _taufree_priors(source: str) -> dict:
 
 
 def taufree_spec(source: str, batch: str = "256") -> int:
-    """``name:n_dof:time_step:burn_in_s:windows`` for benchmark_twomass_coupling.py (windows from BATCH samples)."""
+    """``n_dof:time_step:burn_in_s:windows:window_s`` for benchmark_twomass_coupling.py (windows from BATCH samples).
+
+    The window is the classes' training window: ``burn_in_s + 1`` s, or with a
+    zero burn-in (FR_04 D-2) the whole bag, its length the contract's mean
+    train-bag row count.
+    """
     priors = _taufree_priors(source)
     step, burn_in = float(priors["sample_time_step"]), float(priors["burn_in_s"])
-    windows = max(1, int(round(int(batch) / round(1.0 / step))))
-    print(f"{len(priors['joints'])}:{step:g}:{burn_in:g}:{windows}")
+    if burn_in > 0.0:
+        window_s, loss_samples = burn_in + 1.0, round(1.0 / step)
+    else:
+        splits = json.loads(Path(source).read_text(encoding="utf-8"))["baselines"]["two_mass"]["splits"]
+        train = splits.get("train") or splits["all"]
+        loss_samples = int(round(train["n_rows_unmasked"] / train["n_bags"]))
+        window_s = loss_samples * step
+    windows = max(1, int(round(int(batch) / loss_samples)))
+    print(f"{len(priors['joints'])}:{step:g}:{burn_in:g}:{windows}:{window_s:g}")
     return 0
 
 
@@ -521,7 +541,11 @@ def taufree_chain(src: str, out: str, dataset: str, contract: str, epochs: str, 
 
     Every class inherits its hyperparameters (``training_overrides``, KAN
     kwargs) from the round-6 chain entry FR_04 names; the sequence classes get
-    the contract's per-joint priors, the sample step and the burn-in.
+    the contract's per-joint priors, the sample step and the burn-in.  With a
+    zero burn-in (FR_04 D-2) no ``window_s`` is set: each bag is one window
+    from its first sample.  The two-mass classes get ``zeta_max`` (FR_04 D-3,
+    :func:`taufree_zeta_max`); the history controls keep the rule's burn-in as
+    their receptive field (``history_s``), whatever the contract's burn-in.
     """
     import yaml
 
@@ -535,7 +559,8 @@ def taufree_chain(src: str, out: str, dataset: str, contract: str, epochs: str, 
     sequence_kwargs = {"time_step": float(priors["sample_time_step"]), "burn_in_s": float(priors["burn_in_s"])}
     prior_kwargs = {"stiffness_range": [j["stiffness_range"] for j in priors["joints"]],
                     "damping_ratio_range": [j["damping_ratio_range"] for j in priors["joints"]],
-                    "coupling": coupling, "integrator": integrator}
+                    "zeta_max": taufree_zeta_max(priors), "coupling": coupling, "integrator": integrator}
+    history_kwargs = {"history_s": float(priors.get("burn_in_rule_s", priors["burn_in_s"]))}
     runs = []
     for name in [c for c in classes.replace(",", " ").split() if c]:
         if name not in TAUFREE_CLASSES:
@@ -548,7 +573,7 @@ def taufree_chain(src: str, out: str, dataset: str, contract: str, epochs: str, 
         if extra.get("priors"):
             kwargs.update(sequence_kwargs, **prior_kwargs)
         if extra.get("window"):
-            kwargs.update(sequence_kwargs)
+            kwargs.update(sequence_kwargs, **history_kwargs)
         if "observer_inputs" in extra:
             kwargs["observer_inputs"] = extra["observer_inputs"]
         run = {"base_name": name, "class_path": class_path,
@@ -561,7 +586,8 @@ def taufree_chain(src: str, out: str, dataset: str, contract: str, epochs: str, 
     header = f"# generated by launch_helpers.py taufree_chain from {src} (FR_04 S-5) -- do not hand-edit\n"
     Path(out).write_text(header + yaml.safe_dump({"defaults": defaults, "runs": runs}, sort_keys=False),
                          encoding="utf-8")
-    print(f"{out}: {len(runs)} classes x seeds {list(defaults['seeds'])}, burn-in {priors['burn_in_s']} s, "
+    print(f"{out}: {len(runs)} classes x seeds {list(defaults['seeds'])}, burn-in {priors['burn_in_s']} s "
+          f"(history {history_kwargs['history_s']} s), zeta_max {prior_kwargs['zeta_max']}, "
           f"coupling {coupling}, integrator {integrator}")
     return 0
 
