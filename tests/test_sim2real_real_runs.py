@@ -260,8 +260,15 @@ def test_refuses_plan_whose_coefficients_disagree_with_its_samples(run_copy):
     plan_path.write_text(json.dumps(plan))
     manifest_path = run_copy / "plan" / "plan.manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["segments"][0]["digest"] = MaterializedTrajectory.load(plan_path).digest()
+    digest = MaterializedTrajectory.load(plan_path).digest()
+    manifest["segments"][0]["digest"] = digest
     manifest_path.write_text(json.dumps(manifest))
+    events_path = run_copy / "events.json"
+    events = json.loads(events_path.read_text())
+    for event in events:
+        if event["segment_id"] == "excitation_0":
+            event["plan_digest"] = digest
+    events_path.write_text(json.dumps(events))
     with pytest.raises(RealRunError, match="analytic evaluator differs"):
         load_real_run(run_copy, sidecar=False)
 
@@ -283,7 +290,14 @@ def test_sidecar_matches_every_row_through_duplicates_and_sign(synthetic_run, tm
         np.testing.assert_array_equal(bag.ipo, rows[[f"ipo_position{j}" for j in range(N)]].to_numpy())
         np.testing.assert_array_equal(bag.external, -rows[[f"external_effort{j}" for j in range(N)]].to_numpy())
         np.testing.assert_array_equal(bag.ft, -rows[[f"ft{j}" for j in range(N)]].to_numpy())
-        assert max(entry["tracking"]["max_abs_q_minus_ipo_rad"]) < 1e-5
+        assert max(entry["tracking"]["max_abs_q_minus_cmd_rad"]) < 1e-5
+        # S2R_04 A-10: ipo is kept as a column but is in no check or summary.
+        assert not any("ipo" in key for key in entry["tracking"])
+        # N-1b: the synthetic command changes on every cycle.
+        assert entry["command_cadence"]["changed_fraction"] == pytest.approx(1.0, abs=0.01)
+        assert entry["command_cadence"]["median_identical_rows"] == 1.0
+    assert not any("ipo" in key for key in run.sidecar["summary"]["tracking"])
+    assert run.sidecar["summary"]["command_cadence"]["bags"] == 3
     cycles = np.concatenate([b.fri_cycle for b in run.bags[:2]])
     assert cycles.min() < 2 ** 31 < cycles.max() or True  # wrap handled by _cycle_steps
 
@@ -293,7 +307,7 @@ def test_identification_segments_and_hold_checks(synthetic_run, tmp_path):
     ident = run.bag("identify_excitation_0")
     entry = run.sidecar["bags"]["identify_excitation_0"]
     assert ident.n_rows == len(ident.plan.time) and entry["consecutive_cycles"]
-    assert entry["latency_cycles"] == LATENCY and entry["latency_ok"]
+    assert entry["latency_cycles"] == LATENCY and entry["latency_ok"] and entry["plan_lag"]["cycles"] == 0
     np.testing.assert_allclose(ident.ipo, ident.plan.position, atol=0)
     holds = [b for b in run.bags if b.kind == "hold"]
     assert all(h.n_rows == 1001 for h in holds)  # 1501 plan samples - 0.5 s
@@ -327,6 +341,34 @@ def test_match_block_is_exact_and_reports_ambiguity():
     assert match_block(repeated, haystack[:2]) == [0, 4]
 
 
+def test_refine_window_is_bagio_find_segment_start():
+    """S2R_02 F-2: the re-implemented rule is erd_recording's argmax."""
+    bagio_dir = _REPO / "src" / "ros2" / "erd_recording"
+    if not (bagio_dir / "erd_recording" / "bagio.py").is_file():
+        pytest.skip("erd_recording source not present")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_bagio", bagio_dir / "erd_recording" / "bagio.py")
+    bagio = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(bagio)
+    except ImportError as error:
+        pytest.skip(f"bagio needs {error.name}")
+    from elastic_sim.sim2real.real_runs import refine_window
+
+    rng = np.random.default_rng(3)
+    for trial in range(20):
+        plan = np.cumsum(rng.normal(size=(400, N)), axis=0)
+        delay = int(rng.integers(0, 300))
+        commanded = np.vstack([np.tile(plan[0], (100 + delay, 1)), plan, np.tile(plan[-1], (200, 1))])
+        commanded = commanded + 1e-3 * rng.normal(size=commanded.shape)
+        raw = pd.DataFrame({f"commanded_position{j}": commanded[:, j] for j in range(N)})
+        window = (100, 500)
+        start = refine_window(raw, window, plan, N, pad_samples=60)
+        padded = raw.iloc[40:min(len(raw), 560)].to_numpy().sum(axis=1)
+        assert start == 40 + bagio.find_segment_start(padded, plan.sum(axis=1))
+
+
 # ---------------------------------------------------------------------------
 # The real runs A and B (FR_05 numbers); skipped unless the full folders exist.
 # ---------------------------------------------------------------------------
@@ -339,8 +381,12 @@ REAL = {
 }
 #: FR_05 §6, run A's holds.
 FR05_SIGMA_FT_A = [0.0097, 0.013, 0.0052, 0.0076, 0.0031, 0.0034, 0.0013]
-#: FR_05 §3: max |q - reference| over the excitations.
+#: FR_05 §3: max |q - reference| over the excitations (the monitor's own
+#: reference; reported alongside, not asserted: S2R_02 F-1).
 FR05_MAX_TRACKING = {"A": 4.6e-3, "B": 11.5e-3}
+#: S2R_04 N-3: regression guard on max |q - cmd| per run, 1.05 x the
+#: S2R_03 §3.2 values (not a physical limit).
+MAX_Q_MINUS_CMD = {"A": 1.05 * 1.16e-3, "B": 1.05 * 2.70e-3}
 
 
 def _real_run(run_id: str):
@@ -359,10 +405,25 @@ def test_real_run_sidecar(run_id):
     for bag in excitations:
         entry = run.sidecar["bags"][bag.bag]
         assert entry["matched_rows"] == bag.n_rows == 10001 and entry["consecutive_cycles"]
-    worst = max(run.sidecar["summary"]["tracking"]["max_abs_q_minus_ipo_rad"])
-    assert worst <= FR05_MAX_TRACKING[run_id] * 1.05
+    # S2R_04 N-1/N-3: the reference is the command echo; FR_05 §3's max |e|
+    # uses the monitor's own reference and is printed alongside only.
+    tracking = run.sidecar["summary"]["tracking"]
+    worst = max(tracking["max_abs_q_minus_cmd_rad"])
+    cadence = run.sidecar["summary"]["command_cadence"]
+    print(f"\n{run_id}: max |q - cmd| {worst:.4g} rad, "
+          f"max |q - plan| {max(tracking['max_abs_q_minus_plan_rad']):.4g} rad "
+          f"(FR_05 §3: {FR05_MAX_TRACKING[run_id]:.4g}); command cadence: changed on "
+          f"{cadence['changed_fraction']:.4f} of rows, longest identical run {cadence['longest_identical_rows']}")
+    assert worst <= MAX_Q_MINUS_CMD[run_id]
+    # S2R_02 F-2: identify_excitation's cross-correlated window puts the
+    # command echo on its plan with the excitations' lag, within one cycle.
+    # (The event-to-command latency is printed only: the event stamps jitter
+    # by tens of cycles between segments.)
     ident = run.sidecar["bags"]["identify_excitation_0"]
-    assert ident["latency_ok"]
+    print(f"{run_id}: identify_excitation_0 event latency {ident['latency_cycles']} cycles "
+          f"({ident['latency_vs_excitation_cycles']:+.1f} vs the excitations' median), "
+          f"plan lag {ident['plan_lag']['cycles']} ({ident['plan_lag_vs_excitation_cycles']:+.1f})")
+    assert abs(ident["plan_lag_vs_excitation_cycles"]) <= 1.0 and ident["latency_ok"]
 
 
 @pytest.mark.slow

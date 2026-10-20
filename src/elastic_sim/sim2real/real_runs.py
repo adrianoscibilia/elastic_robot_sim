@@ -8,7 +8,11 @@ it into :class:`ReplayBag` s:
 * **excitation** bags come from the dataset: row k = plan sample k = FRI
   cycle k of the window (``convert_cli`` aligned and de-duplicated them);
 * the **sidecar** attaches what only ``raw.parquet`` carries (``ipo_position``,
-  the command echo, the external torque, ``fri_cycle``). The window start
+  the command echo, the external torque, ``fri_cycle``). ``ipo_position`` is
+  FRI's ``ipoJointPosition``: with the session run as an overlay on a Sunrise
+  ``PositionHold`` it is the overlay's *base* motion, the held ``home`` pose,
+  not the setpoint. It is kept as a column but never used as a tracking
+  reference (S2R_04 N-1, A-10); the reference is the command echo. The window start
   isn't stored, but the dataset copies ``q`` and ``-ft`` bit for bit from the
   raw stream, so the 10,001 consecutive raw rows that match exactly identify it;
 * **identify_excitation** and **hold** bags come from
@@ -39,7 +43,9 @@ from .config import REPO_ROOT
 
 BagKind = Literal["excitation", "identify_excitation", "hold"]
 
-SIDECAR_SCHEMA = "elastic_sim.sim2real.sidecar/1"
+#: /2: tracking vs cmd echo and plan, plan lag; /3: ipo dropped from every
+#: check and summary (S2R_04 A-10), command cadence (N-1b), hold sigma(q).
+SIDECAR_SCHEMA = "elastic_sim.sim2real.sidecar/3"
 DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "sim2real" / "cache"
 #: ``convert_cli.KUKA_TORQUE_SIGN_REAL``: raw.parquet keeps KUKA's torque
 #: sign; the dataset (and every bag here) is in the model convention.
@@ -50,6 +56,8 @@ SEGMENT_PAD_S = 0.5
 #: FR_05 §6 / ``convert_cli.standstill_holds``: holds drop their first 0.5 s.
 HOLD_SKIP_S = 0.5
 PLAN_ANALYTIC_TOLERANCE = 1e-9
+#: Search range of the command-echo vs plan lag (cycles).
+PLAN_LAG_RANGE = 8
 _SIDECAR_CHANNELS = ("ipo_position", "commanded_position", "external_effort")
 
 
@@ -69,7 +77,7 @@ class ReplayBag:
     dq: np.ndarray                     # (N, n) SG derivative of q
     tau_cmd: np.ndarray                # (N, n) KUKA commanded torque
     ft: np.ndarray                     # (N, n) joint torque sensor
-    ipo: np.ndarray | None = None      # (N, n) KUKA's interpolated setpoint
+    ipo: np.ndarray | None = None      # (N, n) FRI ipoJointPosition: the overlay base (held pose), not a reference
     cmd_echo: np.ndarray | None = None  # (N, n) FRI command echo
     external: np.ndarray | None = None  # (N, n) external torque, model sign
     fri_cycle: np.ndarray | None = None  # (N,)
@@ -233,7 +241,11 @@ def _load_plan_segment(path: Path, plans: Mapping[str, Mapping[str, Any]], name:
 
     asset = AssetRegistry.for_repository().load(run.sim_asset)
     step = float(plan.time[1] - plan.time[0])
-    rebuilt = trajectory_from_metadata(asset, dict(plan.metadata), time_step=step)
+    metadata = dict(plan.metadata)
+    scale = metadata.pop("ladder_scale", None)
+    rebuilt = trajectory_from_metadata(asset, metadata, time_step=step)
+    if scale is not None:
+        rebuilt = _ladder_scaled(rebuilt, float(scale))
     if rebuilt.position.shape != plan.position.shape:
         raise RealRunError(f"{path}: plan/{name}.json has {plan.position.shape} samples, its coefficients "
                            f"rebuild {rebuilt.position.shape}")
@@ -242,6 +254,31 @@ def _load_plan_segment(path: Path, plans: Mapping[str, Mapping[str, Any]], name:
         raise RealRunError(f"{path}: plan/{name}.json analytic evaluator differs from its samples by "
                            f"{error:.3g} rad (> {PLAN_ANALYTIC_TOLERANCE:g})")
     return dataclasses.replace(plan, analytic=rebuilt.analytic)
+
+
+class _LadderEvaluator:
+    """``erd_recording.planning.ladder_scale_trajectory`` on the analytic
+    signal: q = c + s(q_base - c), velocity and acceleration times s, with c
+    the per-joint mean of the base trajectory's samples."""
+
+    def __init__(self, base, centre: np.ndarray, scale: float):
+        self.base, self.centre, self.scale = base, centre, scale
+
+    def __call__(self, t: float):
+        q, dq, ddq = self.base(t)
+        return self.centre + self.scale * (np.asarray(q) - self.centre), self.scale * np.asarray(dq), \
+            self.scale * np.asarray(ddq)
+
+
+def _ladder_scaled(base: MaterializedTrajectory, scale: float) -> MaterializedTrajectory:
+    """The ladder-scaled plan (identify_excitation_* carry ``ladder_scale``),
+    rebuilt from its base excitation with the analytic evaluator kept."""
+    centre = base.position.mean(axis=0)
+    return dataclasses.replace(
+        base, position=centre + scale * (base.position - centre), velocity=scale * base.velocity,
+        acceleration=None if base.acceleration is None else scale * base.acceleration,
+        metadata={**base.metadata, "ladder_scale": scale},
+        analytic=None if base.analytic is None else _LadderEvaluator(base.analytic, centre, scale))
 
 
 def _check_event_digests(events_path: Path, plans: Mapping[str, Mapping[str, Any]]) -> None:
@@ -336,12 +373,13 @@ def build_sidecar(run: RealRun) -> tuple[list[pd.DataFrame], dict[str, Any]]:
         if not consecutive or t_error > 1e-9:
             raise RealRunError(f"{run.path}: bag {bag.bag}: matched rows aren't consecutive FRI cycles "
                                f"(consecutive={consecutive}, max |t - cycle/rate| = {t_error:.3g} s)")
-        ipo = _block(window, "ipo_position", n)
+        cmd = _block(window, "commanded_position", n)
         entry = {"kind": "excitation", "source": "raw.parquet",
                  "raw_index": [int(window.index[0]), int(window.index[-1])],
                  "fri_cycle": [int(cycles[0]), int(cycles[-1])],
                  "rows": int(bag.n_rows), "matched_rows": int(bag.n_rows), "consecutive_cycles": consecutive,
-                 "tracking": _tracking(bag.q, ipo)}
+                 "tracking": _tracking(bag.q, cmd, bag.plan.position), "command_cadence": command_cadence(cmd)}
+        entry["plan_lag"] = plan_lag(cmd, bag.plan.position)
         latency = _event_latency(events, bag.bag, stamps, raw["fri_cycle"].to_numpy(dtype=np.int64), cycles[0])
         if latency is not None:
             entry["latency_cycles"] = latency
@@ -353,16 +391,28 @@ def build_sidecar(run: RealRun) -> tuple[list[pd.DataFrame], dict[str, Any]]:
         frames.append(frame)
         entries[name] = entry
 
-    summary = {"tracking": _run_tracking(frames, entries, n)}
+    summary = {"tracking": _run_tracking(frames, entries, n), "command_cadence": _run_cadence(entries)}
     latencies = [e["latency_cycles"] for e in entries.values() if e["kind"] == "excitation" and "latency_cycles" in e]
     if latencies:
         summary["excitation_latency_cycles"] = {"median": float(np.median(latencies)), "min": int(min(latencies)),
                                                 "max": int(max(latencies))}
-        for name, entry in entries.items():
-            if entry["kind"] == "identify_excitation" and "latency_cycles" in entry:
-                delta = entry["latency_cycles"] - float(np.median(latencies))
-                entry["latency_vs_excitation_cycles"] = delta
-                entry["latency_ok"] = bool(abs(delta) <= 1.0)
+    lags = [e["plan_lag"]["cycles"] for e in entries.values() if e["kind"] == "excitation"]
+    if lags:
+        summary["excitation_plan_lag_cycles"] = {"median": float(np.median(lags)), "min": int(min(lags)),
+                                                 "max": int(max(lags))}
+    for name, entry in entries.items():
+        if entry["kind"] != "identify_excitation":
+            continue
+        if latencies and "latency_cycles" in entry:
+            # Event-to-command latency: recorded, not a check (the events'
+            # stamps jitter by tens of cycles between segments).
+            entry["latency_vs_excitation_cycles"] = entry["latency_cycles"] - float(np.median(latencies))
+        if lags:
+            # The alignment check (T-1.3, S2R_02 F-2): the refined window puts
+            # the command echo on the plan with the excitations' lag (+-1).
+            delta = entry["plan_lag"]["cycles"] - float(np.median(lags))
+            entry["plan_lag_vs_excitation_cycles"] = delta
+            entry["latency_ok"] = bool(abs(delta) <= 1.0)
     holds = [f for f in frames if f["kind"].iat[0] == "hold"]
     if holds:
         summary["holds"] = hold_checks(holds, run)
@@ -414,10 +464,14 @@ def _identification_bags(run: RealRun) -> dict[str, tuple[str, pd.DataFrame, dic
         entry: dict[str, Any] = {"kind": kind, "source": "identification/raw.parquet",
                                  "events_raw_index": [lo, hi]}
         if kind == "identify_excitation":
-            start = refine_window(raw, (lo, hi), plan.position, n, pad_samples=pad)
-            entry["latency_cycles"] = int(all_cycles[start] - all_cycles[lo])
-            first = int(np.searchsorted(unique.index.to_numpy(), start))
+            # Refined on the de-duplicated stream: a republished FRI state
+            # inside the padded bracket would shift the correlation by a row.
+            # Without duplicates this is convert_cli._refine_window exactly.
+            u_lo, u_hi = (int(i) for i in np.searchsorted(unique.index.to_numpy(), [lo, hi]))
+            first = refine_window(unique, (u_lo, u_hi), plan.position, n, pad_samples=pad)
+            entry["latency_cycles"] = int(_cycle_steps(np.array([all_cycles[lo], unique["fri_cycle"].iat[first]]))[0])
             window = unique.iloc[first:first + n_plan]
+            entry["plan_lag"] = plan_lag(_block(window, "commanded_position", n), plan.position)
         else:
             first = int(np.searchsorted(unique.index.to_numpy(), lo))
             last = int(np.searchsorted(unique.index.to_numpy(), hi))
@@ -437,7 +491,10 @@ def _identification_bags(run: RealRun) -> dict[str, tuple[str, pd.DataFrame, dic
         t = (cycles - cycles[0]) / run.rate_hz
         q = _block(window, "q", n)
         dq = savgol_filter(q, sg_window, sg_poly, deriv=1, delta=1.0 / run.rate_hz, axis=0, mode="interp")
-        entry["tracking"] = _tracking(q, _block(window, "ipo_position", n))
+        cmd = _block(window, "commanded_position", n)
+        entry["tracking"] = _tracking(q, cmd, plan.position if kind == "identify_excitation" else None)
+        if kind == "identify_excitation":
+            entry["command_cadence"] = command_cadence(cmd)
         frame = _bag_frame(name, kind, t, q, dq, sign * _block(window, "tau", n), sign * _block(window, "ft", n),
                            window, n, sign)
         result[name] = (kind, frame, entry)
@@ -446,10 +503,11 @@ def _identification_bags(run: RealRun) -> dict[str, tuple[str, pd.DataFrame, dic
 
 def refine_window(raw: pd.DataFrame, window: tuple[int, int], plan_position: np.ndarray, n_dof: int, *,
                   pad_samples: int) -> int:
-    """Start row of a segment, by cross-correlating its plan with the
-    ``commanded_position`` echo (sum over joints, de-meaned) over the events
-    bracket padded by ``pad_samples``: ``convert_cli._refine_window`` +
-    ``bagio.find_segment_start``."""
+    """Start row (positional) of a segment, by cross-correlating its plan with
+    the ``commanded_position`` echo (sum over joints, de-meaned) over the
+    events bracket padded by ``pad_samples``: ``convert_cli._refine_window`` +
+    ``bagio.find_segment_start`` (the same argmax; a test checks it against
+    ``bagio`` when the ROS package source is present)."""
     start, end = window
     padded_start = max(0, start - pad_samples)
     padded_end = min(len(raw), end + pad_samples)
@@ -461,6 +519,20 @@ def refine_window(raw: pd.DataFrame, window: tuple[int, int], plan_position: np.
     return padded_start + int(np.argmax(correlation))
 
 
+def plan_lag(cmd: np.ndarray, plan: np.ndarray, max_lag: int = PLAN_LAG_RANGE) -> dict[str, float]:
+    """The shift s (cycles, |s| <= max_lag) minimising RMS(cmd[k + s] - plan[k])
+    over the overlap: 0 means row k of the window carries plan sample k's
+    command. Returns the lag, its RMS and the RMS at lag 0 (rad)."""
+    cmd, plan = np.asarray(cmd, dtype=float), np.asarray(plan, dtype=float)
+    rms = {}
+    for shift in range(-max_lag, max_lag + 1):
+        a = cmd[max(shift, 0):len(cmd) + min(shift, 0)]
+        b = plan[max(-shift, 0):len(plan) + min(-shift, 0)]
+        rms[shift] = float(np.sqrt(np.mean((a - b) ** 2)))
+    best = min(rms, key=rms.get)
+    return {"cycles": int(best), "rms_rad": rms[best], "rms_at_zero_rad": rms[0]}
+
+
 def hold_checks(holds: Sequence[pd.DataFrame], run: RealRun) -> dict[str, Any]:
     """FR_05 §6 standstill checks on the hold bags: sigma(ft) (linear-detrended
     per hold, mean over holds, as ``validate.noise_table``) and the per-joint
@@ -469,20 +541,21 @@ def hold_checks(holds: Sequence[pd.DataFrame], run: RealRun) -> dict[str, Any]:
     from ..assets import AssetRegistry
 
     n = run.n_dof
-    sigmas = []
+    sigmas, sigmas_q = [], []
     for frame in holds:
-        values = _block(frame, "ft", n)
-        t = np.arange(len(values), dtype=float)
+        t = np.arange(len(frame), dtype=float)
         design = np.column_stack([t, np.ones_like(t)])
-        coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
-        sigmas.append(np.std(values - design @ coefficients, axis=0))
+        for prefix, store in (("ft", sigmas), ("q", sigmas_q)):
+            values = _block(frame, prefix, n)
+            coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
+            store.append(np.std(values - design @ coefficients, axis=0))
     pin, model, data = idn.build_model(AssetRegistry.for_repository().load(run.sim_asset))
     measured = np.vstack([_block(f, "ft", n) for f in holds])
     gravity = np.vstack([np.asarray([pin.computeGeneralizedGravity(model, data, row).copy()
                                      for row in _block(f, "q", n)]) for f in holds])
     slope, intercept, r2 = _linear_fit(measured, gravity)
     return {"n_holds": len(holds), "rows": [int(len(f)) for f in holds],
-            "sigma_ft": np.mean(sigmas, axis=0).tolist(),
+            "sigma_ft": np.mean(sigmas, axis=0).tolist(), "sigma_q": np.mean(sigmas_q, axis=0).tolist(),
             "gravity_slope": slope.tolist(), "gravity_intercept": intercept.tolist(), "gravity_r2": r2.tolist(),
             "statistic": "sigma: linear-detrended per hold, mean over holds; slope: ft = a * g(q) + b per joint, "
                          "all hold samples stacked (first 0.5 s of each hold dropped)"}
@@ -530,21 +603,63 @@ def _bag_from_frame(rows: pd.DataFrame, run: RealRun, name: str, kind: BagKind, 
                      plan=plan, digests={"plan": digest, "dataset_sha256": run.dataset_sha256})
 
 
-def _tracking(q: np.ndarray, ipo: np.ndarray) -> dict[str, list[float]]:
-    error = q - ipo
-    return {"rms_q_minus_ipo_rad": np.sqrt(np.mean(error ** 2, axis=0)).tolist(),
-            "max_abs_q_minus_ipo_rad": np.max(np.abs(error), axis=0).tolist()}
+def _tracking(q: np.ndarray, cmd: np.ndarray, plan: np.ndarray | None = None) -> dict[str, list[float]]:
+    """Per-joint RMS and max of q against the FRI command echo (the R2
+    reference, S2R_04 A-10) and (row k = plan sample k) the plan. FR_05 §3's
+    "max |e|" is the monitor's error against its own reference, so neither is
+    that number (S2R_02 F-1, S2R_04 N-3). ``ipo_position`` is the overlay base
+    and is never a reference."""
+    result = {}
+    for name, reference in (("cmd", cmd), ("plan", plan)):
+        if reference is None:
+            continue
+        error = q - reference
+        result[f"rms_q_minus_{name}_rad"] = np.sqrt(np.mean(error ** 2, axis=0)).tolist()
+        result[f"max_abs_q_minus_{name}_rad"] = np.max(np.abs(error), axis=0).tolist()
+    return result
 
 
 def _run_tracking(frames: Iterable[pd.DataFrame], entries: Mapping[str, Any], n: int) -> dict[str, Any]:
     excitation = [f for f in frames if f["kind"].iat[0] == "excitation"]
-    error = np.vstack([_block(f, "q", n) - _block(f, "ipo", n) for f in excitation])
-    worst = max(entries.items(), key=lambda item: max(item[1]["tracking"]["max_abs_q_minus_ipo_rad"])
+    worst = max(entries.items(), key=lambda item: max(item[1]["tracking"]["max_abs_q_minus_cmd_rad"])
                 if item[1]["kind"] == "excitation" else -1.0)
-    return {"excitation_bags": len(excitation),
-            "rms_q_minus_ipo_rad": np.sqrt(np.mean(error ** 2, axis=0)).tolist(),
-            "max_abs_q_minus_ipo_rad": np.max(np.abs(error), axis=0).tolist(),
-            "worst_bag": worst[0]}
+    result: dict[str, Any] = {"excitation_bags": len(excitation)}
+    error = np.vstack([_block(f, "q", n) - _block(f, "cmd", n) for f in excitation])
+    result["rms_q_minus_cmd_rad"] = np.sqrt(np.mean(error ** 2, axis=0)).tolist()
+    result["max_abs_q_minus_cmd_rad"] = np.max(np.abs(error), axis=0).tolist()
+    plan_max = [e["tracking"]["max_abs_q_minus_plan_rad"] for e in entries.values()
+                if e["kind"] == "excitation" and "max_abs_q_minus_plan_rad" in e["tracking"]]
+    if plan_max:
+        result["max_abs_q_minus_plan_rad"] = np.max(plan_max, axis=0).tolist()
+    result["worst_bag"] = worst[0]
+    return result
+
+
+def command_cadence(cmd: np.ndarray) -> dict[str, float]:
+    """How often the FRI command echo changes (S2R_04 N-1b): the fraction of
+    rows (consecutive cycles) where any joint's command differs from the
+    previous row, and the run lengths of identical rows. A command every
+    cycle gives 1.0 and runs of 1; receive multiplier 5 gives 0.2 and 5."""
+    cmd = np.asarray(cmd, dtype=float)
+    changed = np.any(np.diff(cmd, axis=0) != 0.0, axis=1)
+    edges = np.flatnonzero(np.concatenate([[True], changed, [True]]))
+    runs = np.diff(edges)
+    return {"changed_fraction": float(changed.mean()) if len(changed) else 0.0,
+            "longest_identical_rows": int(runs.max()), "median_identical_rows": float(np.median(runs)),
+            "rows": int(len(cmd))}
+
+
+def _run_cadence(entries: Mapping[str, Any]) -> dict[str, Any]:
+    cadences = [e["command_cadence"] for e in entries.values() if "command_cadence" in e]
+    if not cadences:
+        return {}
+    rows = sum(c["rows"] for c in cadences)
+    return {"bags": len(cadences),
+            "changed_fraction": float(sum(c["changed_fraction"] * (c["rows"] - 1) for c in cadences)
+                                      / max(1, rows - len(cadences))),
+            "changed_fraction_min": float(min(c["changed_fraction"] for c in cadences)),
+            "longest_identical_rows": int(max(c["longest_identical_rows"] for c in cadences)),
+            "median_identical_rows": float(np.median([c["median_identical_rows"] for c in cadences]))}
 
 
 def _event_bracket(events: Sequence[Mapping[str, Any]], segment_id: str):
@@ -559,7 +674,7 @@ def _event_latency(events, segment_id, stamps, cycles, start_cycle) -> int | Non
     if bracket is None:
         return None
     lo = int(np.searchsorted(stamps, bracket[0]["stamp_ns"]))
-    return int(start_cycle - cycles[min(lo, len(cycles) - 1)])
+    return int(_cycle_steps(np.array([cycles[min(lo, len(cycles) - 1)], start_cycle]))[0])
 
 
 def _cycle_steps(cycles: np.ndarray) -> np.ndarray:

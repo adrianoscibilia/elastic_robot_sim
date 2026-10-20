@@ -1,0 +1,21 @@
+# S0, static (S2R_01 §9, S2R_04 P3-8, S2R_06 P4a-3): R0 on the holds and the
+# quasi-static excitation rows (every |dq| < 0.05 rad/s, |ddq| < 0.2 rad/s^2).
+# Question: where is the missing gravity (FR_05 F-2)? Target (not a gate):
+# hold slopes A2/A4 = 1.00 +- 0.02 on both runs (from 1.14 / 1.17).
+# Split: the base's A-13 split (B trains, A's holds zero A's sensor, A tests).
+schema: elastic_sim.sim2real/1
+extends: kuka_lbr_iiwa_14_r820_base.yaml
+replay:
+  mode: R0
+  r0: {rows: quasi_static}
+parameters:
+  free: ["inertial.*.mass", "inertial.*.com_*", "sensor.ft.*.offset@*"]
+# S2R_06 F-1: lambda = 0.01 / N (the prior is a tie-breaker).
+loss:
+  prior_weight_factor: 0.01
+# S2R_06 F-6: S0 is a warm start; it takes the optimizer's end point (val is
+# 136 friction-dominated rows here and stopped at evaluation 2 in P-3).
+selection: end_point
+optimizer:
+  method: least_squares
+  budget: 50        # Jacobian evaluations

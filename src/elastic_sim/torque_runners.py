@@ -38,6 +38,33 @@ TorqueLaw = Callable[[float, np.ndarray, np.ndarray], "TorqueCommand"]
 
 
 @dataclass(frozen=True)
+class InitialState:
+    """Opt-in start state of a MuJoCo rollout (sim2real S2R_01 T-3.1).
+
+    Passed as ``initial_state=`` to :func:`run_mujoco_torque` and
+    :func:`run_mujoco_elastic_torque`; ``None`` there (the default) is the
+    historical start, bit for bit: the motor at the trajectory's ``(q, dq)``
+    at ``t = 0``, no deflection, the link moving with the motor. A ``None``
+    field here keeps that field's historical value.
+
+    * ``q_motor``, ``dq_motor``: the motor (rigid runner: the joint) state.
+    * ``deflection`` (elastic runner only): ``delta = theta_motor - q_link``
+      per joint, so a linear spring transmits ``tau_s = K delta``; either an
+      array or a callable ``(mujoco, model, data, indices) -> delta``
+      evaluated on the built model with the motor state already written
+      (``indices``: ``motor_qpos``, ``motor_dof``, ``elastic_qpos``,
+      ``elastic_dof`` integer arrays), e.g. a static equilibrium.
+    * ``dq_link`` (elastic runner only): the link velocity; default the
+      motor's.
+    """
+
+    q_motor: np.ndarray | None = None
+    dq_motor: np.ndarray | None = None
+    deflection: Any = None
+    dq_link: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
 class TorqueCommand:
     """One controller evaluation, split so its parts stay auditable."""
 
@@ -463,8 +490,15 @@ def run_mujoco_torque(
     extras: "PlantExtras | None" = None,
     instrument: Any = None,
     implicit_friction: bool = False,
+    initial_state: InitialState | None = None,
+    model_setup: Callable[[Any, Any], None] | None = None,
 ) -> dict[str, Any]:
     """Integrate ``asset`` under an injected joint torque in MuJoCo.
+
+    ``initial_state`` (:class:`InitialState`, its motor fields only) and
+    ``model_setup`` (``(mujoco, model) -> None``, called once after the build,
+    before the data is made: e.g. in-memory inertials) are sim2real's opt-in
+    hooks (S2R_01 T-3.1, T-2.2); ``None`` keeps today's rollout bit for bit.
 
     ``control_decimation`` evaluates the controller every ``N`` physics steps
     and holds the applied torque between updates (zero-order hold, as a real
@@ -507,8 +541,10 @@ def run_mujoco_torque(
     dof_idx = np.asarray([dof for _, dof in active], dtype=int)
     if armature is not None:
         model.dof_armature[dof_idx] = np.asarray(armature, dtype=float)
+    if model_setup is not None:
+        model_setup(mujoco, model)
     data = mujoco.MjData(model)
-    if armature is not None:
+    if armature is not None or model_setup is not None:
         mujoco.mj_setConst(model, data)
     effort_limit = np.asarray(
         [joint.effort if joint.effort is not None else np.inf for joint in asset.resolve_active_joints()],
@@ -525,6 +561,11 @@ def run_mujoco_torque(
     live_friction = not getattr(controller, "compensates_friction", True)
 
     q0, dq0, _ = trajectory(0.0)
+    if initial_state is not None:
+        if initial_state.deflection is not None or initial_state.dq_link is not None:
+            raise ValueError("a rigid rollout has no deflection: InitialState.deflection/dq_link must be None")
+        q0 = q0 if initial_state.q_motor is None else np.asarray(initial_state.q_motor, dtype=float)
+        dq0 = dq0 if initial_state.dq_motor is None else np.asarray(initial_state.dq_motor, dtype=float)
     data.qpos[qpos_idx] = q0
     data.qvel[dof_idx] = dq0
     mujoco.mj_forward(model, data)
@@ -1129,8 +1170,16 @@ def run_mujoco_elastic_torque(
     extras: "PlantExtras | None" = None,
     instrument: Any = None,
     implicit_friction: bool = False,
+    initial_state: InitialState | None = None,
+    model_setup: Callable[[Any, Any], None] | None = None,
 ) -> dict[str, Any]:
     """Torque-driven rollout of a series-elastic chain in MuJoCo.
+
+    ``initial_state`` (:class:`InitialState`: motor state, deflection, link
+    velocity) and ``model_setup`` (``(mujoco, model) -> None``, called once
+    after the build and the transmission's stiffness/damping/armature, before
+    the data is made) are sim2real's opt-in hooks (S2R_01 T-3.1, T-2.2);
+    ``None`` keeps today's rollout bit for bit.
 
     The motor torque is injected on the motor joint; the transmission spring
     is MuJoCo's own zero-reference joint stiffness on the elastic joint.
@@ -1183,6 +1232,8 @@ def run_mujoco_elastic_torque(
         model.jnt_stiffness[addresses[name]["elastic_joint_id"]] = transmission.stiffness[index]
         model.dof_damping[addresses[name]["elastic_dof"]] = transmission.damping[index]
         model.dof_armature[addresses[name]["motor_dof"]] = transmission.rotor_inertia[index]
+    if model_setup is not None:
+        model_setup(mujoco, model)
     data = mujoco.MjData(model)
     mujoco.mj_setConst(model, data)
 
@@ -1202,8 +1253,13 @@ def run_mujoco_elastic_torque(
     live_friction = not getattr(controller, "compensates_friction", True)
 
     q0, dq0, _ = trajectory(0.0)
-    data.qpos[motor_qpos_idx] = q0
-    data.qvel[motor_dof_idx] = dq0
+    if initial_state is None:
+        data.qpos[motor_qpos_idx] = q0
+        data.qvel[motor_dof_idx] = dq0
+    else:
+        _set_elastic_initial_state(mujoco, model, data, initial_state, q0, dq0, {
+            "motor_qpos": motor_qpos_idx, "motor_dof": motor_dof_idx,
+            "elastic_qpos": elastic_qpos_idx, "elastic_dof": elastic_dof_idx})
     mujoco.mj_forward(model, data)
 
     grid = np.arange(0.0, trajectory.duration + 0.5 * time_step, time_step)
@@ -1314,6 +1370,26 @@ def run_mujoco_elastic_torque(
         ddq=np.asarray(rows["ddq"], dtype=float),
         extra=extra,
     )
+
+
+def _set_elastic_initial_state(mujoco: Any, model: Any, data: Any, state: InitialState, q0: np.ndarray,
+                               dq0: np.ndarray, indices: Mapping[str, np.ndarray]) -> None:
+    """Write :class:`InitialState` into the elastic chain's coordinates: the
+    motor joint carries ``theta``, the elastic joint ``e = q_link - theta =
+    -delta``."""
+    q_motor = q0 if state.q_motor is None else np.asarray(state.q_motor, dtype=float)
+    dq_motor = dq0 if state.dq_motor is None else np.asarray(state.dq_motor, dtype=float)
+    data.qpos[indices["motor_qpos"]] = q_motor
+    data.qvel[indices["motor_dof"]] = dq_motor
+    data.qpos[indices["elastic_qpos"]] = 0.0
+    data.qvel[indices["elastic_dof"]] = 0.0
+    deflection = state.deflection
+    if callable(deflection):
+        deflection = deflection(mujoco, model, data, indices)
+    if deflection is not None:
+        data.qpos[indices["elastic_qpos"]] = -np.asarray(deflection, dtype=float)
+    if state.dq_link is not None:
+        data.qvel[indices["elastic_dof"]] = np.asarray(state.dq_link, dtype=float) - dq_motor
 
 
 def run_newton_elastic_torque(

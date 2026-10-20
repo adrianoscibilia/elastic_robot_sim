@@ -1,0 +1,27 @@
+# Gate G-2a (S2R_04 P3-6): the twin experiment, R0 part. Synthetic bags are
+# made by R0 itself on run B's recorded states at a known theta* (masses
+# +-15 %, COM +-2 cm, link friction x[0.5, 2], B offsets +-0.5 N m) with
+# FR_05 §6 noise measured on B's holds; LS then calibrates S1's free set and
+# the A-12' label marks what the data cannot separate (G-2a', S2R_08 §2.2:
+# five seeds, 20261019, 7, 11, 3, 5; scripts/sim2real/twin.py runs all five).
+# A is not used: its offsets are excluded from the free set (A-13).
+schema: elastic_sim.sim2real/1
+extends: kuka_lbr_iiwa_14_r820_base.yaml
+split:
+  train: ["B:excitation_[0-6]", "B:identify_hold_*"]
+  val: ["B:excitation_[7-9]", "B:identify_excitation_0"]
+  zero: []
+  test: []
+replay:
+  mode: R0
+  r0: {rows: all}
+parameters:
+  free: ["inertial.*.mass", "inertial.*.com_*", "inertial.*.inertia_scale",
+         "friction.link.*.*", "sensor.ft.*.offset@*", "sensor.ft.*.gain"]
+# S2R_06 F-1: lambda = 0.01 / N (the prior is a tie-breaker).
+loss:
+  prior_weight_factor: 0.01
+optimizer:
+  method: least_squares
+  budget: 50
+  seed: 20261019     # theta* and the noise draw

@@ -51,8 +51,32 @@ def test_split_globs_assign_bags():
     assert split.split_of("B", "excitation_3") == "train"
     assert split.split_of("B", "excitation_8") == "val"
     assert split.split_of("A", "excitation_8") == "test"
-    assert split.split_of("A", "identify_hold_2") == "train"
+    assert split.split_of("B", "identify_hold_2") == "train"
+    assert split.split_of("A", "identify_hold_2") == "zero"  # S2R_06 A-13: A's session zero
     assert split.split_of("A", "approach_0") is None
+    assert split.runs_of("train", ("A", "B")) == ("B",) and split.runs_of("zero", ("A", "B")) == ("A",)
+
+
+def test_selection_and_identifiability_keys(tmp_path):
+    config = load_config(_stage(tmp_path, selection="end_point", identifiability={"d_post_min": 0.8}))
+    assert config.selection == "end_point"
+    assert config.identifiability.d_post_min == 0.8 and config.identifiability.mode == "label"
+    assert not config.identifiability.freeze_then_refit
+    assert load_config(BASE).selection == "val" and load_config(BASE).identifiability.d_post_min == 0.9
+    assert load_config(BASE).identifiability.mode == "label" and load_config(BASE).identifiability.partner_min == 0.5
+    # S2R_08: the S2R_06 switch maps onto mode, with a deprecation note.
+    with pytest.warns(DeprecationWarning, match="freeze_then_refit"):
+        legacy = load_config(_stage(tmp_path, identifiability={"freeze_then_refit": True}))
+    assert legacy.identifiability.mode == "freeze_refit" and legacy.identifiability.freeze_then_refit
+    with pytest.warns(DeprecationWarning):
+        assert load_config(_stage(tmp_path, identifiability={"freeze_then_refit": False})).identifiability.mode == \
+            "label"
+    with pytest.raises(ConfigError, match="mode"):
+        load_config(_stage(tmp_path, identifiability={"mode": "freeze"}))
+    with pytest.raises(ConfigError, match="selection"):
+        load_config(_stage(tmp_path, selection="test"))
+    with pytest.raises(ConfigError, match="d_post_min"):
+        load_config(_stage(tmp_path, identifiability={"d_post_min": 1.5}))
 
 
 def test_bag_in_two_splits_is_refused(tmp_path):

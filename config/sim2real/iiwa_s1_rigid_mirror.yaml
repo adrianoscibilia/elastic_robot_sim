@@ -1,0 +1,10 @@
+# S1 mirror (S2R_01 §9 mirror split, S2R_06 A-13): A trains, B's holds zero
+# B's sensor, B tests; the prior is the mirror S0's result.
+schema: elastic_sim.sim2real/1
+extends: iiwa_s1_rigid.yaml
+prior_from: data/sim2real/kuka_lbr_iiwa_14_r820/iiwa_s0_static_mirror/best.yaml
+split:
+  train: ["A:excitation_[0-6]", "A:identify_hold_*"]
+  val: ["A:excitation_[7-9]", "A:identify_excitation_0"]
+  zero: ["B:identify_hold_*"]
+  test: ["B:excitation_*", "B:identify_excitation_0"]

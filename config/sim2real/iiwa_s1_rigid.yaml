@@ -1,0 +1,23 @@
+# S1, dynamic rigid + link friction (S2R_01 §9, S2R_04 P3-8, S2R_06 P4a-3):
+# R0 on every training row; S0's result is the prior mean (prior_from) (and,
+# in identifiability mode freeze_refit only, S2R_06 A-12's freeze value).
+# Question: how much of the real torque does a physical rigid model with
+# link friction explain, out of regime? Targets (not gates): test RMSE on A
+# <= 1.5 N m (nominal rigid 3.54), stretch <= 1.05; A1 NRMSE < 1.
+schema: elastic_sim.sim2real/1
+extends: kuka_lbr_iiwa_14_r820_base.yaml
+prior_from: data/sim2real/kuka_lbr_iiwa_14_r820/iiwa_s0_static/best.yaml
+replay:
+  mode: R0
+  r0: {rows: all}
+parameters:
+  free: ["inertial.*.mass", "inertial.*.com_*", "inertial.*.inertia_scale",
+         "friction.link.*.*", "sensor.ft.*.offset@*", "sensor.ft.*.gain"]
+# S2R_06 F-1: lambda = 0.01 / N; scripts/sim2real/sensitivity.py adds x0.1 / x0.001.
+loss:
+  prior_weight_factor: 0.01
+optimizer:
+  method: least_squares
+  budget: 50        # LS: Jacobian evaluations; cma/bo/random comparators (--free-from): --budget 300 (equal)
+  cma: {sigma0: 0.3}
+  bo: {n_initial_points: 15, acq_func: EI}
