@@ -47,6 +47,12 @@ _HARDWARE_CHOICES = {
 PROBE_SG_BOUND_FRACTION = 0.09
 
 
+#: UR_01 U-3: E-ur-4's possible answers.
+POSITION_SIDES = ("motor", "link")
+#: UR_01 U-4: the pendant limits ``plan`` can check (tool0 and elbow speed, m/s).
+VENDOR_LIMIT_KEYS = ("tool_speed", "elbow_speed")
+
+
 class ConfigError(ValueError):
     """A lab configuration is invalid or (for `real`) not yet reviewed."""
 
@@ -131,6 +137,9 @@ class Ur10Connection:
     software_version: str
     serial: str
     ros_domain_id: int
+    #: UR_01 U-1.5: ``blocking_read:=`` of ``ur_control.launch.py`` (driver
+    #: 3.9.0); ``False`` is what was rehearsed.
+    blocking_read: bool = False
 
 
 Connection = IiwaConnection | Ur10Connection
@@ -152,13 +161,15 @@ def _load_connection(robot: str, raw: Mapping[str, Any], source: str) -> Connect
         robot_ip=str(_require(block, "robot_ip", f"{source}.connection")),
         reverse_ip=str(_require(block, "reverse_ip", f"{source}.connection")),
         headless_mode=bool(block.get("headless_mode", False)),
-        kinematics_params_file=block.get("kinematics_params_file"),
+        kinematics_params_file=_expand_path(block.get("kinematics_params_file"),
+                                            "connection.kinematics_params_file", source),
         servoj_gain=float(_require(block, "servoj_gain", f"{source}.connection")),
         servoj_lookahead_time=float(_require(block, "servoj_lookahead_time", f"{source}.connection")),
         rtde_frequency=float(block.get("rtde_frequency", 125.0)),
         software_version=str(_require(block, "software_version", f"{source}.connection")),
         serial=str(_require(block, "serial", f"{source}.connection")),
         ros_domain_id=domain,
+        blocking_read=bool(block.get("blocking_read", False)),
     )
 
 
@@ -601,6 +612,10 @@ class IdentificationSpec:
     sweep_speeds: tuple[float, ...]
     sweep_range: Mapping[str, tuple[float, float]]
     holdout: int
+    #: UR_01 U-3: E-ur-4's answer (``motor`` | ``link``) and the run id of the
+    #: recording it comes from; ``None`` = not analysed yet ("pending E-ur-4").
+    position_side: str | None = None
+    position_side_evidence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +635,9 @@ class SafetySpec:
     #: controller (Sunrise / PolyScope), copied into every run's manifest.
     #: Required key; ``null`` is refused for ``hardware: real``.
     vendor_checksum: str | None
+    #: UR_01 U-4: the pendant's normal-mode tool / elbow speed limits (m/s),
+    #: used by ``plan`` on ``hardware: real``; empty when the block is absent.
+    vendor_limits: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -725,10 +743,16 @@ def _check_probe_sg_bound(probe: ProbeSpec, rate_hz: float, source: str) -> None
 def _load_identification(raw: Mapping[str, Any], source: str) -> IdentificationSpec:
     block = raw.get("identification") or {}
     sweep_range_raw = block.get("sweep_range") or {}
+    side = block.get("position_side")
+    if side is not None and side not in POSITION_SIDES:
+        raise ConfigError(f"{source}.identification.position_side must be one of {POSITION_SIDES}, got {side!r}")
+    evidence = block.get("position_side_evidence")
     return IdentificationSpec(
         sweep_speeds=tuple(float(v) for v in block.get("sweep_speeds", ())),
         sweep_range={str(j): (float(p[0]), float(p[1])) for j, p in sweep_range_raw.items()},
         holdout=int(block.get("holdout", 2)),
+        position_side=None if side is None else str(side),
+        position_side_evidence=None if evidence is None else str(evidence),
     )
 
 
@@ -746,7 +770,17 @@ def _load_consumer(raw: Mapping[str, Any], source: str) -> ConsumerSpec:
 def _load_safety(raw: Mapping[str, Any], source: str) -> SafetySpec:
     block = _require_mapping(raw, "safety", source)
     value = _require(block, "vendor_checksum", f"{source}.safety")
-    return SafetySpec(vendor_checksum=None if value is None else str(value))
+    limits_raw = block.get("vendor_limits") or {}
+    if not isinstance(limits_raw, Mapping):
+        raise ConfigError(f"{source}.safety.vendor_limits must be a mapping")
+    unknown = sorted(set(limits_raw) - set(VENDOR_LIMIT_KEYS))
+    if unknown:
+        raise ConfigError(f"{source}.safety.vendor_limits: unknown key(s) {unknown}; allowed: {list(VENDOR_LIMIT_KEYS)}")
+    vendor_limits = {str(k): float(v) for k, v in limits_raw.items() if v is not None}  # null = not measured yet (refused on real)
+    for key, limit in vendor_limits.items():
+        if not limit > 0.0:
+            raise ConfigError(f"{source}.safety.vendor_limits.{key} must be > 0 m/s, got {limit}")
+    return SafetySpec(vendor_checksum=None if value is None else str(value), vendor_limits=vendor_limits)
 
 
 def _load_recording(raw: Mapping[str, Any], source: str) -> RecordingSpec:
@@ -903,15 +937,23 @@ def _check_real_preconditions(config: LabConfig, raw: Mapping[str, Any], source:
         problems.append("limits.reviewed is false")
     if not config.scene.reviewed:
         problems.append("scene.reviewed is false")
+    kin = getattr(config.connection, "kinematics_params_file", None)
+    if kin and not Path(kin).is_file():
+        problems.append(f"connection.kinematics_params_file does not exist: {kin} (UR_01 U-1.2)")
+    if config.robot == "ur10_cb3" and not kin:
+        # UR_07 F-3: an uncalibrated driver on the real arm is refused, not silent.
+        problems.append("connection.kinematics_params_file is null: the real UR10 runs with its factory "
+                        "calibration (UR_01 U-1.2)")
     probe = config.excitation.probe
     if probe.enabled and not probe.from_training_config:
         problems.append("excitation.probe.from_training_config is null while excitation.probe.enabled is true")
     null_paths = _no_nulls(raw, "")
     # Ignore keys that are legitimately optional/null (consumer hookup, the
-    # UR kinematics file before calibration is asked for by T2.5 not T2.0, and
+    # UR kinematics file is refused for the UR10 above, and
     # the probe's training config when the probe is off -- checked above).
     ignorable = {".consumer.python", ".consumer.reference_contract", ".consumer.checkpoints",
-                 ".consumer.reference_sha256", ".connection.kinematics_params_file",
+                 ".consumer.reference_sha256",
+                 ".identification.position_side", ".identification.position_side_evidence",
                  ".excitation.probe.from_training_config", ".excitation.probe.max_top_hz"}
     null_paths = [p for p in null_paths if p not in ignorable]
     if config.consumer.reference_contract and not config.consumer.reference_sha256:

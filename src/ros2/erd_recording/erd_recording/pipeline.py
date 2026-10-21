@@ -71,6 +71,7 @@ from .safety import (  # noqa: E402
     segment_tracking_rad,
 )
 from .tolerances import GOAL_TOLERANCE_RAD  # noqa: E402
+from .driver_facts import check_driver_facts, parse_driver_facts, read_kinematics_hash  # noqa: E402
 from .env_guard import clean_ros_subprocess_env  # noqa: E402
 from erd_msgs.msg import RunEvent  # noqa: E402
 
@@ -945,6 +946,23 @@ class RecordingNode(Node):
             return None
         return {controller.name: controller.state for controller in future.result().controller}
 
+    def robot_description_text(self, timeout_s: float = 5.0) -> str | None:
+        """The running driver's ``/robot_description`` (latched String), or
+        ``None`` if none arrives in ``timeout_s`` (UR_01 U-2)."""
+        from std_msgs.msg import String
+
+        received: list[str] = []
+        latched = QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST, depth=1,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        subscription = self.create_subscription(String, "/robot_description", lambda m: received.append(m.data), latched)
+        try:
+            deadline = time.time() + timeout_s
+            while not received and time.time() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.1)
+        finally:
+            self.destroy_subscription(subscription)
+        return received[-1] if received else None
+
     def robot_software_version(self, timeout_s: float = 5.0) -> tuple[int, int, int, int] | None:
         """RR_12 A-3b: (major, minor, bugfix, build) from the UR controller."""
         if self.profile.software_version_service is None:
@@ -1119,24 +1137,32 @@ class RecordingNode(Node):
         if sidecar.empty or not driver_log:
             return {"ok": False, "reason": "no sidecar rows or no driver /dynamic_joint_states samples"}
 
-        n = min(125, len(sidecar), len(driver_log))
-        sidecar_tail = sidecar.tail(n).reset_index(drop=True)
-        driver_tail = driver_log[-n:]
-
-        matches = 0
-        for row_index in range(n):
-            decoded = decode_dynamic_joint_state(driver_tail[row_index][1])
-            row_ok = True
-            for joint_index, joint in enumerate(driver_joint_order):
-                driver_value = decoded.get(joint, {}).get("position")
-                sidecar_value = sidecar_tail.loc[row_index, f"actual_q{joint_index}"]
-                if driver_value is None or abs(float(driver_value) - float(sidecar_value)) > 1e-9:
-                    row_ok = False
-                    break
-            if row_ok:
-                matches += 1
+        # UR_10 (2026-10-21, first real-robot preflight): the two streams are
+        # independent RTDE sessions, so their last rows are NOT the same
+        # controller cycle; pairing them by row index matched 125/125 on URSim
+        # (a still simulated arm has constant actual_q) and 0/125 on the real
+        # robot (encoder-level noise at standstill). Same rule as
+        # `erd_link_test`: a sidecar row passes when the identical 6-vector
+        # occurs anywhere in the driver's samples of the window. A wrong robot,
+        # joint order or unit still fails, because no row would be found.
+        # The sidecar is stopped after the driver logging, so its very last
+        # rows can postdate the driver window: leave out its last 0.5 s.
+        guard_rows = 62 if len(sidecar) >= 125 + 62 else 0
+        usable = sidecar.iloc[: len(sidecar) - guard_rows] if guard_rows else sidecar
+        n = min(125, len(usable))
+        sidecar_tail = usable.tail(n).reset_index(drop=True)
+        driver_rows = set()
+        for _, message in driver_log:
+            decoded = decode_dynamic_joint_state(message)
+            values = [decoded.get(joint, {}).get("position") for joint in driver_joint_order]
+            if all(v is not None for v in values):
+                driver_rows.add(tuple(float(v) for v in values))
+        columns = [f"actual_q{joint_index}" for joint_index in range(len(driver_joint_order))]
+        matches = sum(tuple(float(v) for v in row) in driver_rows
+                      for row in sidecar_tail[columns].itertuples(index=False, name=None))
         fraction = matches / n if n else 0.0
-        return {"ok": fraction >= match_fraction, "fraction_matched": fraction, "n_rows_compared": n}
+        return {"ok": fraction >= match_fraction, "fraction_matched": fraction, "n_rows_compared": n,
+                "driver_samples": len(driver_log), "match_rule": "sidecar row present bit-exactly in the driver window"}
 
     # -- RTDE sidecar lifecycle (RR_04 A-12: started/stopped per run, not by
     # the launch file) --------------------------------------------------
@@ -1377,6 +1403,19 @@ def stage_preflight(node: RecordingNode, config: LabConfig, paths: RunPaths) -> 
         version["gated"] = config.hardware == "real"
         checks["software_version"] = version if config.hardware == "real" else {**version, "ok": True,
                                                                                  "would_pass": version["ok"]}
+    # UR_01 U-2: the servo parameters and kinematics hash the running driver
+    # description carries, against the lab file (real: refused on a mismatch).
+    if node.profile.has_ur_status_topics and config.hardware != "mock":
+        text = node.robot_description_text()
+        if text is None:
+            checks["driver_facts"] = {"ok": config.hardware != "real", "gated": config.hardware == "real",
+                                      "problems": ["no /robot_description received"], "facts": {}}
+        else:
+            checks["driver_facts"] = check_driver_facts(
+                parse_driver_facts(text), servoj_gain=config.connection.servoj_gain,
+                servoj_lookahead_time=config.connection.servoj_lookahead_time, hardware=config.hardware,
+                kinematics_hash=read_kinematics_hash(config.connection.kinematics_params_file))
+        _write_manifest_fields(paths, driver_facts=checks["driver_facts"]["facts"])
     # RR_12 A-3c: the vendor safety checksum is on file (the loader already
     # refuses a null one on real hardware).
     checks["safety_vendor_checksum"] = {"ok": config.hardware != "real" or bool(config.safety.vendor_checksum),

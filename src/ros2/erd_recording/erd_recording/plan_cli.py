@@ -30,6 +30,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="the driver's own description, exported by the ROS side (RR_04 B-2 FK gate)")
     parser.add_argument("--driver-urdf-calibrated", default=None,
                         help="UR10 only: report-only deviation against --driver-urdf (RR_04 B-2)")
+    parser.add_argument("--window-check", type=int, default=0, metavar="N",
+                        help="also sample N configurations in excitation.position_window and write the clear "
+                             "fraction against the scene and self collision to window_check.json (UR_01 U-6)")
     parser.add_argument("--ladder", type=float, default=None,
                         help="RR_06 P3-3b: also build a commissioning-scaled copy of every excitation segment")
     args = parser.parse_args(argv or sys.argv[1:])
@@ -43,12 +46,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"plan ok: {len(bundle.segments)} segments, config_digest={bundle.config_digest[:12]}, "
           f"rejected_for_collision={bundle.rejected_for_collision}")
+    if args.window_check > 0:
+        write_window_check(config, Path(args.output_dir), args.window_check)
     ranges = gravity_ranges(config)
     (Path(args.output_dir) / "gravity_range.json").write_text(json.dumps(ranges, indent=2))
     print("gravity range over the standstill poses (RR_12 B-3; a slope is testable at >= 10x the standstill sigma):")
     for joint, entry in ranges["joints"].items():
         print(f"  {joint}: {entry['range_nm']:.3f} N*m  (min {entry['min_nm']:.3f}, max {entry['max_nm']:.3f})")
     return 0
+
+
+def write_window_check(config, output_dir: Path, n_samples: int) -> dict:
+    """``window_check.json``: the clear fraction of the excitation window."""
+    from elastic_sim.assets import AssetRegistry
+
+    from .planning import WorldKinematics, relimited_asset, window_clear_fraction
+
+    snapshot = relimited_asset(AssetRegistry.for_repository().load(config.description.sim_asset), config, output_dir)
+    world = WorldKinematics(snapshot, config.scene.objects, config.scene.allowed_contacts)
+    margin = float(snapshot.metadata.get("collision", {}).get("margin", 0.0))
+    report = window_clear_fraction(config, world, n_samples=n_samples, margin=margin)
+    # UR_07 F-4: the same margin `plan` validates every path with, and the scene
+    # clearance already inflated into the objects, so the fraction is comparable.
+    report["margin_source"] = "asset collision.margin (the margin build_plan uses)"
+    report["scene_clearance_m"] = config.scene.clearance
+    (output_dir / "window_check.json").write_text(json.dumps(report, indent=2))
+    print(f"excitation window: {report['clear']}/{report['samples']} configurations clear "
+          f"({report['clear_fraction']:.1%}; UR_01 U-6 target >= 95 %; margin {margin:g} m + scene clearance "
+          f"{config.scene.clearance:g} m)")
+    for pair, count in list(report["blocking_pairs"].items())[:5]:
+        print(f"  blocked by {pair}: {count}")
+    return report
 
 
 def gravity_ranges(config) -> dict:

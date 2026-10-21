@@ -39,6 +39,8 @@ def convert_ur(config, root: Path, reference):
     events = json.loads((root / 'events.json').read_text())
     alignment = json.loads((root / 'rtde_alignment.json').read_text())
     losses = load_losses(root)
+    from .bagio import ur_attributed_losses
+    losses = ur_attributed_losses(losses)  # UR_10: djs skips judged by the events rule
     clock_ratio = robot_clock_ratio(config, root)
     diff = differentiation_from_reference(reference, rate_real=config.rate_hz, probe_top_real=0., reference_path=reference_path)
     segments = [s for s in bundle.segments if s.kind == 'excitation']
@@ -111,18 +113,23 @@ def convert_ur(config, root: Path, reference):
     freshness = check_identification_freshness_ur(identification, run_config_digest=bundle.config_digest,
                                                   run_temperature_c=temperatures)
 
+    side = config.identification.position_side
+    side_label = side or 'pending E-ur-4'
+    q_side = side or 'unknown'
     manifest = {'schema_version': 2, 'n_dof': n, 'joint_names': list(config.joint_order), 'split': 'test', 'sample_time_step': dt,
                 'signals': {'target': 'link_torque', 'target_source': 'estimated', 'target_kind': 'motor_current_proxy'},
                 'differentiation': diff, 'identification': '../identification.json', 'tau_source': source,
-                'position_side': 'unknown pending E-ur-4', 'source': contract_source(config.hardware)}
+                'position_side': side_label if side else 'unknown pending E-ur-4', 'source': contract_source(config.hardware)}
     contract = real_contract(manifest, hardware=config.hardware, n_dof=n, target_instrument='ur10_current_inertia_friction_proxy',
             target_semantics='K_tau * actual_current - J_m * SG(actual_qd derivative) - fitted motor friction [Nm]',
-            q_side='unknown', dq_side='unknown', dq_source='actual_qd', tau_instrument=source,
+            q_side=q_side, dq_side=q_side, dq_source='actual_qd', tau_instrument=source,
             controller={'location': 'drive', 'vendor': 'ur_servoj', 'model_free': False, 'reference': 'jtc_quintic',
                         'servoj_gain': config.connection.servoj_gain}, differentiation=diff, baselines=baselines,
             real_block={'robot_id': config.robot, 'software_version': config.connection.software_version,
                         'safety_vendor_checksum': config.safety.vendor_checksum,
-                        'position_side': 'pending E-ur-4', 'identification': identification,
+                        'position_side': side_label,
+                        'position_side_evidence': config.identification.position_side_evidence,
+                        'identification': identification,
                         'reference': _reference_block(reference),
                         'rate_mismatch': not diff['cutoff_matched']}, friction_split='all_motor')
     contract['reference_synthetic'] = bool(reference.get('synthetic', False))
@@ -136,7 +143,7 @@ def convert_ur(config, root: Path, reference):
             reference_tracking=check_reference_tracking(tracking, commanded_report_only=True),
             envelopes=check_envelopes(frame, n_dof=n, effort_limit=arrays['effort'], sg_window=diff['sg_window'],
                                       sg_poly=diff['sg_poly'], time_step=dt),
-            noise=noise, sign_convention=sign, hardware=config.hardware, robot=config.robot)
+            noise=noise, sign_convention=sign, hardware=config.hardware, robot=config.robot, position_side=side or 'pending')
     validation.update(segments=checks, rtde_alignment={k: v for k, v in alignment.items() if k != 'anchor_timestamps'})
     result = _finish_validation(config, root, validation, contract, diff, events,
                                 {'dataset': str(output), 'contract': str(contract_path), 'samples': len(frame)})

@@ -421,3 +421,24 @@ those inputs, S-24), holds the fraction for `--hold-s`, and always resets
 the slider to 1.0 at the end, also on Ctrl-C. Expect the live monitor to
 abort once `speed_scaling` drops below `safety.SPEED_SCALING_FLOOR`
 (0.999).
+
+## UR10 on the real robot
+
+The procedure (laptop, cell, lab files, rungs, E-ur-4, datasets A and B) is
+`REFACTOR_SPECS/ur10_real/UR_05_COMMISSIONING_RUNBOOK.md`. Three UR-only
+facts the operator must not miss:
+
+* **Press Play on the pendant after the launch.** With `headless_mode: false`
+  the trajectory controller stays inactive until the pendant program (External
+  Control node) runs; `ur10.launch.py` prints `erd_ur10: waiting for the
+  pendant program (press Play)` every 10 s whenever `headless_mode` is
+  `false` (real and URSim pendant runs) and waits without a time limit. The connection (`robot_ip`, `reverse_ip`,
+  `headless_mode`, the calibration file) comes from `--lab_config`; a launch
+  argument that differs from the file is refused.
+* **Speed slider at 100 % and normal mode.** The live monitor aborts on
+  `speed_scaling < 0.999`; the robot's own safety limits (tool speed, elbow
+  speed, momentum, power) scale the motion down before they stop it, so
+  `plan` checks the Cartesian peaks (`plan/cartesian_peaks.json`) against
+  0.8 x `safety.vendor_limits`.
+* **`docker network rm ursim_net`** before connecting the real robot on a
+  machine that ran URSim (its bridge shadows the robot's subnet).

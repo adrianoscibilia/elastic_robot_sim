@@ -23,7 +23,10 @@ source workspace_setup.sh --deps
 ```
 
 `--deps` installs ROS 2 Jazzy if it is missing plus the stack's apt/rosdep
-dependencies (sudo). The script then:
+dependencies (sudo), among them the UR10 path's `ros-jazzy-ur-robot-driver`,
+`ros-jazzy-ur-description`, `ros-jazzy-ur-client-library` and
+`ros-jazzy-ur-calibration` (the robot's factory calibration file). The script
+then:
 
 1. links `ros2_ws/src/erd -> ../../src/ros2`;
 2. clones `src/ros2/erd.repos` (pinned `iiwa_ros2`: `iiwa_description` and
@@ -34,7 +37,7 @@ dependencies (sudo). The script then:
    repo editable (`--no-deps`);
 4. runs `python -m colcon build` in `ros2_ws/`;
 5. sources ROS, the overlay and the venv, and exports `ROS_DOMAIN_ID=87`
-   (`--real`: 0) and `ERD_REPO_ROOT`, `ERD_WS`, `ERD_DATA_ROOT`, `ERD_LAB`,
+   (`--real`: 0, plus `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`) and `ERD_REPO_ROOT`, `ERD_WS`, `ERD_DATA_ROOT`, `ERD_LAB`,
    `ERD_FRI_SDK_ROOT`, `ERD_CONSUMER_REPO`, `ERD_CONSUMER_PYTHON`.
 
 Every new terminal: `source <repo>/workspace_setup.sh` (no rebuild unless

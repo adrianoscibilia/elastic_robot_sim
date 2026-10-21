@@ -1,0 +1,204 @@
+# erd.lab/1 -- UR10 CB3, REAL ROBOT -- profile B (fast; dataset B, primary).
+#
+# DRAFT 2026-10-20 (UR10 chat, REFACTOR_SPECS/ur10_real/UR_04 S11). Copy of
+# UR_04a_ur10.yaml (profile A) with faster excitations, used only after
+# dataset A is valid. Changed: limits velocity/acceleration/jerk, approach,
+# abort.tracking_rad (provisional, D-12); excitation seed, base_frequency,
+# n_periods, velocity_fraction, max_acceleration, regime. Everything else
+# (connection, scene, poses, window, identification, safety, consumer,
+# recording) must stay IDENTICAL to ur10.yaml: copy the owner's measured
+# values over from it. Both `reviewed` flags are reset; the OWNER re-reviews.
+# Before the first B run: `plan` must stay under 0.8 x the pendant's tool and
+# elbow speed limits (UR_01 U-4); if it doesn't, lower velocity_fraction here
+# rather than touching the robot's safety configuration.
+#
+#
+# 2026-10-21 14:05, architect (UR10 chat), UR_09 S7 -- FINAL orientation.
+# The owner checked the earlier version with `erd_scene_view --live` on the real
+# robot: moving toward the window put the arm INSIDE the modelled workspace, so
+# that version was reversed. P1-P2 is the owner's boundary drawn to keep the arm
+# away from the window column and the iiwa; the workspace is the side AWAY from
+# the window = away from the base axis (the base is 0.118 m on the window side).
+# The arm's own body near the base crosses the line (it did in both taught
+# poses), so the scene has the table top (z = 0) and a GUARD wall 0.45 m behind
+# the line on the robot/window side; poses, window and sweeps keep forearm,
+# wrist and tool over the workspace (capsule model; `plan` is authoritative).
+#   * points from the JOINT ANGLES by FK, in base_link (the pendant's Move-tab
+#     feature was "View" with TCP "Drapebot", not Base / TCP 0);
+#   * P = 3.45 rad = 197.67 deg on the pendant (NOT -162.33: same pose, other
+#     turn) for home, lean_fwd, fore_up, tall; lean_back at 2.9 (166.16 deg);
+#   * safety values from the pendant photos (checksum CCCC, 1500 mm/s);
+#   * limits/scene.reviewed set true at the owner's request (2026-10-21);
+#     the owner's review is the scene viewer (live + plan replay) vs the cell.
+schema: erd.lab/1
+robot: ur10_cb3
+hardware: real                          # mock | ursim | real
+operator: {confirm_each_trajectory: true}
+
+connection:
+  robot_ip: 192.168.56.10               # I-12; pendant Setup Robot > Network (UR_03 S1)
+  reverse_ip: 192.168.56.1              # the laptop's USB adapter (UR_02 S3.2)
+  headless_mode: false                  # pendant program with the External Control node (UR_00 D-4)
+  # UR_03 S6 (ur_calibration); `${...}` is expanded by the loader (UR_01 U-1.2):
+  kinematics_params_file: ${ERD_REPO_ROOT}/src/ros2/erd_recording/config/lab/ur10_2017307500_calibration.yaml
+  servoj_gain: 2000                     # = the driver's built-in value (UR_00 D-5; preflight checks it, U-2)
+  servoj_lookahead_time: 0.03           # = the driver's built-in value (UR_00 D-5)
+  blocking_read: false                  # UR_01 U-1.5; rehearsed value; rung-1 A/B decides (UR_Q Q-6)
+  rtde_frequency: 125
+  software_version: 3.15.7              # pendant About: 3.15.7.106331; the CB3 reports build 0 to the driver, so the build is not compared (UR_10)
+  serial: "2017307500"                  # I-12
+  ros_domain_id: 0                      # real always uses domain 0
+
+description:
+  sim_asset: ur10                        # the BARE asset: planning, FK gate and baselines
+  joint_map:
+    shoulder_pan_joint: shoulder_pan_joint
+    shoulder_lift_joint: shoulder_lift_joint
+    elbow_joint: elbow_joint
+    wrist_1_joint: wrist_1_joint
+    wrist_2_joint: wrist_2_joint
+    wrist_3_joint: wrist_3_joint
+  base_frame: base_link
+  tool:
+    mass: 0.0                           # nothing mounted (owner, Q-13); pendant payload 0 kg (UR_03 S4.2)
+    extra_collision: []
+
+limits:                                 # A = the URSim-rehearsed values (ur10_sim.yaml)
+  reviewed: true                        # 2026-10-21 owner request; checked vs pendant Joint Limits (131/131/191x4 deg/s, +-363 deg) (UR_09 S4)
+  position:                             # inside UR's +-360 deg; lift <= 0 keeps the upper arm at or above horizontal
+    shoulder_pan_joint: [-0.5, 5.5]   # UR_09 S7: P = 3.45 +- window; inside the pendant's +-363 deg
+    shoulder_lift_joint: [-3.14, 0.0]
+    elbow_joint: [-2.8, 2.8]
+    wrist_1_joint: [-3.14, 3.14]
+    wrist_2_joint: [-3.14, 3.14]
+    wrist_3_joint: [-3.14, 3.14]
+  velocity:                             # FAST (A: 0.6/0.8); UR max 2.09 / 2.09 / 3.14 x4 (S-57) -> 48 % / 38 % / 48 %
+    shoulder_pan_joint: 1.0
+    shoulder_lift_joint: 1.0
+    elbow_joint: 1.2
+    wrist_1_joint: 1.5
+    wrist_2_joint: 1.5
+    wrist_3_joint: 1.5
+  acceleration:                         # FAST (A: 1.0/1.2/1.5), rad/s^2
+    shoulder_pan_joint: 3.0
+    shoulder_lift_joint: 3.0
+    elbow_joint: 4.0
+    wrist_1_joint: 6.0
+    wrist_2_joint: 6.0
+    wrist_3_joint: 6.0
+  jerk:                                 # FAST (A: 15); a 1 Hz harmonic at 0.8 rad/s alone needs ~32 (as iiwa B)
+    shoulder_pan_joint: 100.0
+    shoulder_lift_joint: 100.0
+    elbow_joint: 100.0
+    wrist_1_joint: 100.0
+    wrist_2_joint: 100.0
+    wrist_3_joint: 100.0
+  effort:                               # N*m, UR joint sizes 4/4/3/2/2/2 (S-6; URDF 56 on the wrists)
+    shoulder_pan_joint: 330
+    shoulder_lift_joint: 330
+    elbow_joint: 150
+    wrist_1_joint: 56
+    wrist_2_joint: 56
+    wrist_3_joint: 56
+  approach: {velocity: 0.25, acceleration: 0.5}   # FAST (A: 0.1/0.2; approaches were 2/3 of the iiwa A run)
+  # tracking_rad: URSim predicts ~15 mrad at full A (1.49 mrad at ladder 0.1, rr19g_ur10_ladder01);
+  # keep >= 2 x the prediction from the real 0.1/0.5 rungs (UR_00 D-12); relaunch the driver after a change.
+  # torque_fraction is not used on the UR10 (no torque channel online).
+  # FAST: PROVISIONAL 0.05 for the B ladder (0.1, 0.5); then >= 2 x the predicted full-scale
+  # tracking error (UR_05 S7), owner re-review, relaunch the driver with this file.
+  # 2026-10-21 B ladder (UR_05 S7): max |e| 4.10 mrad at 0.1 (ur_fast_l010), 18.17 mrad at 0.5 (ur_fast_l050)
+  # -> e(1) = 18.17 + 1.25 x (18.17 - 4.10) = 35.8 mrad -> max(0.03, 2 x e(1)) = 71.5 mrad -> 0.075 (< 0.08 stop-and-ask).
+  abort: {tracking_rad: 0.075, torque_fraction: 0.6, stop_timeout_s: 3.0}
+
+scene:                                  # UR_09 S7 (final, 2026-10-21 14:05)
+  reviewed: true                        # set at the owner's request 2026-10-21; owner checks it in the viewer before any motion
+  frame: base_link                      # NOT `base`: computed by FK from the taught joint angles (UR_09 S1)
+  clearance: 0.03
+  objects:
+    # Welding table top: the base sits on it, top face at z = 0 (6 x 6 m plane,
+    # outline not measured; conservative).
+    - {id: table_top, type: box, size: [6.0, 6.0, 0.2], xyz: [0.0, 0.0, -0.1]}
+    # Owner's boundary P1 = (-0.5386, 0.5249), P2 = (0.3488, -0.6662) m (flange
+    # centres of the taught poses, base_link); workspace direction (-0.8019,
+    # -0.5974), i.e. away from the window; the base axis is 0.118 m on the window
+    # side. GUARD wall parallel to it, face 0.45 m behind the line on the window
+    # side (beyond the arm's own body near the base): local +y = (-0.8019,
+    # -0.5974) faces the robot; 6 m long, 0.2 m thick, z -1 .. 3 m.
+    - {id: guard_behind, type: box, size: [6.0, 0.2, 4.0], xyz: [0.346176, 0.257910, 1.0], rpy: [0.0, 0.0, 2.211106]}
+  # Base and shoulder sit on the table top inside the clearance.
+  allowed_contacts: [[base_link_inertia, table_top], [shoulder_link, table_top]]
+
+poses:                                  # rad; P = 3.45 (197.67 deg). Gravity shoulder / elbow N*m unchanged (pan-independent)
+  home: [3.45, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]         # (197.67, -90, 90, -90, -90, 0 deg): arm over the workspace
+  standstill:
+    - [3.45, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]           # home                          41 / 41
+    - [3.45, -0.9599, 1.2217, -1.8326, -1.5708, 0.0]           # lean_fwd  (197.67, -55, 70, -105, -90, 0)   86 / 40
+    - [2.9, -2.0944, 1.0472, -2.0944, -1.5708, 0.0]            # lean_back (166.16, -120, 60, -120, -90, 0) -21 / 20  own pan: leans away from the guard
+    - [3.45, -1.3963, -0.6981, -1.0472, -1.5708, 0.0]          # fore_up   (197.67, -80, -40, -60, -90, 0)   -5 / -19
+    - [3.45, -1.7453, 0.5236, -0.3491, -1.5708, 0.0]           # tall      (197.67, -100, 30, -20, -90, 0)    2 / 16
+
+excitation:
+  trajectories: 10
+  seed: 20261021                        # FAST: new trajectories
+  base_frequency: 0.2                   # FAST: harmonics 0.2-1.0 Hz (as iiwa B)
+  n_periods: 2                          # FAST: 2 x 5 s = still 10 s per excitation
+  n_harmonics: 5
+  velocity_fraction: 0.8                # FAST: of the limits above
+  max_acceleration: 3.0                 # FAST: rad/s^2, <= every joint's acceleration limit
+  centre_jitter: 1.0
+  position_window:                      # UR_09 S7: arm over the workspace side of the P1-P2 line
+    shoulder_pan_joint: [2.75, 4.15]    # P +- 0.7
+    shoulder_lift_joint: [-1.75, -1.1]  # lift < -1.75 leans the elbow back toward the guard / wrist behind the line
+    elbow_joint: [0.6, 1.9]
+    wrist_1_joint: [-2.4, -0.8]
+    wrist_2_joint: [-2.2, -0.9]
+    wrist_3_joint: [-1.5, 1.5]
+  candidates: 48
+  regime:
+    enabled: true
+    velocity_fraction: [0.5, 1.0]       # FAST (A: [0.3, 1.0])
+    max_acceleration: [0.5, 1.0]        # FAST (A: [0.25, 1.0])
+  probe:
+    enabled: false                      # rung 7 only; capped at 11 Hz (SG bound at 125 Hz = 11.25 Hz)
+    from_training_config: ${ERD_REPO_ROOT}/config/identification/ur10_table_round6.yaml
+    max_top_hz: 11.0
+    acceleration_fraction: 0.2
+    budget: split
+  settle_s: 2.0
+  amplitude_ladder: [0.1, 0.25, 0.5, 1.0]
+
+identification:                         # E-ur-1 (3 excitations at 0.25) and E-ur-3 sweeps, centred at home
+  sweep_speeds: [0.05, 0.1, 0.2, 0.35, 0.5, 0.7]   # capped per joint at its excitation peak and limits.velocity
+  sweep_range:                          # absolute joint values; add P to shoulder_pan
+    shoulder_pan_joint: [2.85, 4.05]    # UR_09 S7: P +- 0.6
+    shoulder_lift_joint: [-1.75, -1.1]  # UR_09 S7: inside the window
+    elbow_joint: [0.9, 2.1]
+    wrist_1_joint: [-2.2, -0.9]
+    wrist_2_joint: [-2.2, -0.9]
+    wrist_3_joint: [-1.0, 1.0]
+  holdout: 2
+  # After E-ur-4 (UR_05 S5; keys from UR_01 U-3):
+  # position_side: motor                # motor | link
+  # position_side_evidence: ur_eur4_shoulder_brakes
+
+safety:
+  vendor_checksum: "CCCC"               # PolyScope top-right, photos 2026-10-21 (UR_09 S4); re-read it if the installation changes
+  vendor_limits:                        # General Limits, normal mode, CB3 default preset (photo 2026-10-21): speed 1500 mm/s,
+    tool_speed: 1.5                     # force 150 N, power 300 W, momentum 25 kg m/s. The preset's single "Speed" applies to
+    elbow_speed: 1.5                    # tool and elbow; plan keeps every peak <= 0.8 x (UR_01 U-4)
+
+consumer:
+  repo: ${ERD_CONSUMER_REPO}
+  python: ${ERD_CONSUMER_PYTHON}
+  # Round-6 UR10 production contract + sibling manifest (UR_00 D-8; UR_02 S2).
+  # Training at 500 Hz -> the 125 Hz file is the declared rate gap (CR-2).
+  reference_contract: ${ERD_REPO_ROOT}/data/identification/r6-ur10-20261005-1126/ur10/ur10_table_round6.contract.json
+  reference_sha256: cc8867e909b0e9804df29b4645cabb954991fe99c7c0d2e6d0639b6fbf214a2c
+  checkpoints: ${ERD_REPO_ROOT}/runs/r6-ur10-20261005-1126/chain-ur10.summary.csv   # evaluate (peepo)
+
+recording:
+  output_root: ${ERD_DATA_ROOT}
+  standstill_s: 30
+  pre_roll_s: 2.0
+  post_roll_s: 2.0
+  max_lost_fraction: 0.001

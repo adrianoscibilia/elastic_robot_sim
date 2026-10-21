@@ -12,7 +12,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from xml.etree import ElementTree as ET
 
 import numpy as np
@@ -613,6 +613,14 @@ def build_plan(
     bundle = PlanBundle(config_digest=config_digest(config), asset=snapshot_asset,
                         segments=tuple(segments), rejected_for_collision=rejected_total,
                         standstill_segments=standstill_segments, identify_segments=identify_segments)
+    if config.robot == "ur10_cb3":
+        # UR_07 F-1: the vendor-speed refusal comes before the bundle is
+        # written, so a refused plan leaves no manifest for a later stage to load.
+        output_dir.mkdir(parents=True, exist_ok=True)
+        peaks = write_cartesian_peaks(world, bundle, output_dir, config.safety.vendor_limits)
+        print_cartesian_peaks(peaks)
+        if config.hardware == "real":
+            check_vendor_speed_limits(peaks, config.safety.vendor_limits)
     _write_bundle(bundle, output_dir)
     if config.robot == "kuka_lbr_iiwa_14_r820":
         manifest_path = output_dir / "plan.manifest.json"
@@ -624,6 +632,123 @@ def build_plan(
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))
     return bundle
+
+
+def window_clear_fraction(config: LabConfig, world: WorldKinematics, *, n_samples: int = 10000, seed: int = 0,
+                          margin: float = 0.0) -> dict[str, Any]:
+    """UR_01 U-6 (the method of the iiwa window check, ``05`` S12.1): sample
+    ``n_samples`` configurations uniformly in ``excitation.position_window``
+    and report the fraction clear of the scene and of self collision."""
+    rng = np.random.default_rng(seed)
+    window = excitation_position_window(config)
+    lo = np.asarray([bounds[0] for _, bounds in window])
+    hi = np.asarray([bounds[1] for _, bounds in window])
+    samples = rng.uniform(lo, hi, size=(n_samples, len(window)))
+    blockers: dict[str, int] = {}
+    clear = 0
+    for q in samples:
+        report = world.collision_report([q], margin=margin)
+        if report.valid:
+            clear += 1
+        else:
+            key = " / ".join(report.closest_pair) if report.closest_pair else "?"
+            blockers[key] = blockers.get(key, 0) + 1
+    return {"samples": n_samples, "seed": seed, "clear": clear, "clear_fraction": clear / n_samples,
+            "margin": margin, "blocking_pairs": dict(sorted(blockers.items(), key=lambda kv: -kv[1]))}
+
+
+#: UR_01 U-4: ``plan`` refuses a segment above this fraction of a pendant
+#: speed limit (margin against the controller's own scaling, like the joint caps).
+VENDOR_SPEED_MARGIN = 0.8
+#: frame whose origin stands for the elbow in the elbow-speed limit.
+ELBOW_FRAME = "forearm_link"
+#: frame of the pendant's tool-speed limit (a zero TCP, nothing mounted).
+TOOL_FRAME = "tool0"
+#: pendant limit key for each measured point.
+_PEAK_LIMIT_KEY = {"tool0": "tool_speed", "elbow": "elbow_speed"}
+
+
+def cartesian_speed_peaks(world: WorldKinematics, trajectory: MaterializedTrajectory,
+                          *, oversample: int = 20) -> dict[str, float]:
+    """Peak linear speed (m/s) of ``tool0`` and of the elbow (``forearm_link``
+    origin) along one trajectory, from FK at the same ``oversample`` x grid as
+    :func:`check_caps_on_analytic` (the analytic signal when the trajectory
+    carries one, its own samples otherwise)."""
+    pin = world.pin
+    model, data = world.model, world.data
+    frames = {"tool0": model.getFrameId(world.groups[0].tip_link)}
+    if world.groups[0].tip_link != TOOL_FRAME:
+        raise PlanError(f"the pendant's tool-speed limit applies at {TOOL_FRAME}, but the group tip is "
+                        f"{world.groups[0].tip_link!r}")
+    if model.existFrame(ELBOW_FRAME):
+        frames["elbow"] = model.getFrameId(ELBOW_FRAME)
+    if trajectory.analytic is not None and len(trajectory.time) > 1:
+        step = float(trajectory.time[1] - trajectory.time[0]) / oversample
+        fine_time = np.arange(trajectory.time[0], trajectory.time[-1] + 0.5 * step, step)
+        values = [trajectory.analytic(t) for t in fine_time]
+        positions = np.asarray([v[0] for v in values])
+        velocities = np.asarray([v[1] for v in values])
+    else:  # a quintic segment: its sampled grid already is the exact closed form
+        positions, velocities = np.asarray(trajectory.position), np.asarray(trajectory.velocity)
+    # asset joint k -> model q / v index, once (a continuous joint has nq=2, nv=1)
+    q_index = world._q_indices
+    v_index = [next(j.idx_v for j in model.joints if j.nq > 0 and j.idx_q == index) for index in q_index]
+    model_q = pin.neutral(model)
+    model_dq = np.zeros(model.nv)
+    peaks = {name: 0.0 for name in frames}
+    for q, dq in zip(positions, velocities):
+        for k in range(len(q_index)):
+            model_q[q_index[k]] = q[k]
+            model_dq[v_index[k]] = dq[k]
+        pin.forwardKinematics(model, data, model_q, model_dq)
+        for name, frame_id in frames.items():
+            pin.updateFramePlacement(model, data, frame_id)
+            speed = float(np.linalg.norm(
+                pin.getFrameVelocity(model, data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).linear))
+            if speed > peaks[name]:
+                peaks[name] = speed
+    return peaks
+
+
+def write_cartesian_peaks(world: WorldKinematics, bundle: PlanBundle, output_dir: Path,
+                          vendor_limits: Mapping[str, float]) -> dict[str, Any]:
+    """``plan/cartesian_peaks.json``: per-segment peak speeds and the run maxima."""
+    per_segment: dict[str, dict[str, float]] = {}
+    for segment in bundle.segments + bundle.standstill_segments + bundle.identify_segments:
+        per_segment[segment.segment_id] = cartesian_speed_peaks(world, segment.trajectory)
+    maxima: dict[str, float] = {}
+    for peaks in per_segment.values():
+        for name, value in peaks.items():
+            maxima[name] = max(maxima.get(name, 0.0), value)
+    report = {"schema": "erd.cartesian_peaks/1", "unit": "m/s", "frames": {"tool0": world.groups[0].tip_link, "elbow": ELBOW_FRAME},
+              "vendor_limits": dict(vendor_limits), "margin": VENDOR_SPEED_MARGIN,
+              "maxima": maxima, "segments": per_segment}
+    (output_dir / "cartesian_peaks.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def print_cartesian_peaks(report: Mapping[str, Any]) -> None:
+    limits = report["vendor_limits"]
+    print("cartesian speed peaks over the plan (UR_01 U-4):")
+    for name, value in report["maxima"].items():
+        limit = limits.get(_PEAK_LIMIT_KEY[name])
+        note = f"  ({value / limit:.0%} of the pendant's {limit:g} m/s)" if limit else ""
+        print(f"  {name}: {value:.3f} m/s{note}")
+
+
+def check_vendor_speed_limits(report: Mapping[str, Any], vendor_limits: Mapping[str, float],
+                              *, margin: float = VENDOR_SPEED_MARGIN) -> None:
+    """Refuse a segment whose Cartesian peak exceeds ``margin`` x the pendant's
+    tool / elbow speed limit (UR_01 U-4). A limit not declared is not checked."""
+    for segment_id, peaks in report["segments"].items():
+        for name, value in peaks.items():
+            limit = vendor_limits.get(_PEAK_LIMIT_KEY[name])
+            if limit is not None and value > margin * limit:
+                raise PlanError(
+                    f"{segment_id}: {name} peak speed {value:.3f} m/s exceeds {margin:g} x the pendant's "
+                    f"{_PEAK_LIMIT_KEY[name]} {limit:g} m/s; the controller would scale the motion down "
+                    "(UR_01 U-4). Lower the velocity limits or the excitation speed."
+                )
 
 
 def _rename(trajectory: MaterializedTrajectory, joint_names: tuple[str, ...]) -> MaterializedTrajectory:

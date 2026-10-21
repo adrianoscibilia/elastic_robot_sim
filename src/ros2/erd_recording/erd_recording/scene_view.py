@@ -97,8 +97,9 @@ def scene_marker_specs(scene) -> list[dict[str, Any]]:
 
     clearance = float(scene.clearance)
     specs: list[dict[str, Any]] = []
-    red = (0.9, 0.1, 0.1, 0.25)
-    orange = (1.0, 0.55, 0.0, 0.8)
+    # Light enough to see the robot through a wall or a table plane from any angle.
+    red = (0.9, 0.1, 0.1, 0.12)
+    orange = (1.0, 0.55, 0.0, 0.35)
     for obj in scene.objects:
         rpy = getattr(obj, "rpy", (0.0, 0.0, 0.0))
         quat = rpy_to_quaternion(rpy)
@@ -147,7 +148,12 @@ def driver_description(robot: str, raw: dict) -> str:
     if robot == "ur10_cb3":
         from erd_ur10.description import export_driver_urdf
 
-        kinematics = (raw.get("connection") or {}).get("kinematics_params_file")
+        from .config import _expand_path
+
+        # The lab file is read raw here (no review gate), so `${ERD_REPO_ROOT}`
+        # must be expanded the same way the loader does (UR_01 U-1.2).
+        kinematics = _expand_path((raw.get("connection") or {}).get("kinematics_params_file"),
+                                  "connection.kinematics_params_file", "erd_scene_view")
         with tempfile.TemporaryDirectory() as tmp:
             path = export_driver_urdf(str(Path(tmp) / "ur10.urdf"), kinematics_params_file=kinematics)
             return Path(path).read_text(encoding="utf-8")
@@ -158,6 +164,8 @@ def driver_description(robot: str, raw: dict) -> str:
 RVIZ_TEMPLATE = """Panels:
   - Class: rviz_common/Displays
     Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
 Visualization Manager:
   Class: ""
   Displays:
@@ -185,17 +193,42 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
+  Enabled: true
   Global Options:
     Fixed Frame: {frame}
     Background Color: 48; 48; 48
+    Frame Rate: 30
+  Name: root
+  # Without a Tools list RViz loads no tool, and the mouse can't move the camera.
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.0
+      Name: Current View
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz_default_plugins)
+      Distance: 3.5
       Focal Point:
         X: 0.0
         Y: 0.0
         Z: 0.4
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Near Clip Distance: 0.01
+      Pitch: 0.4
+      Yaw: 0.64
+    Saved: ~
 """
 
 

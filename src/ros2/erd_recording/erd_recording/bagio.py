@@ -880,6 +880,54 @@ def segment_skip_verdict(report: Mapping[str, Any] | None, lo_ns: int, hi_ns: in
     return verdict
 
 
+def ur_attributed_losses(report: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """UR_10 (2026-10-21, first real UR10 identification): a copy of a loss
+    report in which the ``/dynamic_joint_states`` candidates are attributed by
+    the same events rule as every other topic (RR_16 Q-1, RR_18 R-2/R-3)
+    instead of B-2's "always losses".
+
+    Why only for the UR10: its measured data come from the RTDE stream, whose
+    completeness, gaps and anchor intervals are checked on their own; the
+    driver's ``/dynamic_joint_states`` only brackets segments. A candidate that
+    no rosbag2 event explains is the driver not publishing a cycle (a non-RT
+    controller_manager), not lost data. Charged candidates (a run overlapping a
+    real rosbag2 event window) still invalidate their segment, and the skips
+    still count when :func:`segment_skip_verdict` says so (> 1 % of the
+    expected updates, or a gap > 3 nominal periods). Reports with
+    ``count_fallback`` attribution are returned unchanged (fail closed). The
+    iiwa never calls this."""
+    import copy
+
+    if not report or report.get("attribution") != "events":
+        return report
+    result = copy.deepcopy(dict(report))
+    entry = result.get("topics", {}).get("/dynamic_joint_states")
+    if not entry:
+        return result
+    period = result.get("nominal_period_ns")
+    window_ns = int(round(float(result.get("event_window_s", TRANSPORT_EVENT_WINDOW_S)) * 1e9))
+    candidates = np.sort(np.asarray(entry.get("missing_stamps_ns", []), dtype=np.int64))
+    real = [e for e in entry.get("rosbag2_events", []) if not e.get("startup_artefact")]
+    runs, start = [], 0
+    for index in range(1, len(candidates) + 1):
+        if index == len(candidates) or not period or candidates[index] - candidates[index - 1] > 1.5 * period:
+            runs.append((start, index))
+            start = index
+    charged = np.zeros(len(candidates), dtype=bool)
+    holes = []
+    for first, stop in runs:
+        first_ns, last_ns = candidates[first], candidates[stop - 1]
+        if any(first_ns <= e["t_ns"] and last_ns >= e["t_ns"] - window_ns for e in real):
+            charged[first:stop] = True
+        else:
+            count = stop - first
+            holes.append([int(first_ns), int(last_ns), int(count), int((count + 1) * period) if period else 0])
+    entry.update(transport_stamps_ns=candidates[charged].tolist(), skip_stamps_ns=candidates[~charged].tolist(),
+                 publisher_skips=int((~charged).sum()), skip_holes_ns=holes,
+                 attribution_note="UR_10: events rule (RTDE is the UR10 data source)")
+    return result
+
+
 def data_topic_losses(report: Mapping[str, Any] | None, lo_ns: int, hi_ns: int) -> int:
     """RR_12 B-2's rule: losses on ``/dynamic_joint_states`` or the JTC
     ``controller_state`` inside a segment invalidate it.

@@ -327,7 +327,7 @@ def test_real_hardware_refuses_an_unpinned_reference(tmp_path):
         load_lab_config(_write(tmp_path, raw))
 
 
-def _filled_real_lab_file(name: str) -> dict:
+def _filled_real_lab_file(name: str, calibration: Path | None = None) -> dict:
     """``iiwa.yaml``/``ur10.yaml`` as T2.0-lab will leave them: every null
     measured value filled and both reviewed flags true."""
     raw = yaml.safe_load((LAB / f"{name}.yaml").read_text(encoding="utf-8"))
@@ -338,7 +338,9 @@ def _filled_real_lab_file(name: str) -> dict:
     raw["scene"]["reviewed"] = True
     raw["safety"]["vendor_checksum"] = "0xDEADBEEF"
     if name == "ur10":
-        raw["connection"]["kinematics_params_file"] = None  # ignorable until T2.5
+        # UR_07 F-3: a null calibration is refused on real; any existing file loads
+        raw["connection"]["kinematics_params_file"] = str(calibration) if calibration else None
+        raw["safety"]["vendor_limits"] = {"tool_speed": 1.0, "elbow_speed": 1.0}  # UR_01 U-4, measured on the pendant
     return raw
 
 
@@ -347,9 +349,16 @@ def _filled_real_lab_file(name: str) -> dict:
     ("ur10", "cc8867e909b0e9804df29b4645cabb954991fe99c7c0d2e6d0639b6fbf214a2c", 11.0),
 ])
 def test_real_lab_files_load_once_t2_0_fills_them(tmp_path, name, sha, cap):
-    with pytest.raises(ConfigError, match="refused"):
-        load_lab_config(LAB / f"{name}.yaml")  # as checked in: not reviewed yet
-    config = load_lab_config(_write(tmp_path, _filled_real_lab_file(name)))
+    checked_in = yaml.safe_load((LAB / f"{name}.yaml").read_text(encoding="utf-8"))
+    if checked_in["limits"].get("reviewed") and checked_in["scene"].get("reviewed"):
+        # the iiwa since the 2026-10-14 lab session: filled in and reviewed
+        assert load_lab_config(LAB / f"{name}.yaml").hardware == "real"
+    else:
+        with pytest.raises(ConfigError, match="refused"):
+            load_lab_config(LAB / f"{name}.yaml")  # as checked in: not reviewed yet
+    calibration = tmp_path / "calibration.yaml"
+    calibration.write_text("kinematics:\n  hash: calib_1\n", encoding="utf-8")
+    config = load_lab_config(_write(tmp_path, _filled_real_lab_file(name, calibration)))
     assert config.hardware == "real"
     assert config.consumer.reference_sha256 == sha
     assert config.consumer.reference_contract.endswith(".contract.json")

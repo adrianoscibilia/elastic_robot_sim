@@ -18,7 +18,10 @@
 #   --test    run both test invocations (ROS-sourced packages, then the
 #             ROS-free erd_recording suite) after building
 #   --real    ROS_DOMAIN_ID=0 for real robots (default: 87, the domain every
-#             mock/emulator/URSim config requires, RR_01 S9)
+#             mock/emulator/URSim config requires, RR_01 S9), and
+#             ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST so two robot PCs on one
+#             LAN (both domain 0) can't see each other's graphs; every node of
+#             a recording runs on one machine (UR_01 U-5)
 #   --help    print this header
 #
 # Everything generated lives in the repo but is gitignored:
@@ -65,6 +68,7 @@ _erd_install_system_deps() {
     ros-dev-tools python3-pytest python3-yaml \
     ros-jazzy-ros2-control ros-jazzy-ros2-controllers \
     ros-jazzy-ur-robot-driver ros-jazzy-ur-description ros-jazzy-ur-client-library \
+    ros-jazzy-ur-calibration \
     ros-jazzy-xacro ros-jazzy-pinocchio ros-jazzy-rosbag2-storage-mcap || return 1
   if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
     sudo rosdep init || return 1
@@ -258,6 +262,13 @@ _erd_main() {
   # shellcheck disable=SC1091
   source "$ERD_WS/.venv-erd/bin/activate"
   export ROS_DOMAIN_ID="$domain"
+  local discovery=""
+  if (( domain == 0 )); then
+    export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+    discovery=", ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST"
+  else
+    unset ROS_AUTOMATIC_DISCOVERY_RANGE  # UR_07: a re-source without --real must not keep LOCALHOST
+  fi
 
   if (( run_tests )); then
     _erd_test || _erd_warn "some tests failed (see colcon test-result above)"
@@ -268,7 +279,7 @@ _erd_main() {
   command -v docker >/dev/null 2>&1 \
     || _erd_warn "docker not found: L2 (FRI emulator, URSim) needs it"
 
-  _erd_log "ready: ROS_DOMAIN_ID=$ROS_DOMAIN_ID, workspace $ERD_WS"
+  _erd_log "ready: ROS_DOMAIN_ID=$ROS_DOMAIN_ID$discovery, workspace $ERD_WS"
   _erd_log "lab configs: \$ERD_LAB  recordings: \$ERD_DATA_ROOT"
 }
 

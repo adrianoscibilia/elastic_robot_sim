@@ -165,6 +165,25 @@ def write_stamp(repo_root: Path, install_root: Path, digest: str | None = None) 
     return digest
 
 
+#: UR_01 U-2: apt packages whose installed versions go into every run's
+#: ``code_digest`` block, so a laptop/peepo driver mismatch is visible.
+DRIVER_PACKAGES = ("ros-jazzy-ur-robot-driver", "ros-jazzy-ur-controllers", "ros-jazzy-ur-client-library",
+                   "ros-jazzy-ur-description", "ros-jazzy-ur-calibration")
+
+
+def installed_driver_packages(packages: tuple[str, ...] = DRIVER_PACKAGES) -> dict[str, str | None]:
+    """``dpkg-query -W`` version of each package, ``None`` when not installed."""
+    versions: dict[str, str | None] = {}
+    for package in packages:
+        try:
+            run = subprocess.run(["dpkg-query", "-W", "-f=${Version}", package], capture_output=True, text=True)
+        except OSError:
+            versions[package] = None
+            continue
+        versions[package] = (run.stdout.strip() or None) if run.returncode == 0 else None
+    return versions
+
+
 def external_repos(repo_root: Path, workspace: Path | None) -> dict[str, Any]:
     """RR_18 R-4(c): per ``src/ros2/erd.repos`` entry, the pinned version and
     the commit checked out under ``ros2_ws/src/external/<name>`` (``git
@@ -215,14 +234,15 @@ def code_digest() -> dict[str, Any]:
     repo_root = find_repo_root()
     if repo_root is None:
         block = {"value": None, "method": METHOD, "source": None, "install": {"ok": False},
-                 "build_stamp": {"ok": False}, "external_repos": {}}
+                 "build_stamp": {"ok": False}, "external_repos": {}, "driver_packages": installed_driver_packages()}
     else:
         install_root = find_install_root(repo_root)
         value = source_digest(repo_root)
         block = {"value": value, "method": METHOD, "source": str(repo_root),
                  "install": install_check(repo_root / "src" / "ros2", install_root),
                  "build_stamp": build_stamp(install_root, value),
-                 "external_repos": external_repos(repo_root, None if install_root is None else install_root.parent)}
+                 "external_repos": external_repos(repo_root, None if install_root is None else install_root.parent),
+                 "driver_packages": installed_driver_packages()}
     block["problems"] = _problems(block)
     block["ok"] = not block["problems"]
     return block

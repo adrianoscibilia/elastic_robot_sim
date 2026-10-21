@@ -443,6 +443,23 @@ def finalize_checks(checks: Sequence[Mapping[str, Any]], *, hardware: str, robot
             "not_applicable": [c["check"] for c in final if c.get("status") == "not_applicable"]}
 
 
+def check_position_side(position_side: str, *, hardware: str) -> dict[str, Any]:
+    """UR_01 U-3: E-ur-4's answer. ``link`` (``actual_q`` is link-side) fails on
+    ``hardware: real`` -- inputs and target are then collocated, an architect
+    decision (``01`` S3); ``pending`` is reported, not failed."""
+    if position_side == "link":
+        if hardware == "real":
+            return {"check": "motor-side position", "ok": False, "position_side": "link",
+                    "reason": "UR10 `actual_q` is link-side: inputs and target are collocated (`01` §3); "
+                              "architect decision needed"}
+        return {"check": "motor-side position", "ok": True, "position_side": "link",
+                "note": "link-side position tolerated off real hardware"}
+    if position_side == "motor":
+        return {"check": "motor-side position", "ok": True, "position_side": "motor"}
+    return {"check": "motor-side position", "ok": True, "status": "pending", "position_side": "pending E-ur-4",
+            "note": "E-ur-4 not analysed yet; reported, not failed"}
+
+
 def validate_dataset(
     frame: pd.DataFrame, *, n_dof: int, nominal_dt: float, position_lower: np.ndarray, position_upper: np.ndarray,
     quantization: float, tau_source: str, ft_source: str, effort_limit: np.ndarray,
@@ -450,7 +467,7 @@ def validate_dataset(
     session_health: Mapping[str, Any] | None = None, identification_freshness: Mapping[str, Any] | None = None,
     reference_tracking: Mapping[str, Any] | None = None, envelopes: Mapping[str, Any] | None = None,
     noise: Mapping[str, Any] | None = None, sign_convention: Mapping[str, Any] | None = None,
-    hardware: str, robot: str = "",
+    hardware: str, robot: str = "", position_side: str | None = None,
 ) -> dict[str, Any]:
     """Assemble every S8.3 check into one ``validation.json``-shaped report.
     ``hardware`` has no default (RR_16 Q-3, F-6): a caller that forgets it
@@ -470,4 +487,6 @@ def validate_dataset(
                         ("identification freshness", identification_freshness),
                         ("reference tracking", reference_tracking), ("envelopes", envelopes), ("noise", noise)):
         checks.append({"check": name, **(dict(value) if value is not None else _NOT_AVAILABLE)})
+    if position_side is not None:
+        checks.append(check_position_side(position_side, hardware=hardware))
     return finalize_checks(checks, hardware=hardware, robot=robot)

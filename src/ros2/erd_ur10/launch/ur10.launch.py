@@ -80,13 +80,60 @@ def _controllers_file_for(lab_config_path: str, run_dir: str) -> str:
     return str(output_path)
 
 
+#: Launch arguments the lab file also owns (UR_01 U-1.1): ``name -> (lab key,
+#: default declared below)``. An explicit argument that differs from the file
+#: is refused, so the driver and the recorder can't connect to different robots.
+_CONNECTION_ARGUMENTS = {
+    "robot_ip": "192.168.56.10",
+    "reverse_ip": "192.168.56.1",
+    "headless_mode": "false",
+}
+
+
+def resolve_connection(arguments: dict, connection) -> dict:
+    """The driver's connection values. ``arguments`` maps each name of
+    :data:`_CONNECTION_ARGUMENTS` to the launch value, ``None`` when the
+    operator did not give it; ``connection`` is the lab file's
+    :class:`~erd_recording.config.Ur10Connection` (``None`` without a lab file,
+    mock only: the argument or its default is used as before)."""
+    resolved = {}
+    for name, default in _CONNECTION_ARGUMENTS.items():
+        given = arguments.get(name)
+        if connection is None:
+            resolved[name] = default if given is None else given
+            continue
+        from_file = getattr(connection, name)
+        if name == "headless_mode":
+            from_file = str(bool(from_file)).lower()
+        if given is not None and str(given).lower() != str(from_file).lower():
+            raise RuntimeError(
+                f"ur10.launch.py: {name}:={given} differs from the lab file's connection.{name}={from_file}; "
+                "the recorder reads the lab file, so the two must agree (UR_01 U-1.1). "
+                "Drop the argument or edit the lab file."
+            )
+        resolved[name] = str(from_file)
+    return resolved
+
+
+def _given(context, name: str):
+    """The launch argument's value if the operator passed it, else ``None``
+    (the declared default is the empty string for these three)."""
+    value = LaunchConfiguration(name).perform(context)
+    return value if value != "" else None
+
+
 def _launch_setup(context, *args, **kwargs):
     hardware = LaunchConfiguration("hardware")
     hardware_value = hardware.perform(context)
-    robot_ip = LaunchConfiguration("robot_ip")
-    reverse_ip = LaunchConfiguration("reverse_ip")
     lab_config_path = LaunchConfiguration("lab_config").perform(context)
     run_dir = LaunchConfiguration("run_dir").perform(context)
+
+    connection = None
+    if lab_config_path:
+        from erd_recording.config import load_lab_config
+        connection = load_lab_config(lab_config_path).connection
+    connect = resolve_connection({name: _given(context, name) for name in _CONNECTION_ARGUMENTS}, connection)
+    print(f"[ur10.launch.py] connection: {connect}")
 
     # RR_06 P3-2c: outside mock, the JTC's path/goal tolerances are a safety
     # parameter, not an optional extra.
@@ -99,18 +146,27 @@ def _launch_setup(context, *args, **kwargs):
     controllers_file = _controllers_file_for(lab_config_path, run_dir)
     ur_control_launch = str(Path(get_package_share_directory("ur_robot_driver")) / "launch" / "ur_control.launch.py")
 
+    driver_arguments = {
+        "ur_type": "ur10",
+        "robot_ip": connect["robot_ip"],
+        "reverse_ip": connect["reverse_ip"],
+        "use_mock_hardware": PythonExpression(["'", hardware, "' == 'mock'"]),
+        "headless_mode": connect["headless_mode"],
+        "controllers_file": controllers_file,
+        "initial_joint_controller": "scaled_joint_trajectory_controller",
+        "launch_rviz": "false",
+    }
+    if connection is not None:
+        # UR_01 U-1.3: the robot's factory calibration reaches the description
+        # through ur_control -> ur_rsp.launch.py.
+        if connection.kinematics_params_file:
+            driver_arguments["kinematics_params_file"] = connection.kinematics_params_file
+        # UR_01 U-1.5: opt-in; false is what was rehearsed.
+        if connection.blocking_read:
+            driver_arguments["blocking_read"] = "true"
     driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(ur_control_launch),
-        launch_arguments={
-            "ur_type": "ur10",
-            "robot_ip": robot_ip,
-            "reverse_ip": reverse_ip,
-            "use_mock_hardware": PythonExpression(["'", hardware, "' == 'mock'"]),
-            "headless_mode": LaunchConfiguration("headless_mode"),
-            "controllers_file": controllers_file,
-            "initial_joint_controller": "scaled_joint_trajectory_controller",
-            "launch_rviz": "false",
-        }.items(),
+        launch_arguments=driver_arguments.items(),
     )
 
     # RR_12 A-3a: on hardware: real, preflight refuses any active controller
@@ -121,13 +177,21 @@ def _launch_setup(context, *args, **kwargs):
     # force_torque_sensor_broadcaster stays: joint_state_broadcaster is
     # chained to it and cannot run without it.
     extras = " ".join(EXTRA_ACTIVE_CONTROLLERS)
+    # UR_01 U-1.4 / UR_07 F-2: with headless_mode:=false the JTC becomes active
+    # only after Play on the pendant (the controller stopper holds it inactive
+    # until then), so for every hardware but mock the wait has no cap and says
+    # what it waits for; URSim's pendant rehearsal takes the path the real robot does.
+    wait_cap = "" if hardware_value != "mock" and connect["headless_mode"] == "false" \
+        else "[ $i -gt 120 ] && break; "
     deactivate_extras = ExecuteProcess(
         cmd=["bash", "-c",
              "is_active() { echo \"$1\" | grep -qE \"^$2 +.* active\"; }; "
-             "for i in $(seq 1 120); do "
+             "for i in $(seq 1 100000); do "
+             f"  {wait_cap}"
              "  listed=$(ros2 control list_controllers 2>/dev/null); ready=1; "
              f"  for c in scaled_joint_trajectory_controller {extras}; do is_active \"$listed\" $c || ready=0; done; "
-             "  [ $ready = 1 ] && break; sleep 1; "
+             "  [ $ready = 1 ] && break; "
+             "  [ $((i % 10)) = 0 ] && echo 'erd_ur10: waiting for the pendant program (press Play)'; sleep 1; "
              "done; "
              "for attempt in 1 2 3 4 5; do "
              f"  ros2 control switch_controllers --deactivate {extras} --strict "
@@ -146,9 +210,14 @@ EXTRA_ACTIVE_CONTROLLERS = ("gravity_update_controller", "friction_model_control
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument("hardware", default_value="mock", description="mock | ursim | real"),
-        DeclareLaunchArgument("robot_ip", default_value="192.168.56.10"),
-        DeclareLaunchArgument("reverse_ip", default_value="192.168.56.1"),
-        DeclareLaunchArgument("headless_mode", default_value="false"),
+        # UR_01 U-1.1: with lab_config:= the connection comes from the lab file; an explicit
+        # value must equal it. Without lab_config (mock) the defaults below apply.
+        DeclareLaunchArgument("robot_ip", default_value="",
+                              description="default 192.168.56.10 (mock only); with lab_config:= taken from the file"),
+        DeclareLaunchArgument("reverse_ip", default_value="",
+                              description="default 192.168.56.1 (mock only); with lab_config:= taken from the file"),
+        DeclareLaunchArgument("headless_mode", default_value="",
+                              description="default false (mock only); with lab_config:= taken from the file"),
         DeclareLaunchArgument("lab_config", default_value="",
                               description="path to the erd.lab/1 YAML this run uses, for the JTC tolerance "
                                           "override (RR_04 A-5); required outside hardware:=mock (RR_06 P3-2c)"),

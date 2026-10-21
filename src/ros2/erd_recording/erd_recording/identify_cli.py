@@ -228,6 +228,9 @@ def identify(config, root, reference):
     frames, bounds = windows(raw, events, selected)
     losses_path = recording / 'recorder_losses.json'
     losses = json.loads(losses_path.read_text()) if losses_path.is_file() else None
+    if config.robot == 'ur10_cb3':  # UR_10: RTDE is the data source; djs skips judged by the events rule
+        from .bagio import ur_attributed_losses
+        losses = ur_attributed_losses(losses)
     health = segment_health(selected, frames, bounds, losses, hardware=config.hardware,
                                 clock_ratio=robot_clock_ratio(config, recording))
     n = len(config.joint_order)
