@@ -50,6 +50,10 @@ class RobotProfile:
     #: one encoder count of the recorded joint position (RR_12 S5.1 table:
     #: iiwa S-1, UR10 S-24 class E); RR_14 P-3's floor for the rung-4a threshold.
     position_count_rad: float = 0.0
+    #: UR_11 E-ur-1 step 3: drive size per joint of ``driver_joint_order``
+    #: (joints of one size share a K_tau) and where that table comes from.
+    joint_sizes: tuple[str, ...] | None = None
+    joint_size_source: str | None = None
 
 
 IIWA_PROFILE = RobotProfile(
@@ -91,6 +95,8 @@ UR10_PROFILE = RobotProfile(
                                  # joint_state_broadcaster is chained to it:
                                  "force_torque_sensor_broadcaster"),
     software_version_service="/ur_configuration_controller/get_robot_software_version",
+    joint_sizes=("size4", "size4", "size3", "size2", "size2", "size2"),
+    joint_size_source="Universal Robots, 'Max. joint torques CB3 and e-Series', column UR10/UR10e/UR12e [S-6]",
 )
 
 

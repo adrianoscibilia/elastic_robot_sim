@@ -1664,10 +1664,21 @@ def _prepare_conversion(config, root):
 
 
 def stage_convert(config: LabConfig, config_path: str, paths: RunPaths, *, reference_contract: str | None,
-                  reference_sha256: str | None = None) -> dict[str, Any]:
+                  reference_sha256: str | None = None, keep_derived_raw: bool = False) -> dict[str, Any]:
     """Run ``convert_cli`` as a subprocess with a cleaned environment (RR_04
     A-8: like ``plan``, it imports Pinocchio for the baselines/sign-convention
-    gravity fit -- T1.0/T1.6's LD_LIBRARY_PATH conflict)."""
+    gravity fit -- T1.0/T1.6's LD_LIBRARY_PATH conflict).
+
+    UR_11: ``keep_derived_raw`` (``--keep-derived-raw``, offline ``--run-dir``
+    only) converts from the run folder's existing ``raw.parquet``,
+    ``events.json``, ``rtde_alignment.json`` and ``recorder_losses*.json``
+    instead of re-deriving (overwriting) them from the bags: on a copied run
+    folder those files are the laptop's originals."""
+    if keep_derived_raw:
+        missing = [p.name for p in (paths.raw_parquet, paths.root / "events.json") if not p.is_file()]
+        if missing:
+            raise PipelineError(f"--keep-derived-raw: {paths.root} has no {missing}; convert without it")
+        return _run_convert_cli(config_path, paths, reference_contract, reference_sha256)
     _prepare_conversion(config, paths.root)
     if paths.standstill_bag_dir.is_dir():
         from .bagio import write_recorder_losses
@@ -1675,6 +1686,11 @@ def stage_convert(config: LabConfig, config_path: str, paths: RunPaths, *, refer
         write_recorder_losses(config, paths.standstill_bag_dir,
                               paths.raw_log_dir / "bag_standstill.rosbag2.stderr.log",
                               paths.root / "recorder_losses_standstill.json")
+    return _run_convert_cli(config_path, paths, reference_contract, reference_sha256)
+
+
+def _run_convert_cli(config_path: str, paths: RunPaths, reference_contract: str | None,
+                     reference_sha256: str | None) -> dict[str, Any]:
     command = [sys.executable, "-m", "erd_recording.convert_cli", "--config", config_path,
               "--run-dir", str(paths.root)]
     if reference_contract:
@@ -1840,6 +1856,9 @@ def _parse_args(argv: list[str]) -> Any:
                              "rosbag2_recorder:=debug (~0.5 MB/s of rcl lines). Other levels are refused: they drop "
                              "the \"Subscribed to topic\" lines the start wait needs (RR_18 R-5)")
     parser.add_argument("--checkpoints", default=None, help="evaluate: chain summary CSV (default consumer.checkpoints)")
+    parser.add_argument("--keep-derived-raw", action="store_true",
+                        help="convert with --run-dir: use the folder's raw.parquet/events.json/rtde_alignment.json/"
+                             "recorder_losses*.json as they are instead of re-deriving them from the bags (UR_11)")
     return parser.parse_args(argv)
 
 
@@ -1880,6 +1899,8 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
         paths = RunPaths(Path(args.run_dir).expanduser().resolve())
         if not paths.plan_dir.is_dir():
             raise PipelineError(f"--run-dir {paths.root}: not a run folder (no plan/)")
+    elif args.keep_derived_raw:
+        raise PipelineError("--keep-derived-raw is for an existing run folder (--run-dir) only")
     else:
         paths = make_run_dir(config, run_id=args.run_id)
     sim_to_driver = config.description.sim_to_driver()
@@ -1974,7 +1995,7 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
                     raise PipelineError(f"run failed: {run_result}")
             elif stage == "convert":
                 stage_convert(config, args.config, paths, reference_contract=args.reference_contract,
-                              reference_sha256=args.reference_sha256)
+                              reference_sha256=args.reference_sha256, keep_derived_raw=args.keep_derived_raw)
             elif stage == "validate":
                 validation = stage_validate(paths)
             elif stage == "report":

@@ -16,8 +16,10 @@ from .bagio import (data_topic_losses, segment_skip_verdict, segment_skips, even
                     robot_clock_samples, segment_completeness)
 from .config import load_lab_config
 from .contract import load_reference, differentiation_from_reference, resolve_reference
-from .identification import choose_ur_tau_source, fit_linear_per_joint, identify_motor_side, fit_sweep_friction
+from .identification import (IdentificationRefused, choose_ur_tau_source, controller_rotor_inertia,
+                             fit_linear_per_joint, fit_sweep_friction, friction_torque, identify_motor_side)
 from .planning import load_plan
+from .profile import profile_for
 from .validate import require_hardware
 
 
@@ -140,15 +142,24 @@ def detrended_sigma(frames, columns):
 
 def gravity_testability(pose_gravity, sigma, slope, r_squared, joint_names):
     """RR_12 B-3: slope reported only where the joint's gravity range across
-    the poses is >= 10x its standstill sigma and r^2 >= 0.9."""
+    the poses is >= 10x its standstill sigma and r^2 >= 0.9.
+
+    UR_11: a zero gravity range or a zero sigma is never testable. Both make
+    the rule degenerate (``0 >= 10 * 0``), and a constant measured channel
+    gets r^2 1 from ``fit_linear_per_joint``'s ss_tot = 0 convention: UR10
+    wrist 3 (no gravity, K_tau 0) was judged with slope 0 and failed the
+    sign check; the iiwa mock's all-zero ``ft`` did the same on every joint."""
     pose_gravity = np.asarray(pose_gravity, dtype=float)
     span = pose_gravity.max(axis=0) - pose_gravity.min(axis=0)
     table = []
     for j, name in enumerate(joint_names):
-        range_ok = span[j] >= GRAVITY_RANGE_SIGMAS * sigma[j]
+        degenerate = not (span[j] > 0.0 and sigma[j] > 0.0)
+        range_ok = not degenerate and span[j] >= GRAVITY_RANGE_SIGMAS * sigma[j]
         fit_ok = r_squared[j] >= GRAVITY_MIN_R_SQUARED
         testable = bool(range_ok and fit_ok)
         reason = None if testable else (
+            f'not testable at these poses: degenerate (gravity range {span[j]:.3g} N*m, sigma {sigma[j]:.3g})'
+            if degenerate else
             'not testable at these poses: gravity range ' f'{span[j]:.3g} N*m < {GRAVITY_RANGE_SIGMAS:g} sigma '
             f'({GRAVITY_RANGE_SIGMAS * sigma[j]:.3g})' if not range_ok else
             f'not testable at these poses: r^2 {r_squared[j]:.3g} < {GRAVITY_MIN_R_SQUARED}')
@@ -292,7 +303,7 @@ def identify(config, root, reference):
                          gravity, pose_gravity, asset, n, sg, poly, dt)
     invalid = sorted(sid for sid, entry in result['segments'].items() if not entry['ok'])
     result['invalid_segments'] = invalid
-    result['ok'] = not invalid
+    result['ok'] = not invalid and 'refusal' not in result
     result = _serializable(result)
     (root / 'identification.json').write_text(json.dumps(result, indent=2, allow_nan=False))
     return result
@@ -308,12 +319,31 @@ def _identify_ur(config, result, bundle, selected, frames, alignment, excitation
         if not entry['ok']:
             result['segments'][sid]['ok'] = False
     frame = frames[excitations[1].segment_id]
-    choice = choose_ur_tau_source(target_moment=block(frame,'target_moment',n),
-                joint_control_output=block(frame,'joint_control_output',n), target_current=block(frame,'target_current',n),
-                actual_current=block(frame,'actual_current',n),
-                tracking_error=block(frame,'target_q',n)-block(frame,'q',n),
-                tracking_error_rate=block(frame,'target_qd',n)-block(frame,'dq',n),
-                standstill_actual_current=block(holds,'actual_current',n), standstill_gravity=gravity)
+    # UR_11: the controller feed-forward over every moving fit-input segment
+    moving = pd.concat([frames[s.segment_id] for s in selected if s.kind != 'identify_hold'], ignore_index=True)
+    profile = profile_for(config.robot)
+    sizes = None
+    if profile.joint_sizes is not None:
+        driver = config.description.sim_to_driver()
+        sizes = tuple(profile.joint_sizes[profile.driver_joint_order.index(driver[name])] for name in config.joint_order)
+    try:
+        choice = choose_ur_tau_source(target_moment=block(frame,'target_moment',n),
+                    joint_control_output=block(frame,'joint_control_output',n), target_current=block(frame,'target_current',n),
+                    actual_current=block(frame,'actual_current',n),
+                    tracking_error=block(frame,'target_q',n)-block(frame,'q',n),
+                    tracking_error_rate=block(frame,'target_qd',n)-block(frame,'dq',n),
+                    standstill_actual_current=block(holds,'actual_current',n), standstill_gravity=gravity,
+                    standstill_target_moment=block(holds,'target_moment',n),
+                    standstill_target_current=block(holds,'target_current',n),
+                    feedforward={key: block(moving, key, n) for key in
+                                 ('target_current', 'target_moment', 'target_qd', 'target_qdd')},
+                    joint_sizes=sizes, joint_size_source=profile.joint_size_source)
+    except IdentificationRefused as refusal:
+        # UR_11: no placeholder K_tau; identification.json carries the reason
+        result.update(e_ur_1={**refusal.diagnostics, 'status': 'failed', 'reason': str(refusal)},
+                      physical_validity='none: E-ur-1 refused')
+        result['refusal'] = str(refusal)
+        return
     k_tau = choice['k_tau']; friction = []; sweep_table = []
     for j in range(n):
         speeds, torques = [], []
@@ -341,9 +371,19 @@ def _identify_ur(config, result, bundle, selected, frames, alignment, excitation
         qs.append(block(f,'q',n)); dqs.append(dq)
         ddqs.append(savgol_filter(dq,sg,poly,deriv=1,delta=dt,axis=0))
         currents.append(block(f,'i_act',n)); holdouts.extend([i in (0,len(excitations)-1)] * len(f))
+    # UR_11: the controller's own reflected rotor inertia, from the target
+    # signals of the identification excitations; free J_m is not identifiable
+    # on one 10 s excitation (+277 / -128 kg m^2 on pan / lift, A_02).
+    target_rows = pd.concat([frames[s.segment_id] for s in excitations], ignore_index=True)
+    controller_j_m = controller_rotor_inertia(asset, block(target_rows, 'target_q', n), block(target_rows, 'target_qd', n),
+                                              block(target_rows, 'target_qdd', n), block(target_rows, 'target_moment', n))
+    j_m_fixed = np.where(controller_j_m['identified'], controller_j_m['j_m'], np.nan)
     fit = identify_motor_side(asset, np.vstack(qs), np.vstack(dqs), np.vstack(ddqs), np.vstack(currents), k_tau,
                              holdout_mask=np.asarray(holdouts), rotor_inertia_nominal=np.asarray(UR_J_M_NOMINAL),
-                             friction_parameters=parameters)
+                             friction_parameters=parameters, j_m_fixed=j_m_fixed)
+    choice['diagnostics']['controller_rotor_inertia'] = controller_j_m
+    nominal = nominal_model_holdout(asset, np.vstack(qs), np.vstack(dqs), np.vstack(ddqs), np.vstack(currents),
+                                    k_tau, fit, np.asarray(holdouts))
     sanity = choice['diagnostics'].get('standstill_sanity_check')
     if sanity is not None:
         ft_holds = [f.assign(**{f'kt_i_act{j}': k_tau[j] * f[f'i_act{j}'] for j in range(n)}) for f in hold_frames]
@@ -352,9 +392,30 @@ def _identify_ur(config, result, bundle, selected, frames, alignment, excitation
                                                     np.asarray(sanity.get('r_squared', [1.0] * n)), config.joint_order)
     result.update(tau_source=choice['tau_source'], k_tau=k_tau, e_ur_1=choice['diagnostics'], motor_fit=asdict(fit),
                   friction_sweeps=sweep_table, friction_fit=friction, friction_split='all_motor', epsilon=.01,
-                  holdout_segments=[excitations[0].segment_id,excitations[-1].segment_id],
+                  holdout_segments=[excitations[0].segment_id,excitations[-1].segment_id], nominal_model_holdout=nominal,
                   fit_rows=sum(not x for x in holdouts), holdout_rows=sum(holdouts),
                   physical_validity='synthetic URSim fit' if config.hardware != 'real' else 'requires physical review')
+
+
+def nominal_model_holdout(asset, q, dq, ddq, i_act, k_tau, fit, holdout_mask):
+    """UR_11: the motor-current proxy on the holdout rows against the bare
+    asset's own rigid-body RNEA, with the identified K_tau, J_m and friction
+    but no base-parameter refit. E-ur-3's ``holdout_rms`` refits ~40 base
+    parameters on one 10 s excitation and generalises worse (A_02 5.6 vs
+    3.7 N*m); this is the sim2real figure."""
+    pin, model, data = idn.build_model(asset)
+    rows = np.flatnonzero(holdout_mask)
+    if not len(rows):
+        return None
+    friction = friction_torque(dq[rows], {'viscous': fit.viscous, 'coulomb': fit.coulomb, 'stribeck': fit.stribeck,
+                                          'stribeck_velocity': fit.stribeck_velocity})
+    proxy = k_tau[None, :] * i_act[rows] - fit.j_m[None, :] * ddq[rows] - friction
+    rnea = np.asarray([pin.rnea(model, data, q[i], dq[i], ddq[i]).copy() for i in rows])
+    error = proxy - rnea
+    return {'rms_nm': float(np.sqrt(np.mean(error**2))), 'rms_per_joint_nm': np.sqrt(np.mean(error**2, axis=0)).tolist(),
+            'target_rms_nm': float(np.sqrt(np.mean(proxy**2))),
+            'target_rms_per_joint_nm': np.sqrt(np.mean(proxy**2, axis=0)).tolist(), 'rows': int(len(rows)),
+            'model': 'bare asset RNEA, no refit; identified K_tau, J_m, friction'}
 
 
 def _loss_summary(losses):
@@ -379,7 +440,7 @@ def main():
                                hardware=config.hardware, sim_asset=config.description.sim_asset)
     result = identify(config,Path(args.run_dir),reference)
     print(json.dumps({'ok':result['ok'],'recorded_rows':result['recorded_rows'],'fit_rows':result['fit_rows'],
-                      'invalid_segments':result['invalid_segments']}))
+                      'invalid_segments':result['invalid_segments'], 'refusal': result.get('refusal')}))
     # RR_12 B-1: an incomplete or lossy fit-input segment fails the stage;
     # identification.json stays on disk as the evidence.
     return 0 if result['ok'] else 1

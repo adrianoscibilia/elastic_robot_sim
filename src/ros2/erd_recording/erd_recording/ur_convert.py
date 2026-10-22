@@ -34,7 +34,8 @@ def convert_ur(config, root: Path, reference):
     if identification['config_digest'] != bundle.config_digest:
         raise ValueError('identification and recording config digests differ')
     if identification.get('ok') is False:
-        raise ValueError(f"identification has invalid segments: {identification.get('invalid_segments')}")
+        raise ValueError(f"identification failed: invalid segments {identification.get('invalid_segments')}, "
+                         f"refusal {identification.get('refusal')}")
     raw = pd.read_parquet(root / 'raw.parquet')
     events = json.loads((root / 'events.json').read_text())
     alignment = json.loads((root / 'rtde_alignment.json').read_text())
