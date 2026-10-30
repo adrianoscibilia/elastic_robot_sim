@@ -28,6 +28,7 @@ dependencies = [
     "pin==3.4.0; sys_platform == 'win32'",
     "pin-pink==4.3.0",
     "proxsuite==0.7.3",
+    "cvxpy>=1.9.3",
 ]
 
 [dependency-groups]

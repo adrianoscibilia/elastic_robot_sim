@@ -15,6 +15,16 @@ the same optimized trajectories:
 * ``ablation_clean``-> ``<stem>_ablation_clean.parquet``: the noise block off and
   the clean target (Sec 6's noise ablation).
 
+``--round8`` (``identified_filter/01`` Sec 1, a config with a ``round8:`` block)
+adds the ``oop`` (out-of-prior robots, test only) and ``modal`` (single-joint
+chirps of 10 test robots) variants, the per-bag oracle verification of every
+elastic bag (written as privileged per-bag columns), the modal-coverage gate on
+the production file's ``full`` bags with up to ``retries`` regenerations of a
+failing bag at the next seed, the ``mjj*`` audit columns and the contract's
+``privileged`` / ``modal_coverage`` / ``round8`` blocks.  A platform whose gate
+joint is observable in fewer than ``raise_fraction`` of its ``full`` bags exits
+4: rerun with ``--coverage-escalation`` one higher (raises the lines' level).
+
 ``--taufree`` (FR_04, a ``payload.mode: none``/``fixed`` config) adds to every
 contract the ``audit_columns``, ``transmission_priors`` and
 ``baselines.two_mass`` blocks (:mod:`elastic_sim.round7`), and writes the
@@ -54,16 +64,23 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
 sys.path.insert(0, os.fspath(_REPO / "scripts"))
 
 import numpy as np
+import pandas as pd
 
 from diagnose_controller_modes import _load_asset, _shrink, add_baselines_to_contract
 from elastic_sim.dataset import PlantExtrasSampling, assign_splits, default_jobs, generate, load_config, write_dataset
 from elastic_sim.diagnostics import dataset_diagnostics
 from elastic_sim.round6_checks import check_dataset, gate_gainshift
 from elastic_sim.round7 import augment_contract
+from elastic_sim.round8 import (add_bag_columns, add_inertia_audit, add_modal_columns, contract_block, coverage_report, regimes_of,
+                                sample_oop_robots, urdf_home_inertia, verify_bags)
 
-VARIANTS = ("production", "gainshift", "ablation_off", "ablation_clean")
+VARIANTS = ("production", "gainshift", "ablation_off", "ablation_clean", "oop", "modal")
 SUFFIX = {"production": "", "gainshift": "_gainshift", "ablation_off": "_ablation_off",
-          "ablation_clean": "_ablation_clean"}
+          "ablation_clean": "_ablation_clean", "oop": "_oop", "modal": "_modal"}
+#: Exit code of a round-8 build whose modal-coverage gate asks for a higher escalation (Sec 1.1.3).
+EXIT_COVERAGE = 4
+#: Round 8: stop regenerating when a retry recovers fewer than this share of the failing bags.
+REGEN_MIN_RECOVERY = 0.10
 
 
 def variant_config(config, variant: str):
@@ -83,15 +100,127 @@ def variant_config(config, variant: str):
     if variant == "ablation_clean":
         return replace(config, noise=replace(config.noise, enabled=False),
                        signals=replace(config.signals, target_source="clean"))
+    if variant in ("oop", "modal") and config.round8 is None:
+        raise ValueError(f"the {variant} file needs a round8 config block")
+    if variant == "oop":
+        # identified_filter/01 Sec 1: K outside the widened range, test only, no rigid tier.
+        spec = config.round8
+        tiers = sample_oop_robots(config.transmission, config.seed, spec.oop)
+        return replace(config, tiers=tiers, rigid_reference=False, fixed_split="test",
+                       transmission=replace(config.transmission, robots=len(tiers)),
+                       round8=replace(spec, trajectories_by_split=(("test", spec.oop.trajectories),)),
+                       n_trajectories=max(config.n_trajectories, spec.oop.trajectories))
+    if variant == "modal":
+        labels = assign_splits(config.tiers, config.split)
+        test = tuple(sorted(name for name, label in labels.items() if label == "test"))[:config.round8.modal.robots]
+        return replace(config, only_tiers=test, modal=config.round8.modal)
     raise ValueError(f"unknown variant {variant!r}")
+
+
+def _verify(frame, manifest, contract, asset, spec, jobs: int):
+    """``verify_bags`` over the elastic bags, one bag per task in a pool when ``jobs > 1``."""
+    import concurrent.futures
+
+    bags = [b for b, g in frame.groupby("bag", sort=False) if str(g["tier"].iloc[0]) != "rigid"]
+    if jobs <= 1 or len(bags) < 2:
+        return verify_bags(frame, manifest, contract, asset, spec)
+    chunks = [frame[frame["bag"] == bag] for bag in bags]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
+        parts = list(pool.map(verify_bags, chunks, *(([x] * len(chunks)) for x in (manifest, contract, asset, spec))))
+    return pd.concat(parts, ignore_index=True)
+
+
+def _splice(frame, manifest, new_frame, new_manifest, bags):
+    """Replace ``bags`` of a build by their regenerated versions, keeping the bag order."""
+    order = {bag: i for i, bag in enumerate(frame["bag"].unique())}
+    kept = frame[~frame["bag"].isin(bags)]
+    merged = pd.concat([kept, new_frame[new_frame["bag"].isin(bags)]], ignore_index=True)
+    merged = merged.iloc[np.argsort(merged["bag"].map(order).to_numpy(), kind="stable")].reset_index(drop=True)
+    records = {r["bag"]: r for r in new_manifest.get("records", []) if r["bag"] in bags}
+    manifest = dict(manifest)
+    manifest["records"] = [records.get(r["bag"], r) for r in manifest.get("records", [])]
+    return merged, manifest
+
+
+def round8_verification(variant_cfg, asset, frame, manifest, *, jobs: int, verbose: bool, gate: bool,
+                        trajectory_cache: dict):
+    """Sec 1.1.3: verify every elastic bag; on the production file regenerate failing ``full`` bags.
+
+    Returns ``(frame, manifest, verification, coverage, attempts)``.  A failing
+    bag (a resolvable main joint not observable) is rebuilt at the next seed,
+    at most ``retries`` times, then kept and flagged (``regen_attempt``).
+    """
+    from elastic_sim.dataset_config import differentiation_policy
+    from elastic_sim.round7 import transmission_priors
+
+    spec = variant_cfg.round8
+    # What verify_bags reads of the contract, before it is written: the SG window and the burn-in.
+    contract = {"differentiation": differentiation_policy(variant_cfg),
+                "transmission_priors": transmission_priors(manifest, asset,
+                                                           burn_in_override_s=variant_cfg.burn_in_override_s)}
+    verification = _verify(frame, manifest, contract, asset, spec, jobs)
+    regimes = regimes_of(variant_cfg, frame)
+    coverage = coverage_report(verification, regimes, spec)
+    attempts: dict[str, int] = {}
+    reseed = list(variant_cfg.reseed)
+    previous_failing = 0
+    for attempt in range(1, spec.verification.retries + 1 if gate else 1):
+        failing = [b for b in coverage["failing_full_bags"] if attempts.get(b, 0) == attempt - 1]
+        if not failing:
+            break
+        if attempt > 1 and len(failing) > (1.0 - REGEN_MIN_RECOVERY) * previous_failing:
+            # The last retry fixed almost nothing: the failure is not the draw (a new seed cannot fix a plant
+            # whose spring is not the linear filter's, e.g. the nonlinear spring and transmission error).
+            coverage["regeneration_stopped"] = (f"attempt {attempt - 1} recovered {previous_failing - len(failing)} "
+                                                f"of {previous_failing} bags")
+            break
+        previous_failing = len(failing)
+        pairs = []
+        for bag in failing:
+            tier = str(frame.loc[frame["bag"] == bag, "tier"].iloc[0])
+            index = int(str(bag).split("_")[0][1:])
+            pairs.append((tier, index))
+            reseed = [r for r in reseed if (r[0], r[1]) != (tier, index)] + [(tier, index, attempt)]
+        if verbose:
+            print(f"[round8] regenerating {len(failing)} full bag(s), attempt {attempt}: {failing[:6]}...")
+        sub = replace(variant_cfg, reseed=tuple(reseed), only_bags=tuple(pairs))
+        new_frame, new_manifest, _ = generate(sub, asset, verbose=False, jobs=jobs, trajectory_cache=trajectory_cache)
+        done = sorted(set(new_frame["bag"]) & set(failing))
+        frame, manifest = _splice(frame, manifest, new_frame, new_manifest, done)
+        for bag in done:
+            attempts[bag] = attempt
+        fresh = _verify(frame[frame["bag"].isin(done)], manifest, contract, asset, spec, jobs)
+        verification = pd.concat([verification[~verification["bag"].isin(done)], fresh], ignore_index=True)
+        variant_cfg = sub
+        regimes = regimes_of(variant_cfg, frame)
+        coverage = coverage_report(verification, regimes, spec)
+    coverage["regenerated"] = attempts
+    coverage["still_failing"] = coverage["failing_full_bags"]
+    # Escalation (stronger lines) can only help a joint whose full-regime in-band SNR is below the threshold.
+    full = coverage["per_regime"].get("full", {})
+    coverage["excitation_limited"] = sorted(
+        joint for joint in coverage["raise_joints"]
+        if not (full.get(joint, {}).get("median_snr", float("nan")) >= spec.verification.snr_min))
+    frame = add_bag_columns(frame, regimes, verification, attempts)
+    return frame, manifest, verification, coverage, attempts
 
 
 def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs: int, verbose: bool,
                   save: bool, trajectory_cache: dict, production_manifest: dict | None = None,
-                  taufree: bool = False, priors: dict | None = None) -> dict:
+                  taufree: bool = False, priors: dict | None = None, round8: bool = False) -> dict:
     variant_cfg = variant_config(config, variant)
     frame, manifest, comparison = generate(variant_cfg, asset, verbose=verbose, jobs=jobs,
                                            trajectory_cache=trajectory_cache)
+    coverage = None
+    if round8 and variant != "modal":
+        frame, manifest, _, coverage, _ = round8_verification(
+            variant_cfg, asset, frame, manifest, jobs=jobs, verbose=verbose, gate=variant == "production",
+            trajectory_cache=trajectory_cache)
+    elif round8:
+        frame = add_bag_columns(frame, {b: "modal" for b in frame["bag"].unique()}, None)
+        frame = add_modal_columns(frame, variant_cfg.modal)
+    if round8:
+        frame = add_inertia_audit(frame, asset, int(manifest["n_dof"]))
     diagnostics = dataset_diagnostics(frame, manifest, asset)
     report = check_dataset(frame, manifest, diagnostics=diagnostics, production=variant == "production")
     if variant == "gainshift" and production_manifest is not None:
@@ -100,6 +229,8 @@ def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs
                             and next(g for g in report["gates"] if g["gate"].startswith("1"))["ok"])
     report["variant"] = variant
     report["bags"] = int(manifest["n_bags"])
+    if coverage is not None:
+        report["modal_coverage"] = coverage
     report["qc_v2_median"] = {
         kind: float(np.nanmedian(diagnostics.loc[mask, "tau_unexplained_fraction"]))
         for kind, mask in (("elastic", ~diagnostics["tier"].eq("rigid")), ("rigid", diagnostics["tier"].eq("rigid")))
@@ -117,7 +248,36 @@ def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs
             priors = augment_contract(output, frame, manifest, asset, priors=priors, fixture=variant == "production",
                                       burn_in_override_s=config.burn_in_override_s)
             report["transmission_priors_burn_in_s"] = priors["burn_in_s"]
+        if round8:
+            write_round8_contract(output, variant_cfg, asset, coverage, variant)
     return {"report": report, "manifest": manifest, "priors": priors}
+
+
+def write_round8_contract(output: Path, config, asset, coverage, variant: str) -> None:
+    """The contract's r8 blocks, ``M_ref`` per joint in ``transmission_priors``, and the file's SHA-256."""
+    import hashlib
+
+    spec = config.round8
+    home = spec.modal.poses[0][1] if spec.modal.poses else [0.0] * len(asset.joint_names)
+    reference = urdf_home_inertia(asset, home)
+    path = output.with_suffix(".contract.json")
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    contract.update(contract_block(spec, coverage, variant=variant, reference_inertia=reference, home=home))
+    priors = contract.get("transmission_priors")
+    if priors:
+        manifest = json.loads(output.with_suffix(".manifest.json").read_text(encoding="utf-8"))
+        robots = manifest.get("robots") or []
+        for j, joint in enumerate(priors["joints"]):
+            joint["link_inertia_home"] = reference[j]
+            if robots:
+                damping = [float(r["damping"][j]) for r in robots]
+                joint["damping_range"] = [min(damping), max(damping)]
+    digest = hashlib.sha256()
+    with open(output, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    contract["dataset_sha256"] = digest.hexdigest()
+    path.write_text(json.dumps(contract, indent=2, default=float), encoding="utf-8")
 
 
 def _print_report(report: dict) -> None:
@@ -148,6 +308,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="FR_04: also write audit_columns, transmission_priors and the two-mass baselines into "
                              "each contract, and the production file's cross-test fixture (needs payload.mode "
                              "fixed or none)")
+    parser.add_argument("--round8", action="store_true",
+                        help="identified_filter/01 Sec 1: also build the oop and modal files, verify every bag, "
+                             "gate and regenerate full bags, write the privileged metadata (needs a round8 block)")
+    parser.add_argument("--coverage-escalation", type=int, default=0,
+                        help="round 8: 1 = all full bags acceleration-weighted at fraction [0.8, 1]; 2 = also the "
+                             "fewest lines (exit 4 asks for one level more)")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -159,7 +325,17 @@ def main(argv: list[str] | None = None) -> int:
         config = _shrink(config, trajectories=args.trajectories or config.n_trajectories,
                          robots=args.robots if args.robots is not None else config.transmission.robots,
                          backends=tuple(config.backends))
-    variants = list(dict.fromkeys(args.variants + (["ablation_off", "ablation_clean"] if args.ablations else [])))
+    if args.round8:
+        if config.round8 is None:
+            parser.error("--round8 needs a config with a round8: block")
+        config = replace(config, round8=replace(config.round8, escalation=int(args.coverage_escalation)))
+        if args.robots is not None:
+            # A preflight-sized r8 build: one out-of-prior robot, one modal robot, one chirp per joint and pose.
+            spec = config.round8
+            config = replace(config, round8=replace(spec, oop=replace(spec.oop, robots=1),
+                                                    modal=replace(spec.modal, robots=1, repeats=1)))
+    variants = list(dict.fromkeys(args.variants + (["ablation_off", "ablation_clean"] if args.ablations else [])
+                                  + (["oop", "modal"] if args.round8 else [])))
     if "gainshift" in variants and "production" not in variants:
         parser.error("the gain-shift file is checked against the production file; build both")
     if args.taufree and config.payload.mode == "random":
@@ -181,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             config, asset, variant, out_dir=out_dir, stem=stem, jobs=jobs, verbose=verbose, save=save,
             trajectory_cache=trajectory_cache,
             production_manifest=results.get("production", {}).get("manifest"),
-            taufree=args.taufree, priors=results.get("production", {}).get("priors"),
+            taufree=args.taufree, priors=results.get("production", {}).get("priors"), round8=args.round8,
         )
         _print_report(results[variant]["report"])
 
@@ -193,6 +369,16 @@ def main(argv: list[str] | None = None) -> int:
         path.write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
         print(f"\nwrote {path}")
     print(f"\nround-6 build {'OK' if summary['ok'] else 'REFUSED'}")
+    coverage = reports.get("production", {}).get("modal_coverage")
+    if coverage is not None:
+        print(f"round-8 modal coverage gate {'OK' if coverage['gate_ok'] else 'FAILED'}; "
+              f"raise: {coverage['raise_joints'] or 'none'}; still failing: {len(coverage['still_failing'])} bag(s)")
+        if coverage["raise_joints"] and coverage.get("excitation_limited"):
+            print(f"EXIT {EXIT_COVERAGE}: rerun with --coverage-escalation {args.coverage_escalation + 1}")
+            return EXIT_COVERAGE
+        if coverage["raise_joints"]:
+            print("round-8 coverage: the failing joints' in-band SNR is above the threshold, so stronger lines "
+                  "cannot fix them (the oracle fit, not the excitation, fails); the gate is recorded, not escalated")
     for variant, report in reports.items():
         if not report["ok"]:
             print(f"REFUSED {variant} {report.get('file') or '(not written)'}")

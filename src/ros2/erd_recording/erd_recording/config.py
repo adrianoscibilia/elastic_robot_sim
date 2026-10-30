@@ -12,7 +12,9 @@ Refusal rules (RR_01 S4):
   measured value the config declares is ``null``.
 * Every scene object/frame name must be explicit (no defaults invented here).
 * The probe's top frequency must fit the SG resolvability bound at the real
-  rate (S-12): ``<= 0.09 * rate``.
+  rate (S-12): ``<= 0.09 * rate``. The check is on the comb as the planner
+  resolves it (capped, on the lab's base grid; RR_20 T1), not on the
+  training config's uncapped top.
 * ``hardware: real`` is refused off ``ros_domain_id: 0``; any non-real
   hardware is refused off domain ``87`` (RR_01 S9 "Separation").
 """
@@ -29,6 +31,7 @@ import numpy as np
 import yaml
 
 from . import frames
+from .probe import PROBE_SG_BOUND_FRACTION, resolve_probe_comb  # noqa: F401  (re-exported)
 
 SCHEMA = "erd.lab/1"
 
@@ -42,9 +45,11 @@ _HARDWARE_CHOICES = {
     "ur10_cb3": ("mock", "ursim", "real"),
 }
 
-#: SG resolvability bound (RR_01 S4 "Probe rule"), the same fraction dataset_config
-#: (elastic_sim) documents as `0.09 * rate` (the order-3 SG differentiator's floor).
-PROBE_SG_BOUND_FRACTION = 0.09
+#: RR_20 T3: ``excitation.probe.weighting`` (``FourierExcitationConfig.probe_weighting``).
+PROBE_WEIGHTINGS = ("position", "acceleration")
+#: Every key ``excitation.probe`` may carry; any other is refused, so a
+#: misspelt or newer key never silently falls back to a default (RR_20 S2).
+PROBE_KEYS = ("enabled", "from_training_config", "max_top_hz", "weighting", "acceleration_fraction", "budget")
 
 
 #: UR_01 U-3: E-ur-4's possible answers.
@@ -587,6 +592,8 @@ class ProbeSpec:
     #: RR_12 S4.4: the real probe's top frequency cap (iiwa 90 Hz, UR10 11 Hz),
     #: applied on top of the SG bound; ``None`` leaves only the SG bound.
     max_top_hz: float | None = None
+    #: RR_20 T3: ``position`` (the training draw) or ``acceleration`` (flat per line).
+    weighting: str = "position"
 
 
 @dataclass(frozen=True)
@@ -669,6 +676,11 @@ def _load_excitation(raw: Mapping[str, Any], source: str, rate_hz: float) -> Exc
     position_window = {
         str(joint): (float(pair[0]), float(pair[1])) for joint, pair in position_window_raw.items()
     }
+    if not isinstance(probe_raw, Mapping):
+        raise ConfigError(f"{source}.excitation.probe must be a mapping")
+    unknown = sorted(set(probe_raw) - set(PROBE_KEYS))
+    if unknown:
+        raise ConfigError(f"{source}.excitation.probe: unknown key(s) {unknown}; allowed: {list(PROBE_KEYS)}")
     max_top_hz = probe_raw.get("max_top_hz")
     probe = ProbeSpec(
         enabled=bool(probe_raw.get("enabled", False)),
@@ -677,7 +689,11 @@ def _load_excitation(raw: Mapping[str, Any], source: str, rate_hz: float) -> Exc
         acceleration_fraction=float(probe_raw.get("acceleration_fraction", 0.2)),
         budget=str(probe_raw.get("budget", "split")),
         max_top_hz=None if max_top_hz is None else float(max_top_hz),
+        weighting=str(probe_raw.get("weighting", "position")),
     )
+    if probe.weighting not in PROBE_WEIGHTINGS:
+        raise ConfigError(f"{source}.excitation.probe.weighting must be one of {list(PROBE_WEIGHTINGS)}, "
+                          f"got {probe.weighting!r}")
     if probe.budget not in ("split", "additive"):
         raise ConfigError(f"{source}.excitation.probe.budget must be 'split' or 'additive'")
     if probe.budget == "additive":
@@ -706,38 +722,44 @@ def _load_excitation(raw: Mapping[str, Any], source: str, rate_hz: float) -> Exc
         amplitude_ladder=tuple(float(v) for v in block.get("amplitude_ladder", (0.1, 0.25, 0.5, 1.0))),
     )
     if probe.enabled and probe.from_training_config:
-        _check_probe_sg_bound(probe, rate_hz, source)
+        _check_probe_comb(spec, rate_hz, source)
     return spec
 
 
-def _check_probe_sg_bound(probe: ProbeSpec, rate_hz: float, source: str) -> None:
-    """RR_01 S4 "Probe rule": the real probe top must fit ``0.09 * rate``.
+def _check_probe_comb(excitation: ExcitationSpec, rate_hz: float, source: str) -> None:
+    """RR_01 S4 "Probe rule", on the *resolved* comb (RR_20 T1).
 
-    Resolving the actual comb needs the training config and
-    ``elastic_sim.link_modes``; this is a cheap necessary check the loader
-    can do on its own -- the full resolution happens in the ``plan`` stage,
-    which raises the same way if the resolved comb still violates it.
+    Uses the planner's rule (:func:`erd_recording.probe.resolve_probe_comb`):
+    the training comb capped at ``min(0.09 * rate, max_top_hz)`` and moved
+    onto ``excitation.base_frequency``. Refused if that leaves no line, or
+    (which the rule should make impossible) a line above the bound. A
+    training config with a ``probe_design`` needs pinocchio to resolve, which
+    this process may not load; ``plan`` resolves and checks it instead.
     """
-    bound = PROBE_SG_BOUND_FRACTION * rate_hz
-    if probe.max_top_hz is not None:
-        bound = min(bound, probe.max_top_hz)
+    probe = excitation.probe
     training_path = Path(probe.from_training_config).expanduser()
     if not training_path.is_file():
-        return
+        raise ConfigError(f"{source}.excitation.probe.from_training_config does not exist: {training_path}")
     try:
-        from elastic_sim.dataset_config import load_config
+        comb = resolve_probe_comb(probe, base_frequency=excitation.base_frequency,
+                                  n_harmonics=excitation.n_harmonics, rate_hz=rate_hz, resolve_design=False)
     except ImportError:
         return
-    training = load_config(training_path)
-    probe_harmonics = training.excitation.probe_harmonics
-    if not probe_harmonics:
+    if comb is None:
         return
-    top_hz = float(probe_harmonics[-1]) * float(training.excitation.base_frequency)
-    if top_hz > bound:
-        raise ConfigError(
-            f"{source}.excitation.probe: the training config's probe top {top_hz:g} Hz exceeds "
-            f"the real bound {bound:g} Hz (0.09 x {rate_hz:g} Hz, or probe.max_top_hz); cap it or disable the probe"
+    check_probe_comb(comb, f"{source}.excitation.probe", ConfigError)
+
+
+def check_probe_comb(comb, where: str, error: type[Exception]) -> None:
+    """Raise ``error`` if a resolved comb is empty or tops the bound (loader and ``plan``)."""
+    if not comb.harmonics:
+        raise error(
+            f"{where}: no probe line of the training comb ({len(comb.training_harmonics)} lines at "
+            f"{comb.training_base_frequency:g} Hz) is at or below the bound {comb.bound_hz:g} Hz "
+            f"(0.09 x rate, or probe.max_top_hz) above the main harmonics; raise the cap or disable the probe"
         )
+    if comb.top_hz > comb.bound_hz * (1.0 + 1e-9):
+        raise error(f"{where}: the resolved probe top {comb.top_hz:g} Hz exceeds the bound {comb.bound_hz:g} Hz")
 
 
 def _load_identification(raw: Mapping[str, Any], source: str) -> IdentificationSpec:

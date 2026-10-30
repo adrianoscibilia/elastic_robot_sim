@@ -937,6 +937,17 @@ class DatasetConfig:
     #: where every bag starts at rest and in static equilibrium (FMRR), so the
     #: filter's quasi-static initial condition is exact at the bag start.
     burn_in_override_s: float | None = None
+    # Round 8 (`identified_filter/01` Sec 1, :mod:`elastic_sim.round8`).  ``None`` keeps round 7 exactly.
+    round8: Any = None
+    #: The modal file's chirp design (:class:`elastic_sim.round8.ModalSpec`): set by the build's
+    #: ``modal`` variant; every trajectory is then a single-joint chirp, not a Fourier excitation.
+    modal: Any = None
+    #: Every elastic tier gets this split (the ``*_oop`` and ``*_modal`` files are test only).
+    fixed_split: str | None = None
+    #: ``((tier, trajectory index, attempt), ...)``: regenerated bags (Sec 1.1.3), seed + attempt x stride.
+    reseed: tuple = ()
+    #: Build only these ``(tier, trajectory index)`` bags; every draw is still the full build's.
+    only_bags: tuple | None = None
 
     @property
     def is_round6(self) -> bool:
@@ -1282,7 +1293,8 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
             "`transmission` block (see config/identification/kuka_lbr_iiwa_14_r820_table.yaml)"
         )
     known = {"schema_version", "asset", "backends", "rigid_reference", "transmission", "comparison",
-             "excitation", "dataset", "simulation", "visualization", "payload", "gates", "transmission_priors"}
+             "excitation", "dataset", "simulation", "visualization", "payload", "gates", "transmission_priors",
+             "round8"}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown keys in {source}: {', '.join(unknown)}")
@@ -1513,6 +1525,7 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
         gates=_gate_spec(raw.get("gates"), source),
         burn_in_override_s=_burn_in_override(raw.get("transmission_priors"), source),
         probe_design=_probe_design(exc_cfg.get("probe_design"), exc_cfg, source),
+        round8=_round8(raw.get("round8"), source),
         auto_time_steps=tuple(key for key in ("max_time_step", "rigid_time_step")
                               if str(sim_cfg.get(key, "")).strip().lower() == "auto"),
     )
@@ -1524,6 +1537,10 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
         from .link_modes import resolve_probe_design
 
         config = resolve_probe_design(config)
+    if config.round8 is not None:
+        from .round8 import resolve_round8
+
+        config = resolve_round8(config)
     require_probe_within_sampling_bound(config, source=source)
     require_round6(config, source=source)
     if config.auto_time_steps:
@@ -1540,6 +1557,14 @@ def load_config(path: str | Path, *, check_bounds: bool = True) -> DatasetConfig
 #: Ceiling for a step derived from the bound (``auto``): the schema default,
 #: so a bound that allows more still steps no coarser than rounds 4-5 did.
 AUTO_TIME_STEP_CEILING = 5.0e-4
+
+
+def _round8(raw: Any, source: Any):
+    if raw is None:
+        return None
+    from .round8 import parse_round8
+
+    return parse_round8(raw, source)
 
 
 def _probe_design(raw: Any, exc_cfg: Mapping[str, Any], source: Any) -> ProbeDesign | None:

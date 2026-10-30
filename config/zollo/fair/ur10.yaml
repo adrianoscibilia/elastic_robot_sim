@@ -1,0 +1,50 @@
+# Fair classical baselines, UR10 (REFACTOR_SPECS/model_based_baseline/03_fair_comparison_plan.md).
+# Shared by scripts/zollo_fair_fit.py and scripts/zollo_fair_evaluate.py; CLI flags override.
+platform: ur10                   # the `variant` key of the r7 result CSVs
+dataset: data/identification/r7-nopayload/ur10/ur10_table_round7_nopayload_val4.parquet
+asset: ur10_table                # the dataset manifest's asset (URDF kinematics, plan A9)
+
+selection:                       # F3: every choice on the validation split only
+  epsilons: [1.0e-3, 1.0e-2, 1.0e-1]   # F5: Coulomb tanh(dtheta / eps) [rad/s]
+  weighted: [true, false]        # F6 row scaling s_j = 1 / sigma_j on / off
+  rank_tolerance: 1.0e-6         # base-parameter elimination (zollo/basis.py, unchanged)
+
+output_error:                    # ID-2M-fair (plan Sec 3.2), Levenberg-Marquardt
+  stage1_iterations: 2000        # ID-rigid-fair's problem, physically consistent inertials (log-Cholesky)
+  stage2_iterations: 40          # K, zeta only
+  stage3_iterations: 80          # everything jointly
+  patience: 30                   # the LNNs' early_stopping_patience (val RMSE, relative min_delta 1e-4)
+  device: auto
+  chunk: 64                      # train windows per filter batch (GPU memory)
+
+percentile:                      # F6: the LNN two-mass run used percentile_mse@90 (Adam, F8: 3 seeds)
+  loss_percentile: 90.0
+  seeds: [0, 1, 2]
+  epochs: 300
+  patience: 30
+  residual: {batch_size: 256, learning_rate: 6.150632572446415e-4}   # lnn_tau_res's (chain-ur10-taufree.yaml)
+  two_mass: {batch_size: 256, learning_rate: 6.150632572446415e-4}   # lnn_twomass's
+
+evaluation:
+  real:
+    A: data/real_robot/ur10_cb3/20261021/ur_A_all_02/dataset/ur10_cb3.parquet
+    B: data/real_robot/ur10_cb3/20261021/ur_B_all_02/dataset/ur10_cb3.parquet
+  gainshift: data/identification/r7-nopayload/ur10/ur10_table_round7_nopayload_gainshift.parquet
+  plots:                         # the bags of 02's trace figures
+    sim: t1_e18_f0_mujoco
+    real_B: excitation_0
+
+references:
+  lnn_sim: REFACTOR_SPECS/final_results/data/model_comparison_taufree.csv
+  lnn_sim_per_bag: REFACTOR_SPECS/final_results/data/per_bag_errors.csv
+  real_rows: REFACTOR_SPECS/final_results/data/real_zero_shot_rows.csv
+  real_per_bag: REFACTOR_SPECS/final_results/data/real_zero_shot_per_bag.csv
+  lnn_chain: runs/r7-taufree-20261015-1231/chain-ur10-taufree.yaml       # F4 cross-check of the priors
+  lnn_eval_test: runs/r7-taufree-20261015-1231/eval-ur10-test.csv        # the test robots' K, zeta ranges
+  harness_tolerance: 1.0e-3      # FG3 and FG4 [N m]
+
+lnn_pipeline:                    # FG1: row counts from the LNN training code itself
+  python: ../dynamic_model_nn/.venv/bin/python
+  repo: ../dynamic_model_nn
+
+output_dir: reports/zollo_fair/ur10

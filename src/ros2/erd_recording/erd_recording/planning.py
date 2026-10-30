@@ -22,7 +22,8 @@ from elastic_sim.excitation import FourierExcitationConfig, optimize_excitation
 from elastic_sim.kinematics import PortableKinematics, kinematic_groups
 from elastic_sim.materialized import MaterializedTrajectory
 
-from .config import LabConfig, SceneBox, SceneCylinder, SceneMesh, SceneSphere
+from .config import LabConfig, SceneBox, SceneCylinder, SceneMesh, SceneSphere, check_probe_comb
+from .probe import ProbeComb, resolve_probe_comb
 
 
 class PlanError(ValueError):
@@ -200,23 +201,23 @@ def excitation_position_window(config: LabConfig) -> tuple[tuple[str, tuple[floa
     return tuple(result)
 
 
-def resolve_probe_harmonics(config: LabConfig, rate_hz: float) -> tuple[int, ...]:
+def resolve_probe(config: LabConfig, rate_hz: float) -> ProbeComb | None:
     """Resolve the real probe comb from the training config, capped at the
-    SG resolvability bound (RR_01 S4 "Probe rule", S1.4)."""
-    if not config.excitation.probe.enabled or not config.excitation.probe.from_training_config:
-        return ()
-    from elastic_sim.dataset_config import load_config
-    from elastic_sim.link_modes import resolve_probe_design
+    SG resolvability bound (RR_01 S4 "Probe rule", S1.4; RR_12 S4.4 cap) and
+    moved onto the lab's base grid (RR_20 T2). ``None`` when the probe is off;
+    :class:`PlanError` when the comb is empty."""
+    excitation = config.excitation
+    comb = resolve_probe_comb(excitation.probe, base_frequency=excitation.base_frequency,
+                              n_harmonics=excitation.n_harmonics, rate_hz=rate_hz)
+    if comb is not None:
+        check_probe_comb(comb, "excitation.probe", PlanError)
+    return comb
 
-    training = load_config(config.excitation.probe.from_training_config)
-    resolved = resolve_probe_design(training)
-    harmonics = resolved.excitation.probe_harmonics
-    bound_hz = 0.09 * rate_hz
-    if config.excitation.probe.max_top_hz is not None:
-        bound_hz = min(bound_hz, config.excitation.probe.max_top_hz)  # RR_12 S4.4 cap
-    base = resolved.excitation.base_frequency
-    capped = tuple(int(h) for h in harmonics if h * base <= bound_hz)
-    return capped
+
+def resolve_probe_harmonics(config: LabConfig, rate_hz: float) -> tuple[int, ...]:
+    """The resolved comb's harmonic indices of ``excitation.base_frequency``."""
+    comb = resolve_probe(config, rate_hz)
+    return () if comb is None else comb.harmonics
 
 
 def regime_draw(config: LabConfig, index: int) -> tuple[float, float]:
@@ -371,6 +372,113 @@ def check_caps_on_analytic(trajectory: MaterializedTrajectory, velocity_limit: n
         j_peak = np.max(np.abs(jerk), axis=0)
         if np.any(j_peak > jerk_limit * (1.0 + 1e-6)):
             raise PlanError(f"jerk cap exceeded on the analytic signal: peak {j_peak} vs limit {jerk_limit}")
+
+
+#: RR_20 T5: the excitation report's RNEA runs on the analytic signal at
+#: least this fine (the UR10's 125 Hz grid is only 13 samples per 9.6 Hz line).
+REPORT_MIN_RATE_HZ = 1000.0
+
+
+def _analytic_fine(trajectory: MaterializedTrajectory, oversample: int) -> tuple[np.ndarray, ...]:
+    step = float(trajectory.time[1] - trajectory.time[0]) / oversample
+    fine_time = np.arange(trajectory.time[0], trajectory.time[-1] + 0.5 * step, step)
+    values = [trajectory.analytic(t) for t in fine_time]
+    return step, *(np.asarray([v[i] for v in values]) for i in range(3))
+
+
+def excitation_report(config: LabConfig, asset: AssetSpec, segments, comb: ProbeComb | None) -> dict[str, Any]:
+    """RR_20 T5 (spec S2 "required check"): the resolved probe comb, each
+    excitation's per-joint per-line probe acceleration, and its predicted
+    envelope with main + probe together -- peak ``|tau|``/effort (URDF RNEA,
+    no friction, no payload), ``|dq|``, ``|ddq|`` and jerk on the analytic
+    signal. Per-line amplitudes and phases come from the stored coefficients
+    (``dq = sum a_k cos + b_k sin``: acceleration amplitude ``k w hypot(a, b)``,
+    velocity phase ``atan2(b, a)``)."""
+    from elastic_sim import identification as idn
+
+    pin, model, data = idn.build_model(asset)
+    arrays = config.limits.as_arrays(config.joint_order)
+    effort = np.asarray(arrays["effort"], dtype=float)
+    joints = list(config.joint_order)
+    probe = config.excitation.probe
+    report: dict[str, Any] = {
+        "schema": "erd.excitation_report/1",
+        "torque_model": f"URDF RNEA ({asset.name}), no friction, no payload",
+        "joint_names": joints,
+        "probe": None if comb is None else {
+            "enabled": True, "from_training_config": probe.from_training_config,
+            "weighting": probe.weighting, "acceleration_fraction": probe.acceleration_fraction,
+            "budget": probe.budget, "bound_hz": comb.bound_hz, "base_frequency": comb.base_frequency,
+            "training_base_frequency": comb.training_base_frequency,
+            "harmonics": list(comb.harmonics), "lines_hz": [round(f, 9) for f in comb.lines_hz],
+            "top_hz": comb.top_hz, "n_lines": len(comb.harmonics),
+        },
+        "excitations": [],
+    }
+    n_main = config.excitation.n_harmonics
+    for segment in segments:
+        trajectory = segment.trajectory
+        meta = trajectory.metadata
+        omega = 2.0 * np.pi * float(meta["base_frequency"])
+        oversample = max(1, int(np.ceil(REPORT_MIN_RATE_HZ * float(trajectory.time[1] - trajectory.time[0]) - 1e-9)))
+        step, q, dq, ddq = _analytic_fine(trajectory, oversample)
+        jerk = np.abs(np.diff(ddq, axis=0)).max(axis=0) / step
+        tau = np.abs(np.asarray([pin.rnea(model, data, qi, dqi, ddqi) for qi, dqi, ddqi in zip(q, dq, ddq)]))
+        entry: dict[str, Any] = {
+            "segment_id": segment.segment_id,
+            "seed": int(meta["seed"]),
+            "max_acceleration": float(meta["max_acceleration"]),
+            "velocity_fraction": float(meta["velocity_fraction"]),
+            "peak": {
+                "velocity": dict(zip(joints, np.abs(dq).max(axis=0).tolist())),
+                "acceleration": dict(zip(joints, np.abs(ddq).max(axis=0).tolist())),
+                "jerk": dict(zip(joints, jerk.tolist())),
+                "torque_nm": dict(zip(joints, tau.max(axis=0).tolist())),
+                "torque_fraction": dict(zip(joints, (tau.max(axis=0) / effort).tolist())),
+            },
+        }
+        if comb is not None and comb.harmonics:
+            a = np.asarray(meta["coefficients_a"], dtype=float)[:, n_main:]
+            b = np.asarray(meta["coefficients_b"], dtype=float)[:, n_main:]
+            k = np.asarray(meta["probe_harmonics"], dtype=float)
+            amplitude = k * omega * np.hypot(a, b)
+            entry["probe_amplitude_acc"] = {j: amplitude[i].tolist() for i, j in enumerate(joints)}
+            entry["probe_phase"] = {j: np.arctan2(b[i], a[i]).tolist() for i, j in enumerate(joints)}
+        report["excitations"].append(entry)
+    fractions = np.asarray([[e["peak"]["torque_fraction"][j] for j in joints] for e in report["excitations"]])
+    report["worst"] = {
+        key: {j: max(e["peak"][key][j] for e in report["excitations"]) for j in joints}
+        for key in ("velocity", "acceleration", "jerk", "torque_fraction")
+    } if report["excitations"] else {}
+    report["worst_torque_fraction"] = float(fractions.max()) if fractions.size else 0.0
+    return report
+
+
+def print_excitation_report(report: Mapping[str, Any]) -> None:
+    """The ``plan`` printout of :func:`excitation_report`."""
+    probe = report["probe"]
+    joints = report["joint_names"]
+    if probe is None:
+        print("probe: off")
+    else:
+        print(f"probe: {probe['n_lines']} lines {probe['lines_hz'][0]:g} ... {probe['top_hz']:g} Hz on the "
+              f"{probe['base_frequency']:g} Hz grid (bound {probe['bound_hz']:g} Hz; weighting {probe['weighting']}, "
+              f"fraction {probe['acceleration_fraction']:g}, {probe['budget']})")
+        print("  lines [Hz]: " + " ".join(f"{f:g}" for f in probe["lines_hz"]))
+        print("  per-line probe acceleration [rad/s^2], median over excitations (min / median / max over lines):")
+        for joint in joints:
+            per_exc = np.asarray([e["probe_amplitude_acc"][joint] for e in report["excitations"]])
+            median = np.median(per_exc, axis=0)
+            print(f"    {joint:24s} {median.min():.4f} / {np.median(median):.4f} / {median.max():.4f}")
+    if not report["excitations"]:
+        return
+    print("predicted envelope, main + probe, worst over excitations "
+          f"({report['torque_model']}):")
+    print(f"    {'joint':24s} {'|dq|':>8s} {'|ddq|':>8s} {'jerk':>8s} {'|tau|/effort':>13s}")
+    worst = report["worst"]
+    for joint in joints:
+        print(f"    {joint:24s} {worst['velocity'][joint]:8.3f} {worst['acceleration'][joint]:8.3f} "
+              f"{worst['jerk'][joint]:8.2f} {worst['torque_fraction'][joint]:13.3f}")
 
 
 def ladder_scale_trajectory(trajectory: MaterializedTrajectory, scale: float) -> MaterializedTrajectory:
@@ -537,7 +645,8 @@ def build_plan(
     position_window = excitation_position_window(config)
     rate_hz = config.rate_hz
     time_step = 1.0 / rate_hz
-    probe_harmonics = resolve_probe_harmonics(config, rate_hz)
+    comb = resolve_probe(config, rate_hz)
+    probe_harmonics = () if comb is None else comb.harmonics
 
     segments: list[PlanSegment] = []
     rejected_total = 0
@@ -557,6 +666,7 @@ def build_plan(
             probe_harmonics=probe_harmonics,
             probe_acceleration_fraction=config.excitation.probe.acceleration_fraction,
             probe_budget=config.excitation.probe.budget,
+            probe_weighting=config.excitation.probe.weighting,
             position_window=position_window,
         )
         trajectory = optimize_excitation(
@@ -622,6 +732,17 @@ def build_plan(
         if config.hardware == "real":
             check_vendor_speed_limits(peaks, config.safety.vendor_limits)
     _write_bundle(bundle, output_dir)
+    # RR_20 T5: the resolved comb and the predicted envelope, printed and frozen
+    # with the plan (plan.manifest.json `probe`, full detail in excitation_report.json).
+    report = excitation_report(config, snapshot_asset, [s for s in segments if s.kind == "excitation"], comb)
+    (output_dir / "excitation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print_excitation_report(report)
+    manifest_path = output_dir / "plan.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["probe"] = report["probe"]
+    manifest["predicted_envelope"] = {"worst": report["worst"], "torque_model": report["torque_model"],
+                                      "report": "excitation_report.json"}
+    manifest_path.write_text(json.dumps(manifest, indent=2))
     if config.robot == "kuka_lbr_iiwa_14_r820":
         manifest_path = output_dir / "plan.manifest.json"
         manifest = json.loads(manifest_path.read_text())

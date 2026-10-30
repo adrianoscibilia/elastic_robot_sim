@@ -26,7 +26,8 @@ assert_environment(require_ros=False, require_pinocchio=True)
 
 from .bagio import build_iiwa_raw_frame, find_segment_start, read_bag_topic, iiwa_cycle_health  # noqa: E402
 from .config import LabConfig, load_lab_config  # noqa: E402
-from .contract import (differentiation_from_reference, load_reference, real_baselines, real_contract,  # noqa: E402
+from .contract import (differentiation_from_reference, excitation_block_from_plan, load_reference,  # noqa: E402
+                       real_baselines, real_contract, segments_block,
                        resolve_reference, write_real_contract)
 from .convert import iiwa_dataset_frame  # noqa: E402
 from .planning import PlanBundle, load_plan  # noqa: E402
@@ -367,8 +368,11 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
         raise RuntimeError("convert_cli: no excitation segment's window could be recovered from the bag/events")
     windowed = to_model_torque_sign(pd.concat(rows, ignore_index=True), n_dof=n_dof, hardware=config.hardware)
 
+    used_segments = list(dict.fromkeys(str(b) for b in windowed["bag"]))
+    excitation_block = excitation_block_from_plan(run_dir / "plan", used_segments)
+    probe_top = excitation_block["probe"]["top_hz"] if excitation_block["probe"] else 0.0
     differentiation = differentiation_from_reference(
-        reference_contract, rate_real=config.rate_hz, probe_top_real=0.0,
+        reference_contract, rate_real=config.rate_hz, probe_top_real=probe_top,
         reference_path=reference_contract_path,
     )
     time_step = 1.0 / config.rate_hz
@@ -416,6 +420,8 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
     )
 
     contract["reference_synthetic"] = bool(reference_contract.get("synthetic", False))
+    contract["excitation"] = excitation_block
+    contract["segments"] = segments_block(used_segments)
 
     from .convert import write_real_dataset
 

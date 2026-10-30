@@ -418,6 +418,31 @@ def real_contract(
     return contract
 
 
+def excitation_block_from_plan(plan_dir: Path, segment_ids: list[str]) -> dict[str, Any]:
+    """RR_20 T8 (spec S6): the resolved probe and the planned envelope, from
+    the frozen plan (``plan.manifest.json`` ``probe``, ``excitation_report.json``),
+    for the excitations that made it into the dataset. ``probe`` is ``None``
+    when the probe was off or the plan predates RR_20."""
+    plan_dir = Path(plan_dir)
+    manifest = json.loads((plan_dir / "plan.manifest.json").read_text(encoding="utf-8"))
+    probe = manifest.get("probe")
+    report_path = plan_dir / "excitation_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {"excitations": []}
+    by_id = {entry["segment_id"]: entry for entry in report["excitations"]}
+    keep = ("probe_amplitude_acc", "probe_phase", "peak", "seed", "max_acceleration", "velocity_fraction")
+    return {
+        "probe": None if probe is None else {**probe, "top_hz": float(probe["top_hz"])},
+        "predicted_envelope": manifest.get("predicted_envelope"),
+        "excitations": {sid: {k: by_id[sid][k] for k in keep if k in by_id[sid]} for sid in segment_ids if sid in by_id},
+    }
+
+
+def segments_block(segment_ids: list[str], *, kind: str = "excitation", split: str = "test") -> list[dict[str, str]]:
+    """RR_20 T8 (spec S6): ``segments[]`` with ``kind`` and ``split`` (the
+    consumer scores only ``test``)."""
+    return [{"segment_id": sid, "kind": kind, "split": split} for sid in segment_ids]
+
+
 def write_real_contract(dataset_path: Path, contract: Mapping[str, Any]) -> Path:
     """Overwrite ``<stem>.contract.json`` written by ``write_dataset`` with
     the real contract (RR_02 CR-4: the ROS 2 side's interim writer)."""

@@ -52,7 +52,7 @@ from .dataset_config import (
 )
 
 
-def assign_splits(tiers: tuple[Tier, ...], policy: SplitPolicy) -> dict[str, str]:
+def assign_splits(tiers: tuple[Tier, ...], policy: SplitPolicy, fixed_split: str | None = None) -> dict[str, str]:
     """Map each tier name to ``"train" | "val" | "test"``.
 
     ``holdout_robots`` reserves the softest and stiffest strata (by mean log
@@ -66,6 +66,9 @@ def assign_splits(tiers: tuple[Tier, ...], policy: SplitPolicy) -> dict[str, str
             "implemented; use 'contiguous' or 'holdout_robots'"
         )
     labels = {tier.name: "train" for tier in tiers}
+    if fixed_split is not None:
+        # Round 8: the ``*_oop`` / ``*_modal`` files hold test robots only.
+        return {tier.name: ("train" if tier.is_rigid else fixed_split) for tier in tiers}
     if policy.mode != "holdout_robots":
         return labels
     elastic = [tier for tier in tiers if not tier.is_rigid]
@@ -124,6 +127,10 @@ def sample_payloads(sampling: PayloadSampling, seed: int, count: int) -> tuple[P
             offset = (offset[0], offset[1], offset[2] + 0.5 * size)
         payloads.append(Payload(mass=mass, offset=offset, size=size))
     return tuple(payloads)
+
+
+#: Round 8 (Sec 1.1.3): trajectory-seed offset per regeneration attempt (`elastic_sim.round8`).
+RESEED_STRIDE = 1_000_000_007
 
 
 def _robot_stream(robot: str) -> int:
@@ -238,10 +245,59 @@ def trajectory_seed(config: DatasetConfig, tier: Tier, index: int) -> int:
     the robot's *name*, not its position, so dropping the rigid tier or adding
     robots leaves the others' trajectories untouched.
     """
+    attempt = reseed_attempt(config, tier.name, index)
+    offset = 0 if not attempt else attempt * RESEED_STRIDE
     if not config.trajectories_per_robot:
-        return config.seed + index
+        return config.seed + index + offset
     digest = hashlib.blake2b(tier.name.encode("utf-8"), digest_size=4).digest()
-    return config.seed + index + 1000 * (1 + int.from_bytes(digest, "big") % 100_000)
+    return config.seed + index + 1000 * (1 + int.from_bytes(digest, "big") % 100_000) + offset
+
+
+def reseed_attempt(config: DatasetConfig, tier: str, index: int) -> int:
+    """Round 8 (Sec 1.1.3): the regeneration attempt of bag ``(tier, index)``, 0 as first built."""
+    for name, traj, attempt in getattr(config, "reseed", ()) or ():
+        if name == tier and int(traj) == int(index):
+            return int(attempt)
+    return 0
+
+
+def split_labels_of(config: DatasetConfig) -> dict[str, str]:
+    """``assign_splits`` with the config's ``fixed_split``."""
+    return assign_splits(config.tiers, config.split, getattr(config, "fixed_split", None))
+
+
+def trajectories_for(config: DatasetConfig, tier: Tier, labels: Mapping[str, str] | None = None) -> int:
+    """How many trajectories ``tier`` runs: the modal segments, round 8's per-split count, or ``n_trajectories``."""
+    if getattr(config, "modal", None) is not None:
+        return len(config.modal.segments)
+    if getattr(config, "round8", None) is not None:
+        labels = split_labels_of(config) if labels is None else labels
+        return min(config.n_trajectories, config.round8.trajectories_for(labels.get(tier.name, "train")))
+    return config.n_trajectories
+
+
+def bag_wanted(config: DatasetConfig, tier: Tier, index: int) -> bool:
+    only = getattr(config, "only_bags", None)
+    return only is None or (tier.name, int(index)) in {(str(a), int(b)) for a, b in only}
+
+
+def bag_excitation(config: DatasetConfig, tier: Tier, index: int, split: str | None = None
+                   ) -> tuple[str, FourierExcitationConfig]:
+    """``(probe regime, excitation)`` of one bag: the regime-drawn excitation, then round 8's probe regime.
+
+    Without a ``round8`` block the regime is ``"r7"`` and the excitation is
+    :func:`regime_excitation`'s, unchanged.
+    """
+    traj_seed = trajectory_seed(config, tier, index)
+    excitation = regime_excitation(config.excitation, config.regime, config.seed, traj_seed)
+    if getattr(config, "modal", None) is not None:
+        return "modal", excitation
+    if getattr(config, "round8", None) is None:
+        return "r7", excitation
+    from .round8 import regime_draw
+
+    split = split_labels_of(config).get(tier.name, "train") if split is None else split
+    return regime_draw(config.round8, excitation, split, index, config.seed, traj_seed)
 
 
 def regime_excitation(
@@ -390,10 +446,14 @@ def iter_conditions(config: DatasetConfig) -> Iterator[tuple[int, Tier, int, str
     train/test as a contiguous half of the file, and a dataset ordered by tier
     would put whole tiers on one side of that split.
     """
-    for trajectory_index in range(config.n_trajectories):
+    labels = split_labels_of(config)
+    counts = {tier.name: trajectories_for(config, tier, labels) for tier in config.tiers}
+    for trajectory_index in range(max(counts.values(), default=0)):
         for friction_index in range(config.n_friction_samples):
             for tier in config.tiers:
                 if config.only_tiers is not None and tier.name not in config.only_tiers:
+                    continue
+                if trajectory_index >= counts[tier.name] or not bag_wanted(config, tier, trajectory_index):
                     continue
                 for backend in config.backends:
                     yield trajectory_index, tier, friction_index, backend
@@ -549,7 +609,7 @@ def resolve_bag(
     optimization; every other draw is still derived here.
     """
     traj_seed = trajectory_seed(config, tier, index)
-    excitation = regime_excitation(config.excitation, config.regime, config.seed, traj_seed)
+    _, excitation = bag_excitation(config, tier, index)
     natural_frequency, damping_ratio = sample_control_gains(
         config.control_gains, config.control_frequency, config.control_damping_ratio, config.seed, traj_seed,
     )
@@ -566,6 +626,10 @@ def resolve_bag(
         effort=np.asarray([np.inf if j.effort is None else j.effort for j in asset.resolve_active_joints()]),
     )
 
+    if trajectory is None and getattr(config, "modal", None) is not None:
+        from .round8 import modal_trajectory
+
+        trajectory = modal_trajectory(config.modal, asset, index, excitation.time_step)
     if trajectory is None:
         stack = contextlib.ExitStack()
         try:
@@ -595,10 +659,11 @@ def trajectory_key(
     excitation, the candidate count and the payload-fitted collision geometry.
     """
     traj_seed = trajectory_seed(config, tier, index)
-    excitation = regime_excitation(config.excitation, config.regime, config.seed, traj_seed)
+    _, excitation = bag_excitation(config, tier, index)
     payload_key = () if payload is None or payload.is_empty else (payload.mass, payload.offset, payload.size)
+    modal = () if getattr(config, "modal", None) is None else ("modal", repr(config.modal))
     return (asset.name, str(asset.urdf_path), tier.name if config.trajectories_per_robot else "", index,
-            traj_seed, repr(excitation), int(config.candidates), payload_key)
+            traj_seed, repr(excitation), int(config.candidates), payload_key) + modal
 
 
 def _optimize_trajectory(args: tuple) -> MaterializedTrajectory:
@@ -844,7 +909,9 @@ def generate(
             resolve_tiers = tuple(t for t in resolve_tiers if t.name in config.only_tiers)
         pending: dict[tuple, tuple] = {}
         for tier in resolve_tiers:
-            for index in range(config.n_trajectories):
+            for index in range(trajectories_for(config, tier)):
+                if not bag_wanted(config, tier, index):
+                    continue
                 payload = _payload_for(tier, index) if config.trajectories_per_robot else Payload()
                 cache_key = trajectory_key(config, asset, tier, index, payload)
                 if cache_key not in trajectory_cache and cache_key not in pending:
@@ -861,7 +928,9 @@ def generate(
 
         for tier in resolve_tiers:
             key = tier.name if config.trajectories_per_robot else ""
-            for index in range(config.n_trajectories):
+            for index in range(trajectories_for(config, tier)):
+                if not bag_wanted(config, tier, index):
+                    continue
                 # When every tier gets its own trajectory, that tier's payload
                 # (whether drawn "per: robot" -- constant across its
                 # trajectories -- or "per: trajectory" -- one per (tier,
@@ -888,7 +957,7 @@ def generate(
                     print(f"{label}: condition={metadata['condition_number']:.0f}"
                           f" ({metadata['collision_rejections']} candidates rejected for collision)")
 
-        split_labels = assign_splits(config.tiers, config.split)
+        split_labels = split_labels_of(config)
 
         # Post-hoc safety net for the case the loop above could not already
         # guarantee: a shared (``trajectories_per_robot: false``) trajectory

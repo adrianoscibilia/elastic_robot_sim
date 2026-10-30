@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 from .bagio import (data_topic_losses, losses_in_window, robot_clock_samples, segment_completeness,
                     segment_skip_verdict, segment_skips)
-from .contract import contract_source, differentiation_from_reference, real_baselines, real_contract
+from .contract import (contract_source, differentiation_from_reference, excitation_block_from_plan, real_baselines,
+                       real_contract, segments_block)
 from .convert import ur10_dataset_frame, write_real_dataset
 from .identification import MotorSideFit
 from .planning import load_plan
@@ -43,7 +44,9 @@ def convert_ur(config, root: Path, reference):
     from .bagio import ur_attributed_losses
     losses = ur_attributed_losses(losses)  # UR_10: djs skips judged by the events rule
     clock_ratio = robot_clock_ratio(config, root)
-    diff = differentiation_from_reference(reference, rate_real=config.rate_hz, probe_top_real=0., reference_path=reference_path)
+    probe = excitation_block_from_plan(root / 'plan', [])['probe']  # RR_20 T8
+    diff = differentiation_from_reference(reference, rate_real=config.rate_hz, probe_top_real=probe['top_hz'] if probe else 0.,
+                                          reference_path=reference_path)
     segments = [s for s in bundle.segments if s.kind == 'excitation']
     bounds = excitation_windows(raw, events, segments)
     stamp_ns = raw['stamp_ns'].to_numpy() if 'stamp_ns' in raw else raw['bag_stamp_ns'].to_numpy()
@@ -134,6 +137,8 @@ def convert_ur(config, root: Path, reference):
                         'reference': _reference_block(reference),
                         'rate_mismatch': not diff['cutoff_matched']}, friction_split='all_motor')
     contract['reference_synthetic'] = bool(reference.get('synthetic', False))
+    contract['excitation'] = excitation_block_from_plan(root / 'plan', list(session))
+    contract['segments'] = segments_block(list(session))
     output, _, contract_path = write_real_dataset(frame, manifest, contract, root / 'dataset' / f'{config.robot}.parquet')
     arrays = config.limits.as_arrays(config.joint_order)
     validation = validate_dataset(frame, n_dof=n, nominal_dt=dt, position_lower=arrays['position_lower'],

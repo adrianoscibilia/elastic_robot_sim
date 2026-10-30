@@ -115,7 +115,7 @@ scene:                                  # STIIMA-Milan lab: virtual floor + virt
 
 poses:                                  # 2026-10-08
   home: [-0.7854, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]   # the Sunrise app's INITIAL_POSITION (0, -45, 0, 80, 0, 35, 0 deg)
-  # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,
+  # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,ho
   # 11.3 / +1.8 -> ranges 40.2 and 25.9 N*m for the sign check. A6 gets < 0.5 N*m
   # in any pose with nothing on the flange: not testable, by design.
   standstill:

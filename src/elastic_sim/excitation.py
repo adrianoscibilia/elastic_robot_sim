@@ -29,6 +29,10 @@ from .assets import AssetSpec
 from .materialized import MaterializedTrajectory
 
 
+#: ``FourierExcitationConfig.probe_weighting`` choices (`RR_20` T3).
+PROBE_WEIGHTINGS = ("position", "acceleration")
+
+
 @dataclass(frozen=True)
 class FourierExcitationConfig:
     """Shape and limits of a periodic excitation trajectory."""
@@ -59,6 +63,13 @@ class FourierExcitationConfig:
     # on top (0 < f <= 1, so the total stays <= 2 x max_acceleration).
     probe_acceleration_fraction: float = 0.2
     probe_budget: str = "split"
+    # How the probe's random draw is weighted across its lines before
+    # scaling (`RR_20` T3).  ``position`` keeps the historical draw: equal
+    # *velocity* coefficients, so per-line acceleration grows as ``k``.
+    # ``acceleration`` divides each line by ``k``, so every line gets the
+    # same expected acceleration amplitude -- what a real robot's motion
+    # floor, roughly flat in acceleration, needs at the low lines.
+    probe_weighting: str = "position"
     # Per-joint ``(lower, upper)`` [rad], overriding the URDF limit for that
     # joint before ``limit_margin`` is applied.  Empty means every joint keeps
     # its URDF limit (the iiwa's historical behaviour).  Needed on robots
@@ -96,6 +107,8 @@ class FourierExcitationConfig:
                 raise ValueError("probe_harmonics must all be greater than n_harmonics")
             if self.probe_budget not in ("split", "additive"):
                 raise ValueError("probe_budget must be 'split' or 'additive'")
+            if self.probe_weighting not in PROBE_WEIGHTINGS:
+                raise ValueError(f"probe_weighting must be one of {PROBE_WEIGHTINGS}")
             if self.probe_budget == "split" and not 0.0 < self.probe_acceleration_fraction < 1.0:
                 raise ValueError("probe_acceleration_fraction must be in (0, 1)")
             if self.probe_budget == "additive" and not 0.0 < self.probe_acceleration_fraction <= 1.0:
@@ -143,6 +156,30 @@ def project_coefficients(
     a = a - a.mean(axis=1, keepdims=True)
     b = b - np.outer(b @ harmonics / float(harmonics @ harmonics), harmonics)
     return a, b
+
+
+def _project_acceleration_flat(
+    c: np.ndarray, d: np.ndarray, indices: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """``project_coefficients`` for an acceleration-flat probe (`RR_20` T3).
+
+    ``c``/``d`` are the N(0, 1) draws read as *acceleration* coefficients:
+    line ``k``'s acceleration amplitude is ``omega * hypot(c_k, d_k)``.  The
+    velocity coefficients are ``a = c / k``, ``b = d / k``.  The two boundary
+    constraints (``sum a = 0``, ``sum k b = 0``) are projected out in this
+    acceleration space, i.e. ``c`` off ``1 / k`` and ``d`` off the all-ones
+    direction.  Dividing by ``k`` first and then calling
+    ``project_coefficients`` would also meet the constraints, but its
+    minimum-norm correction lives in velocity space and puts most of its
+    energy on the top lines (``~ k`` there), undoing the flat weighting.
+    """
+    harmonics = np.asarray(indices, dtype=float)
+    weight = 1.0 / harmonics
+    c = np.asarray(c, dtype=float)
+    d = np.asarray(d, dtype=float)
+    c = c - np.outer(c @ weight / float(weight @ weight), weight)
+    d = d - d.mean(axis=1, keepdims=True)
+    return c * weight, d * weight
 
 
 #: ``(sin, cos)`` of ``outer(time, scaled)``, keyed on both arrays' bytes.
@@ -446,7 +483,9 @@ def sample_candidate(
     a = rng.normal(size=(n, total))
     b = rng.normal(size=(n, total))
     a[:, :n_main], b[:, :n_main] = project_coefficients(a[:, :n_main], b[:, :n_main], indices=indices[:n_main])
-    if total > n_main:
+    if total > n_main and config.probe_weighting == "acceleration":
+        a[:, n_main:], b[:, n_main:] = _project_acceleration_flat(a[:, n_main:], b[:, n_main:], indices[n_main:])
+    elif total > n_main:
         a[:, n_main:], b[:, n_main:] = project_coefficients(a[:, n_main:], b[:, n_main:], indices=indices[n_main:])
     omega = 2.0 * np.pi * config.base_frequency
     return _fit_to_limits(
@@ -545,6 +584,8 @@ def optimize_excitation(
         "probe_acceleration_fraction": float(config.probe_acceleration_fraction),
         # Only when additive, so a split trajectory keeps its round-5 metadata bytes.
         **({"probe_budget": "additive"} if config.probe_budget == "additive" else {}),
+        # Only when not the default, for the same reason (`RR_20` T3).
+        **({"probe_weighting": config.probe_weighting} if config.probe_weighting != "position" else {}),
         "probe_top_hz": float(config.probe_harmonics[-1] * config.base_frequency) if config.probe_harmonics else 0.0,
         "candidates": int(n_candidates),
         "candidate_index": int(best["index"]),
