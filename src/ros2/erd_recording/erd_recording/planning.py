@@ -552,6 +552,28 @@ def build_ladder_segments(
     return tuple(segments)
 
 
+def validated_approach(config: LabConfig, world: WorldKinematics, start, end, segment_id: str, kind: str,
+                       joint_names: tuple[str, ...], time_step: float, margin: float) -> PlanSegment:
+    """A quintic move at the approach limits, slowed down until it keeps the jerk
+    cap (as the identification approaches), collision-checked (RR_23 C4/C5)."""
+    arrays = config.limits.as_arrays(config.joint_order)
+    trajectory = quintic_segment(np.asarray(start, dtype=float), np.asarray(end, dtype=float),
+                                 velocity_limit=config.limits.approach.velocity,
+                                 acceleration_limit=config.limits.approach.acceleration, time_step=time_step)
+    jerk = np.max(np.abs(np.gradient(trajectory.acceleration, trajectory.time, axis=0)), axis=0)
+    stretch = max(1.0, float(np.max(jerk / arrays["jerk"])) ** (1 / 3))
+    if stretch > 1:
+        trajectory = MaterializedTrajectory(
+            time=trajectory.time * stretch, position=trajectory.position, velocity=trajectory.velocity / stretch,
+            acceleration=trajectory.acceleration / stretch**2, joint_names=trajectory.joint_names,
+            metadata=trajectory.metadata)
+    trajectory = _rename(trajectory, joint_names)
+    report = world.validate_path(trajectory.position, margin=margin, max_joint_step=0.01)
+    if not report.valid:
+        raise PlanError(f"{segment_id}: collision between {report.closest_pair}")
+    return PlanSegment(segment_id, kind, trajectory, trajectory.digest())
+
+
 def build_standstill_segments(
     config: LabConfig, world: WorldKinematics, joint_names: tuple[str, ...], time_step: float,
     margin: float = 0.0,
@@ -587,9 +609,15 @@ def build_standstill_segments(
 def build_plan(
     config: LabConfig, output_dir: Path, *, n_candidates: int | None = None,
     driver_urdf_path: Path | None = None, driver_urdf_calibrated_path: Path | None = None,
-    ladder_scale: float | None = None,
+    ladder_scale: float | None = None, modal=None, te_sweeps: bool = False,
 ) -> PlanBundle:
     """Build, validate and freeze the plan bundle for one lab config.
+
+    ``modal`` (a :class:`erd_recording.modal.ModalOptions`, ``plan --modal``)
+    or ``te_sweeps`` (``plan --te-sweeps``) replace the excitation segments by
+    the P2 chirps or the TE sweeps (RR_23 C4/C5). Only the excitations the
+    ``identify`` segments use are then optimised (iiwa: the first; UR10: the
+    first and last), and they are not run by ``run``.
 
     Raises :class:`PlanError` naming the joint/sample/object/link on any
     collision, cap or FK failure (RR_01 S5 `plan`).
@@ -613,6 +641,11 @@ def build_plan(
     """
     from elastic_sim.assets import AssetRegistry
 
+    mode = "modal" if modal is not None else ("te_sweeps" if te_sweeps else "excitation")
+    if modal is not None and te_sweeps:
+        raise PlanError("--modal and --te-sweeps are separate plans")
+    if mode != "excitation" and ladder_scale is not None:
+        raise PlanError(f"--ladder scales the excitations only; a {mode} plan takes --rung (modal) or nothing")
     registry = AssetRegistry.for_repository()
     bare_asset = registry.load(config.description.sim_asset)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -649,11 +682,15 @@ def build_plan(
     probe_harmonics = () if comb is None else comb.harmonics
 
     segments: list[PlanSegment] = []
+    identification_bases: list[PlanSegment] = []
     rejected_total = 0
     home = np.asarray(config.poses.home, dtype=float)
     previous_end = home
+    n_excitations = config.excitation.trajectories
+    indices = range(n_excitations) if mode == "excitation" else \
+        sorted({0, n_excitations - 1} if config.robot == "ur10_cb3" else {0})
 
-    for index in range(config.excitation.trajectories):
+    for index in indices:
         velocity_fraction, max_acceleration = regime_draw(config, index)
         exc_config = FourierExcitationConfig(
             n_harmonics=config.excitation.n_harmonics,
@@ -681,6 +718,9 @@ def build_plan(
                 f"excitation_{index}: collision at min distance {report.minimum_distance:.4g} m "
                 f"between {report.closest_pair}"
             )
+        if mode != "excitation":
+            identification_bases.append(PlanSegment(f"excitation_{index}", "excitation", trajectory, trajectory.digest()))
+            continue
 
         approach = quintic_segment(previous_end, trajectory.position[0], velocity_limit=config.limits.approach.velocity,
                                     acceleration_limit=config.limits.approach.acceleration, time_step=time_step)
@@ -692,13 +732,39 @@ def build_plan(
         segments.append(PlanSegment(f"excitation_{index}", "excitation", trajectory, trajectory.digest()))
         previous_end = trajectory.position[-1]
 
-    ret = quintic_segment(previous_end, home, velocity_limit=config.limits.approach.velocity,
-                          acceleration_limit=config.limits.approach.acceleration, time_step=time_step)
-    ret = _rename(ret, snapshot_asset.joint_names)
-    ret_report = world.validate_path(ret.position, margin=collision_margin, max_joint_step=0.01)
-    if not ret_report.valid:
-        raise PlanError(f"return: collision between {ret_report.closest_pair}")
-    segments.append(PlanSegment("return_0", "return", ret, ret.digest()))
+    if mode == "excitation":
+        ret = quintic_segment(previous_end, home, velocity_limit=config.limits.approach.velocity,
+                              acceleration_limit=config.limits.approach.acceleration, time_step=time_step)
+        ret = _rename(ret, snapshot_asset.joint_names)
+        ret_report = world.validate_path(ret.position, margin=collision_margin, max_joint_step=0.01)
+        if not ret_report.valid:
+            raise PlanError(f"return: collision between {ret_report.closest_pair}")
+        segments.append(PlanSegment("return_0", "return", ret, ret.digest()))
+        identification_bases = [s for s in segments if s.kind == "excitation"]
+
+    mode_report = None
+    if mode != "excitation":
+        from . import modal as modal_plan
+
+        def approach(start, end, segment_id, kind):
+            return validated_approach(config, world, start, end, segment_id, kind, snapshot_asset.joint_names,
+                                      time_step, collision_margin)
+
+        try:
+            if mode == "modal":
+                built, mode_report = modal_plan.build_modal_segments(
+                    config, world, bare_asset, snapshot_asset.joint_names, time_step, collision_margin, modal,
+                    approach=approach, segment_type=PlanSegment)
+            else:
+                built, mode_report = modal_plan.build_te_sweep_segments(
+                    config, world, snapshot_asset.joint_names, time_step, collision_margin,
+                    approach=approach, segment_type=PlanSegment)
+        except modal_plan.ModalError as exc:
+            raise PlanError(str(exc)) from None
+        segments = list(built)
+        report_name = "modal_report.json" if mode == "modal" else "te_sweep_report.json"
+        (output_dir / report_name).write_text(json.dumps(mode_report, indent=2), encoding="utf-8")
+        (modal_plan.print_modal_report if mode == "modal" else modal_plan.print_te_sweep_report)(mode_report)
 
     if ladder_scale is not None:
         # RR_06 P3-3b: one commissioning-tagged, re-validated copy of every
@@ -716,8 +782,7 @@ def build_plan(
     from .identification_plan import build_identification_segments
 
     identify_segments = build_identification_segments(
-        config, world, [s for s in segments if s.kind == "excitation"],
-        snapshot_asset.joint_names, time_step, collision_margin,
+        config, world, identification_bases, snapshot_asset.joint_names, time_step, collision_margin,
     )
 
     bundle = PlanBundle(config_digest=config_digest(config), asset=snapshot_asset,
@@ -732,16 +797,27 @@ def build_plan(
         if config.hardware == "real":
             check_vendor_speed_limits(peaks, config.safety.vendor_limits)
     _write_bundle(bundle, output_dir)
-    # RR_20 T5: the resolved comb and the predicted envelope, printed and frozen
-    # with the plan (plan.manifest.json `probe`, full detail in excitation_report.json).
-    report = excitation_report(config, snapshot_asset, [s for s in segments if s.kind == "excitation"], comb)
-    (output_dir / "excitation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print_excitation_report(report)
     manifest_path = output_dir / "plan.manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["probe"] = report["probe"]
-    manifest["predicted_envelope"] = {"worst": report["worst"], "torque_model": report["torque_model"],
-                                      "report": "excitation_report.json"}
+    manifest["mode"] = mode
+    if mode == "excitation":
+        # RR_20 T5: the resolved comb and the predicted envelope, printed and frozen
+        # with the plan (plan.manifest.json `probe`, full detail in excitation_report.json).
+        report = excitation_report(config, snapshot_asset, [s for s in segments if s.kind == "excitation"], comb)
+        (output_dir / "excitation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print_excitation_report(report)
+        manifest["probe"] = report["probe"]
+        manifest["predicted_envelope"] = {"worst": report["worst"], "torque_model": report["torque_model"],
+                                          "report": "excitation_report.json"}
+    elif mode == "modal":
+        manifest["probe"] = None
+        manifest["modal"] = {"report": "modal_report.json", "rung": mode_report["rung"], "a": mode_report["a"],
+                             "previous_runs": mode_report["previous_runs"],
+                             "refused": mode_report["refused"], "segments": mode_report["segments"]}
+    else:
+        manifest["probe"] = None
+        manifest["te_sweeps"] = {"report": "te_sweep_report.json", "skipped": mode_report["skipped"],
+                                 "segments": mode_report["segments"]}
     manifest_path.write_text(json.dumps(manifest, indent=2))
     if config.robot == "kuka_lbr_iiwa_14_r820":
         manifest_path = output_dir / "plan.manifest.json"

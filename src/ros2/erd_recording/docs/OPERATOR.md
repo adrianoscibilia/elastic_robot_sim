@@ -422,6 +422,84 @@ the slider to 1.0 at the end, also on Ctrl-C. Expect the live monitor to
 abort once `speed_scaling` drops below `safety.SPEED_SCALING_FLOOR`
 (0.999).
 
+## P0/P1/P2 campaign: modal chirps, TE sweeps, quick-look, hand-off (RR_23)
+
+One `--run-id` per run; every stage of a run takes the same id. The pattern is
+`plan [opts] -> preflight -> run -> convert -> report -> quicklook`. **UR10:**
+add `identify` after `preflight` (convert needs this run's `identification.json`,
+and the quick-look's current proxy and 10.7 Hz check read it).
+
+**Plan modes** (`plan` only; `run` executes whatever the plan froze):
+
+```bash
+record_iiwa --config $ERD_LAB/iiwa_probe.yaml plan --run-id <id>                 # P1 (excitations + probe)
+record_iiwa --config $ERD_LAB/iiwa_probe.yaml plan --ladder 0.1 --run-id <id>    # P1 ladder (commissioning)
+record_iiwa --config $ERD_LAB/iiwa_probe.yaml plan --run-id <id> \
+    --modal --rung 0.25 --modal-only iiwa_A2:home [--repeats 1] [--modal-previous <run>]   # P2
+record_iiwa --config $ERD_LAB/iiwa_probe.yaml plan --te-sweeps --run-id <id>     # TE sweeps
+```
+
+* `--modal --rung <r>`: the `modal:` chirps at `a = r x modal.a_max`.
+  `--modal-only <joint>:<pose>[,...]` restricts them (pose name from
+  `modal.pose_names`, or the index). Repeats default to 1 below rung 1.0 and to
+  `modal.repeats` at a dataset rung; `--repeats` overrides. An extra pose
+  (`extra_poses`, D5: UR10 `lean_fwd`) is planned only up to its `max_rung`,
+  and at that rung it is a dataset chirp.
+* **Torque rule:** predicted peak `|g_j| + M_jj a Q`, Q = 10 unless
+  `--modal-previous <run>` (repeatable, or comma-separated; a run id or a path)
+  measured that (joint, pose); the previous run must have its `quicklook.json`.
+  A chirp above `modal.torque_fraction_max` x effort is **left out and listed**
+  (stdout, `plan/modal_report.json`); the rest of the plan goes on.
+* `plan` prints per chirp the f-ranges where acceleration, position, velocity
+  or jerk binds A(f), the peak `|dq|`, `|ddq|`, jerk, `M_jj`, `|g|`, the Q used
+  and the predicted `|tau|`/effort.
+* Kinds: a rung-1.0 chirp (and an extra pose at its `max_rung`) is
+  `modal_chirp` (`split: modal_reference`); any other rung is
+  `modal_chirp_commissioning` and never enters a dataset. Sweeps are
+  `calibration_sweep` (`split: calibration`).
+* `--te-sweeps`: per joint and speed of `te_sweeps:`, one sweep each way at
+  pose `te_sweeps.pose`, centred in the range, plateau `min(plateau_s, what
+  fits)`; shorter than `min_plateau_s` is skipped and listed
+  (`plan/te_sweep_report.json`).
+
+A modal or sweep plan optimises only the excitations its `identify` segments
+use (iiwa the first, UR10 the first and last); `run` does not execute them.
+
+**Quick-look** (after `convert`, or directly after `run` on a ladder run, which
+never converts; it derives `raw.parquet` from the bag itself):
+
+```bash
+record_iiwa --config <file> quicklook --run-id <id> [--previous <previous rung's id>]
+record_ur10 --config <file> quicklook --run-id <id> [--reference <mount-check run id>]
+record_ur10 --config <file> quicklook --run-id ur_mount_check_01 --mount-check --reference ur_B_all_02
+```
+
+Writes `quicklook.json` / `quicklook.md` and prints `PASS` or `STOP` with the
+rule that stopped (exit 0; the stage itself never marks the run failed):
+* peak `|tau|`/effort <= 0.5 (iiwa `ft`) / 0.6 (UR10 current proxy, from
+  this run's `identification.json`); max `|q - JTC reference|` < the abort;
+* iiwa: `ft` RMS above 15 Hz <= 3 x `--previous`'s, scaled by amplitude;
+* UR10: 9.5-12 Hz content of `q` and current over the identify sweeps <= 1.5 x
+  the mount-check run's (`--reference`);
+* `--mount-check`: 3-25 Hz over the identify sweeps <= 1.5 x `ur_B_all_02`'s;
+* P1: T(f_k) per joint and probe line (median and min over excitations,
+  rectangular window on the two whole 5 s periods), lines under 0.5 listed;
+* P2: per chirp, peak `|tau_j|`, the static torque of the leading hold, the
+  dynamic peak and `Q_measured` = dynamic / (`M_jj` a): the input of the next
+  rung's `--modal-previous`.
+
+**Hand-off** (owner, accepted files only):
+
+```bash
+record_iiwa --config <file> handoff --run-id <id> --split test            # prints the real_files.yaml entry
+record_iiwa --config <file> handoff --run-id <id> --split test --write    # appends it
+```
+
+`test` / `modal_reference` need the run's dataset with `validation.json`
+`valid` and every segment of that split. A `calibration` run without a dataset
+(standstill, mount check) hands off its `raw.parquet`, `identification/raw.parquet`
+or `bag_standstill/` (`format:` says which). An id already listed is refused.
+
 ## UR10 on the real robot
 
 The procedure (laptop, cell, lab files, rungs, E-ur-4, datasets A and B) is

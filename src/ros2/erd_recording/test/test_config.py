@@ -333,7 +333,11 @@ def _filled_real_lab_file(name: str, calibration: Path | None = None) -> dict:
     raw = yaml.safe_load((LAB / f"{name}.yaml").read_text(encoding="utf-8"))
     sim = yaml.safe_load((LAB / f"{name}_sim.yaml").read_text(encoding="utf-8"))
     for key in ("position", "velocity", "acceleration", "jerk", "effort"):
-        raw["limits"][key] = sim["limits"][key]
+        # only what is still null: a file filled in the lab keeps its values
+        # (RR_23 C1: the UR10's real base pan, home 3.45 rad, is outside the sim's +-3.14)
+        measured = raw["limits"].get(key) or {}
+        raw["limits"][key] = {joint: measured.get(joint) if measured.get(joint) is not None else value
+                              for joint, value in sim["limits"][key].items()}
     raw["limits"]["reviewed"] = True
     raw["scene"]["reviewed"] = True
     raw["safety"]["vendor_checksum"] = "0xDEADBEEF"

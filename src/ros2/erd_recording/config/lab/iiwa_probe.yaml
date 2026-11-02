@@ -7,8 +7,11 @@
 # iiwa_fast.yaml. Both `reviewed` flags are reset: the OWNER re-reviews.
 # RR_20 T1-T3 + T5 are in (2026-10-30): the probe loads, plays on the 0.2 Hz
 # grid, is acceleration-flat, and `plan` prints/freezes the resolved comb and the
-# predicted envelope (excitation_report.json). The `modal:` block is NOT read yet
-# (T6): the loader ignores it, so P2 cannot be planned from this file.
+# predicted envelope (excitation_report.json).
+# RR_23 (2026-11-02): the `modal:` block is read (`plan --modal --rung <r>`, P2;
+# `pose_names` added so `--modal-only iiwa_A2:home` and the contract can name the
+# poses) and a `te_sweeps:` block is added (`plan --te-sweeps`, C5a). The loader
+# now refuses unknown top-level keys and unknown keys inside both blocks.
 #
 # Header of iiwa_fast.yaml:
 ## erd.lab/1 -- KUKA LBR iiwa 14 R820, REAL ROBOT -- FAST variant.
@@ -128,7 +131,7 @@ scene:                                  # STIIMA-Milan lab: virtual floor + virt
 
 poses:                                  # 2026-10-08
   home: [-0.7854, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0]   # the Sunrise app's INITIAL_POSITION (0, -45, 0, 80, 0, 35, 0 deg)
-  # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,ho
+  # Gravity torques on the bare asset (A2 / A4, N*m): 51.5 / -15.6, 25.6 / +10.3,
   # 11.3 / +1.8 -> ranges 40.2 and 25.9 N*m for the sign check. A6 gets < 0.5 N*m
   # in any pose with nothing on the flange: not testable, by design.
   standstill:
@@ -174,6 +177,7 @@ excitation:
 # NEW block: needs RR_20 T6. Poses are indices into poses.standstill.
 modal:
   poses: [0, 1, 2]                      # home, forearm_up, upright (M_jj A1 2.47/0.65/0.18, A2 2.99/2.97/4.20, A4 0.67/0.64/0.67)
+  pose_names: [home, forearm_up, upright]   # one per poses.standstill entry (RR_23 C4)
   joints:
     iiwa_A1: {f0: 2.0, f1: 40.0, T: 22.0}   # upright puts A1's mode near 35-40 Hz
     iiwa_A2: {f0: 2.0, f1: 30.0, T: 20.0}
@@ -188,6 +192,18 @@ modal:
   fade_s: 1.0                           # cosine taper at both ends
   torque_fraction_max: 0.5              # refuse above; prediction = |g| + M_jj a_max Q (Q = 10 on the first rung),
                                         # then the previous rung's measured dynamic peak x (a_next / a_prev) + |g|
+
+# RR_23 C5a; model side 2026-11-02 S3.1 -- constant-velocity sweeps for the
+# transmission error (`kind: calibration_sweep`, `split: calibration`).
+te_sweeps:
+  pose: 0                               # home (A2 gravity 51.5 N*m: moderate)
+  joints:                               # absolute ranges = the excitation window (planner-validated before)
+    iiwa_A1: [-1.2, 0.4]
+    iiwa_A2: [-1.1, -0.1]
+    iiwa_A4: [0.3, 1.7]
+  speeds: [0.1, 0.2, 0.4, 0.8]          # rad/s; order 320 at 5.1/10.2/20.4/40.7 Hz, order 160 at half
+  plateau_s: 3.0                        # target steady time per direction
+  min_plateau_s: 2.0                    # shorter -> the (joint, speed) is skipped and listed
 
 identification:
   sweep_speeds: []                      # UR10-only fields; iiwa uses E-iiwa-1/2 instead (RR_01 S2.1)

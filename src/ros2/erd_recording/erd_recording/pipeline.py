@@ -251,11 +251,12 @@ def _export_driver_urdf(config: LabConfig, paths: RunPaths) -> tuple[Path | None
 
 
 def stage_plan(config: LabConfig, config_path: str, paths: RunPaths, *, n_candidates: int | None = None,
-              ladder_scale: float | None = None) -> PlanBundle:
+              ladder_scale: float | None = None, mode_args: Sequence[str] = ()) -> PlanBundle:
     """Run ``plan_cli`` as a subprocess with a cleaned environment (T1.0/T1.6:
     pinocchio and a sourced ROS environment conflict at the dynamic-linker
     level; see :func:`erd_recording.env_guard.clean_ros_subprocess_env`).
-    ``ladder_scale`` (RR_06 P3-3b) is forwarded to ``plan_cli --ladder``."""
+    ``ladder_scale`` (RR_06 P3-3b) is forwarded to ``plan_cli --ladder``;
+    ``mode_args`` are the RR_23 ``--modal``/``--te-sweeps`` flags, verbatim."""
     paths.config_snapshot.write_text(yaml.safe_dump(config.raw, sort_keys=False), encoding="utf-8")
     driver_urdf_path, driver_urdf_calibrated_path = _export_driver_urdf(config, paths)
     command = [sys.executable, "-m", "erd_recording.plan_cli", "--config", config_path,
@@ -268,6 +269,7 @@ def stage_plan(config: LabConfig, config_path: str, paths: RunPaths, *, n_candid
         command += ["--driver-urdf-calibrated", str(driver_urdf_calibrated_path)]
     if ladder_scale is not None:
         command += ["--ladder", str(ladder_scale)]
+    command += list(mode_args)
     result = subprocess.run(command, env=clean_ros_subprocess_env(), capture_output=True, text=True)
     if result.returncode != 0:
         raise PipelineError(f"plan subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}")
@@ -1706,6 +1708,43 @@ def _run_convert_cli(config_path: str, paths: RunPaths, reference_contract: str 
     return converted
 
 
+def find_run_dir(config: LabConfig, run: str) -> Path | None:
+    """A run folder given as a path, or as a run id under
+    ``<output_root>/<robot>/<date>/`` (the latest date wins)."""
+    path = Path(run).expanduser()
+    if (path / "plan").is_dir():
+        return path.resolve()
+    matches = sorted(Path(config.recording.output_root).glob(f"{config.robot}/*/{run}"))
+    matches = [m for m in matches if (m / "plan").is_dir()]
+    return matches[-1].resolve() if matches else None
+
+
+def stage_quicklook(config: LabConfig, config_path: str, paths: RunPaths, *, previous: str | None = None,
+                    reference: str | None = None, mount_check: bool = False) -> dict[str, Any]:
+    """RR_23 C6a: ``quicklook.json``/``.md`` in the run folder. Derives
+    ``raw.parquet``/``events.json`` from the bags first if ``convert`` has not
+    (a ladder run, which never converts), then runs ``quicklook_cli`` as a clean
+    subprocess (it needs Pinocchio, like ``convert``)."""
+    for name, recording in (("run", paths.root), ("identification", paths.root / "identification")):
+        if (recording / "bag").is_dir() and not (recording / "raw.parquet").is_file():
+            _prepare_conversion(config, recording)
+    command = [sys.executable, "-m", "erd_recording.quicklook_cli", "--config", config_path,
+               "--run-dir", str(paths.root)]
+    for flag, value in (("--previous", previous), ("--reference", reference)):
+        if value:
+            found = find_run_dir(config, value)
+            if found is None:
+                raise PipelineError(f"quicklook {flag} {value}: no such run folder")
+            command += [flag, str(found)]
+    if mount_check:
+        command.append("--mount-check")
+    result = subprocess.run(command, env=clean_ros_subprocess_env(), capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode not in (0, 3):
+        raise PipelineError(f"quicklook failed:\nstdout={result.stdout}\nstderr={result.stderr}")
+    return json.loads((paths.root / "quicklook.json").read_text(encoding="utf-8"))
+
+
 def stage_validate(paths: RunPaths) -> dict[str, Any]:
     if paths.validation.is_file():
         return json.loads(paths.validation.read_text(encoding="utf-8"))
@@ -1834,7 +1873,7 @@ def _parse_args(argv: list[str]) -> Any:
     parser = argparse.ArgumentParser(prog="record_<robot>")
     parser.add_argument("--config", required=True)
     parser.add_argument("stage", choices=["plan", "show", "preflight", "standstill", "identify", "run",
-                                          "convert", "validate", "report", "evaluate", "all"])
+                                          "convert", "validate", "report", "evaluate", "quicklook", "handoff", "all"])
     parser.add_argument("--ladder", type=float, default=None)
     parser.add_argument("--only", default=None)
     parser.add_argument("--no-confirm", action="store_true")
@@ -1859,12 +1898,51 @@ def _parse_args(argv: list[str]) -> Any:
     parser.add_argument("--keep-derived-raw", action="store_true",
                         help="convert with --run-dir: use the folder's raw.parquet/events.json/rtde_alignment.json/"
                              "recorder_losses*.json as they are instead of re-deriving them from the bags (UR_11)")
+    from .modal import add_mode_arguments
+
+    add_mode_arguments(parser)  # RR_23 C4/C5, plan only
+    # RR_23 C6a quicklook / C7 handoff
+    parser.add_argument("--previous", default=None, metavar="RUN_DIR",
+                        help="quicklook: the previous rung's run folder (iiwa ft > 15 Hz ratio)")
+    parser.add_argument("--reference", default=None, metavar="RUN_DIR",
+                        help="quicklook: UR10 10.7 Hz reference (the mount-check run); with --mount-check, ur_B_all_02")
+    parser.add_argument("--mount-check", action="store_true",
+                        help="quicklook (UR10): the mount check on this run's identify sweeps against --reference's")
+    parser.add_argument("--split", default=None, choices=["test", "modal_reference", "calibration"],
+                        help="handoff: the real_files.yaml split")
+    parser.add_argument("--handoff-id", default=None, help="handoff: the entry id (default: the run folder name)")
+    parser.add_argument("--write", action="store_true",
+                        help="handoff: append the entry to REFACTOR_SPECS/identified_filter/real_files.yaml")
     return parser.parse_args(argv)
+
+
+def _mode_args(args: Any, config: LabConfig) -> list[str]:
+    """The RR_23 ``plan`` mode flags, forwarded to ``plan_cli`` (``--modal-previous``
+    run ids resolved to their folders)."""
+    from .modal import modal_options
+
+    modal_options(args)  # refuses e.g. --rung without --modal before anything is written
+    flags = []
+    if args.modal:
+        flags += ["--modal", "--rung", str(args.rung)]
+        if args.modal_only:
+            flags += ["--modal-only", args.modal_only]
+        if args.repeats is not None:
+            flags += ["--repeats", str(args.repeats)]
+        for item in args.modal_previous:
+            for run in filter(None, item.split(",")):
+                found = find_run_dir(config, run)
+                if found is None:
+                    raise PipelineError(f"--modal-previous {run}: no such run folder")
+                flags += ["--modal-previous", str(found)]
+    if args.te_sweeps:
+        flags.append("--te-sweeps")
+    return flags
 
 
 _ROS_STAGES = frozenset({"preflight", "standstill", "identify", "run"})
 #: RR_12 C-3: stages that may run on a copied run folder (`--run-dir`).
-_OFFLINE_STAGES = frozenset({"convert", "validate", "report", "evaluate"})
+_OFFLINE_STAGES = frozenset({"convert", "validate", "report", "evaluate", "quicklook", "handoff"})
 
 
 def _run_all(robot: str, argv: list[str] | None = None) -> int:
@@ -1887,12 +1965,21 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
     digest = code_digest()
     if any(stage in _ROS_STAGES for stage in stages) and refusal(digest):
         raise PipelineError(refusal(digest))
+    mode_args = _mode_args(args, config)
+    if mode_args and args.stage not in ("plan", "all"):
+        raise PipelineError("--modal/--te-sweeps are `plan` options: `run` executes whatever the plan froze")
     try:
         check_abort_override(args.abort_tracking_rad, args.ladder, file_rad=config.limits.abort.tracking_rad,
                              stage=args.stage)
     except ValueError as exc:
         raise PipelineError(str(exc)) from None
     profile = profile_for(config.robot)
+    if not args.run_dir and args.run_id and set(stages) <= {"quicklook", "handoff"}:
+        # RR_23 C6a/C7: `--run-id` names an existing run folder for these two
+        existing = find_run_dir(config, args.run_id)
+        if existing is None:
+            raise PipelineError(f"{args.stage}: no run folder {args.run_id!r} under {config.recording.output_root}")
+        args.run_dir = str(existing)
     if args.run_dir:
         if not set(stages) <= _OFFLINE_STAGES:
             raise PipelineError(f"--run-dir is for the offline stages {sorted(_OFFLINE_STAGES)} only")
@@ -1935,7 +2022,16 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
         for stage in stages:
             if stage == "plan":
                 bundle = stage_plan(config, args.config, paths, n_candidates=args.n_candidates,
-                                    ladder_scale=args.ladder)
+                                    ladder_scale=args.ladder, mode_args=mode_args)
+                continue
+            if stage == "quicklook":
+                stage_quicklook(config, args.config, paths, previous=args.previous, reference=args.reference,
+                                mount_check=args.mount_check)
+                continue
+            if stage == "handoff":
+                from .handoff import handoff
+
+                handoff(config, paths.root, split=args.split, entry_id=args.handoff_id, write=args.write)
                 continue
             if not rclpy_started and stage in _ROS_STAGES:
                 # RR_06 P3-1 item 9, live finding: rclpy.init()'s own
@@ -2004,7 +2100,8 @@ def _run_all(robot: str, argv: list[str] | None = None) -> int:
             elif stage == "evaluate":
                 print(json.dumps(stage_evaluate(config, paths, checkpoints=args.checkpoints)))
     except Exception as exc:
-        _write_manifest_status(paths, "failed", error=str(exc))
+        if not set(stages) <= {"quicklook", "handoff"}:  # RR_23: they read a run, never change its status
+            _write_manifest_status(paths, "failed", error=str(exc))
         raise
     finally:
         signal.signal(signal.SIGINT, previous_sigint)

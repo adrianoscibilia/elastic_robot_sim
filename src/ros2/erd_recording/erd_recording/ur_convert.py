@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 from .bagio import (data_topic_losses, losses_in_window, robot_clock_samples, segment_completeness,
                     segment_skip_verdict, segment_skips)
-from .contract import (contract_source, differentiation_from_reference, excitation_block_from_plan, real_baselines,
-                       real_contract, segments_block)
+from .contract import (DATASET_SPLITS, add_segment_columns, contract_source, differentiation_from_reference,
+                       excitation_block_from_plan, real_baselines, real_contract, segment_details, segments_block)
 from .convert import ur10_dataset_frame, write_real_dataset
 from .identification import MotorSideFit
 from .planning import load_plan
@@ -25,8 +25,8 @@ def _motor_fit(identification):
 def convert_ur(config, root: Path, reference):
     from elastic_sim.assets import AssetRegistry
     from .convert_cli import (_finish_validation, _prefixed, _reference_block, _refine_window,
-                              controller_state_window, excitation_windows, load_losses, sign_convention_check,
-                              standstill_holds, tracking_for_segment)
+                              controller_state_window, dataset_split, excitation_windows, load_losses,
+                              sign_convention_check, standstill_holds, tracking_for_segment)
     from .identify_cli import MAX_ANCHOR_INTERVAL_S, anchor_intervals, robot_clock_ratio, window_clock_ratio
     reference_path = reference['_path']
     n = len(config.joint_order); dt = 1 / config.rate_hz
@@ -47,7 +47,8 @@ def convert_ur(config, root: Path, reference):
     probe = excitation_block_from_plan(root / 'plan', [])['probe']  # RR_20 T8
     diff = differentiation_from_reference(reference, rate_real=config.rate_hz, probe_top_real=probe['top_hz'] if probe else 0.,
                                           reference_path=reference_path)
-    segments = [s for s in bundle.segments if s.kind == 'excitation']
+    segments = [s for s in bundle.segments if s.kind in DATASET_SPLITS]  # RR_23: + chirps, sweeps
+    details = segment_details(root / 'plan')
     bounds = excitation_windows(raw, events, segments)
     stamp_ns = raw['stamp_ns'].to_numpy() if 'stamp_ns' in raw else raw['bag_stamp_ns'].to_numpy()
     checks = {}; rows = []; bag_digests = {}; plan_digests = {}; session = {}; tracking = {}
@@ -91,10 +92,10 @@ def convert_ur(config, root: Path, reference):
         # L2-only controller skips are explicit synthetic interpolation. Reader
         # gaps and all real-hardware gaps always exclude the segment above.
         sampled = pd.DataFrame({c: np.interp(grid, ticks, frame[c]) for c in frame if np.issubdtype(frame[c].dtype, np.number)})
-        sampled['t'] = grid * dt; sampled['bag'] = sid; sampled['split'] = 'test'; rows.append(sampled)
+        sampled['t'] = grid * dt; sampled['bag'] = sid; sampled['split'] = DATASET_SPLITS[segment.kind]; rows.append(sampled)
     if not rows:
         (root / 'validation.json').write_text(json.dumps({'ok': False, 'segments': checks, 'rtde_alignment': alignment}, indent=2))
-        raise ValueError('no valid UR10 excitation segments')
+        raise ValueError('no valid UR10 dataset segments (excitation, modal_chirp or calibration_sweep)')
     windowed = pd.concat(rows, ignore_index=True)
     fit = _motor_fit(identification)
     source = identification['tau_source']
@@ -105,7 +106,7 @@ def convert_ur(config, root: Path, reference):
                                   sg_window=diff['sg_window'], sg_poly=diff['sg_poly'], time_step=dt,
                                   tau_source_column=source)
 
-    frame = dataset_frame(windowed)
+    frame = add_segment_columns(dataset_frame(windowed), details)
     baselines = real_baselines(frame, asset=AssetRegistry.for_repository().load(config.description.sim_asset), n_dof=n,
                                time_step=dt, sg_window=diff['sg_window'], sg_poly=diff['sg_poly'])
 
@@ -120,7 +121,7 @@ def convert_ur(config, root: Path, reference):
     side = config.identification.position_side
     side_label = side or 'pending E-ur-4'
     q_side = side or 'unknown'
-    manifest = {'schema_version': 2, 'n_dof': n, 'joint_names': list(config.joint_order), 'split': 'test', 'sample_time_step': dt,
+    manifest = {'schema_version': 2, 'n_dof': n, 'joint_names': list(config.joint_order), 'split': dataset_split(windowed), 'sample_time_step': dt,
                 'signals': {'target': 'link_torque', 'target_source': 'estimated', 'target_kind': 'motor_current_proxy'},
                 'differentiation': diff, 'identification': '../identification.json', 'tau_source': source,
                 'position_side': side_label if side else 'unknown pending E-ur-4', 'source': contract_source(config.hardware)}
@@ -138,7 +139,7 @@ def convert_ur(config, root: Path, reference):
                         'rate_mismatch': not diff['cutoff_matched']}, friction_split='all_motor')
     contract['reference_synthetic'] = bool(reference.get('synthetic', False))
     contract['excitation'] = excitation_block_from_plan(root / 'plan', list(session))
-    contract['segments'] = segments_block(list(session))
+    contract['segments'] = segments_block(list(session), kinds={s.segment_id: s.kind for s in segments}, details=details)
     output, _, contract_path = write_real_dataset(frame, manifest, contract, root / 'dataset' / f'{config.robot}.parquet')
     arrays = config.limits.as_arrays(config.joint_order)
     validation = validate_dataset(frame, n_dof=n, nominal_dt=dt, position_lower=arrays['position_lower'],

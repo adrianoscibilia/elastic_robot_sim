@@ -18,6 +18,7 @@ from .env_guard import assert_environment
 assert_environment(require_ros=False, require_pinocchio=True)
 
 from .config import load_lab_config  # noqa: E402
+from .modal import add_mode_arguments, modal_options  # noqa: E402
 from .planning import build_plan  # noqa: E402
 
 
@@ -35,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
                              "fraction against the scene and self collision to window_check.json (UR_01 U-6)")
     parser.add_argument("--ladder", type=float, default=None,
                         help="RR_06 P3-3b: also build a commissioning-scaled copy of every excitation segment")
+    add_mode_arguments(parser)
     args = parser.parse_args(argv or sys.argv[1:])
 
     config = load_lab_config(args.config)
@@ -42,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         config, Path(args.output_dir), n_candidates=args.n_candidates,
         driver_urdf_path=Path(args.driver_urdf) if args.driver_urdf else None,
         driver_urdf_calibrated_path=Path(args.driver_urdf_calibrated) if args.driver_urdf_calibrated else None,
-        ladder_scale=args.ladder,
+        ladder_scale=args.ladder, modal=modal_options(args), te_sweeps=args.te_sweeps,
     )
     print(f"plan ok: {len(bundle.segments)} segments, config_digest={bundle.config_digest[:12]}, "
           f"rejected_for_collision={bundle.rejected_for_collision}")

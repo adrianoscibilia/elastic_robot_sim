@@ -17,6 +17,9 @@ Refusal rules (RR_01 S4):
   training config's uncapped top.
 * ``hardware: real`` is refused off ``ros_domain_id: 0``; any non-real
   hardware is refused off domain ``87`` (RR_01 S9 "Separation").
+* An unknown top-level key, or an unknown key in ``excitation.probe``,
+  ``modal`` or ``te_sweeps``, is refused (RR_20 S2, RR_23 C3): a misspelt
+  block never silently drops out.
 """
 
 from __future__ import annotations
@@ -50,6 +53,18 @@ PROBE_WEIGHTINGS = ("position", "acceleration")
 #: Every key ``excitation.probe`` may carry; any other is refused, so a
 #: misspelt or newer key never silently falls back to a default (RR_20 S2).
 PROBE_KEYS = ("enabled", "from_training_config", "max_top_hz", "weighting", "acceleration_fraction", "budget")
+
+
+#: RR_23 C3: every top-level key a lab file may carry; any other is refused,
+#: so a misspelt block (``modl:``, ``te_sweep:``) never silently drops out.
+TOP_LEVEL_KEYS = ("schema", "robot", "hardware", "operator", "connection", "description", "limits", "scene",
+                  "poses", "excitation", "identification", "safety", "consumer", "recording", "modal", "te_sweeps")
+#: RR_23 C4: every key of the ``modal:`` block.
+MODAL_KEYS = ("poses", "pose_names", "joints", "law", "a_max", "rungs", "first_rung_target", "position_amplitude_max",
+              "repeats", "hold_s", "fade_s", "torque_fraction_max", "extra_poses")
+MODAL_LAWS = ("log_chirp_constant_acceleration",)
+#: RR_23 C5: every key of the ``te_sweeps:`` block.
+TE_SWEEP_KEYS = ("pose", "joints", "speeds", "plateau_s", "min_plateau_s")
 
 
 #: UR_01 U-3: E-ur-4's possible answers.
@@ -656,6 +671,153 @@ class RecordingSpec:
     max_lost_fraction: float
 
 
+@dataclass(frozen=True)
+class ModalJoint:
+    f0: float
+    f1: float
+    T: float
+
+
+@dataclass(frozen=True)
+class ModalExtraPose:
+    """D5: a pose (index into ``poses.standstill``) planned only up to ``max_rung``."""
+    index: int
+    max_rung: float
+
+
+@dataclass(frozen=True)
+class ModalSpec:
+    """RR_23 C4 / RR_20 S4: the P2 single-joint chirps (``modal:``)."""
+    poses: tuple[int, ...]
+    pose_names: tuple[str, ...]          # one per poses.standstill entry
+    joints: Mapping[str, ModalJoint]
+    law: str
+    a_max: float
+    rungs: tuple[float, ...]
+    first_rung_target: Mapping[str, Any]
+    position_amplitude_max: float
+    repeats: int
+    hold_s: float
+    fade_s: float
+    torque_fraction_max: float
+    extra_poses: tuple[ModalExtraPose, ...] = ()
+
+    def pose_name(self, index: int) -> str:
+        return self.pose_names[index]
+
+
+@dataclass(frozen=True)
+class TeSweepSpec:
+    """RR_23 C5: constant-velocity sweeps for the transmission error (``te_sweeps:``)."""
+    pose: int
+    joints: Mapping[str, tuple[float, float]]
+    speeds: tuple[float, ...]
+    plateau_s: float
+    min_plateau_s: float
+
+
+def _load_modal(raw: Mapping[str, Any], source: str, poses: PosesSpec, joint_order: Sequence[str]) -> ModalSpec | None:
+    block = raw.get("modal")
+    if block is None:
+        return None
+    where = f"{source}.modal"
+    if not isinstance(block, Mapping):
+        raise ConfigError(f"{where} must be a mapping")
+    unknown = sorted(set(block) - set(MODAL_KEYS))
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {unknown}; allowed: {list(MODAL_KEYS)}")
+    n_poses = len(poses.standstill)
+
+    def pose_index(value: Any, key: str) -> int:
+        index = int(value)
+        if not 0 <= index < n_poses:
+            raise ConfigError(f"{where}.{key}: pose index {index} is not in poses.standstill (0..{n_poses - 1})")
+        return index
+
+    names = block.get("pose_names")
+    if names is None:
+        names = [f"pose{i}" for i in range(n_poses)]
+    if not isinstance(names, list) or len(names) != n_poses or len(set(map(str, names))) != n_poses:
+        raise ConfigError(f"{where}.pose_names must name each of the {n_poses} poses.standstill entries once")
+    joints_raw = _require_mapping(block, "joints", where)
+    joints = {}
+    for joint, entry in joints_raw.items():
+        if joint not in joint_order:
+            raise ConfigError(f"{where}.joints: {joint!r} is not a joint of this robot {list(joint_order)}")
+        entry = dict(entry or {})
+        if set(entry) != {"f0", "f1", "T"}:
+            raise ConfigError(f"{where}.joints.{joint} must be {{f0, f1, T}}, got {sorted(entry)}")
+        item = ModalJoint(float(entry["f0"]), float(entry["f1"]), float(entry["T"]))
+        if not 0.0 < item.f0 < item.f1 or item.T <= 0.0:
+            raise ConfigError(f"{where}.joints.{joint}: need 0 < f0 < f1 and T > 0")
+        joints[str(joint)] = item
+    law = str(_require(block, "law", where))
+    if law not in MODAL_LAWS:
+        raise ConfigError(f"{where}.law must be one of {list(MODAL_LAWS)}, got {law!r}")
+    extra = []
+    for entry in block.get("extra_poses") or []:
+        if not isinstance(entry, Mapping) or set(entry) != {"index", "max_rung"}:
+            raise ConfigError(f"{where}.extra_poses entries must be {{index, max_rung}}, got {entry!r}")
+        extra.append(ModalExtraPose(pose_index(entry["index"], "extra_poses"), float(entry["max_rung"])))
+    target = dict(block.get("first_rung_target") or {})
+    spec = ModalSpec(
+        poses=tuple(pose_index(i, "poses") for i in _require(block, "poses", where)),
+        pose_names=tuple(str(n) for n in names),
+        joints=joints, law=law,
+        a_max=float(_require(block, "a_max", where)),
+        rungs=tuple(float(r) for r in _require(block, "rungs", where)),
+        first_rung_target=target,
+        position_amplitude_max=float(_require(block, "position_amplitude_max", where)),
+        repeats=int(_require(block, "repeats", where)),
+        hold_s=float(block.get("hold_s", 1.0)),
+        fade_s=float(block.get("fade_s", 1.0)),
+        torque_fraction_max=float(_require(block, "torque_fraction_max", where)),
+        extra_poses=tuple(extra),
+    )
+    overlap = {e.index for e in spec.extra_poses} & set(spec.poses)
+    if overlap:
+        raise ConfigError(f"{where}.extra_poses repeats pose(s) {sorted(overlap)} of modal.poses")
+    for key, value in (("a_max", spec.a_max), ("position_amplitude_max", spec.position_amplitude_max),
+                       ("torque_fraction_max", spec.torque_fraction_max), ("repeats", spec.repeats)):
+        if not value > 0:
+            raise ConfigError(f"{where}.{key} must be positive")
+    if not spec.torque_fraction_max <= 1.0:
+        raise ConfigError(f"{where}.torque_fraction_max must be <= 1")
+    if not spec.rungs or any(not 0.0 < r <= 1.0 for r in spec.rungs):
+        raise ConfigError(f"{where}.rungs must be in (0, 1]")
+    return spec
+
+
+def _load_te_sweeps(raw: Mapping[str, Any], source: str, poses: PosesSpec, joint_order: Sequence[str]) -> TeSweepSpec | None:
+    block = raw.get("te_sweeps")
+    if block is None:
+        return None
+    where = f"{source}.te_sweeps"
+    if not isinstance(block, Mapping):
+        raise ConfigError(f"{where} must be a mapping")
+    unknown = sorted(set(block) - set(TE_SWEEP_KEYS))
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {unknown}; allowed: {list(TE_SWEEP_KEYS)}")
+    pose = int(_require(block, "pose", where))
+    if not 0 <= pose < len(poses.standstill):
+        raise ConfigError(f"{where}.pose: index {pose} is not in poses.standstill")
+    joints = {}
+    for joint, pair in _require_mapping(block, "joints", where).items():
+        if joint not in joint_order:
+            raise ConfigError(f"{where}.joints: {joint!r} is not a joint of this robot")
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not float(pair[0]) < float(pair[1]):
+            raise ConfigError(f"{where}.joints.{joint} must be [lo, hi] with lo < hi")
+        joints[str(joint)] = (float(pair[0]), float(pair[1]))
+    spec = TeSweepSpec(pose=pose, joints=joints, speeds=tuple(float(v) for v in _require(block, "speeds", where)),
+                       plateau_s=float(_require(block, "plateau_s", where)),
+                       min_plateau_s=float(_require(block, "min_plateau_s", where)))
+    if not spec.speeds or any(v <= 0 for v in spec.speeds):
+        raise ConfigError(f"{where}.speeds must be positive")
+    if not 0 < spec.min_plateau_s <= spec.plateau_s:
+        raise ConfigError(f"{where}: need 0 < min_plateau_s <= plateau_s")
+    return spec
+
+
 def _load_poses(raw: Mapping[str, Any], source: str) -> PosesSpec:
     block = _require_mapping(raw, "poses", source)
     home = _require(block, "home", f"{source}.poses")
@@ -848,6 +1010,8 @@ class LabConfig:
     safety: SafetySpec
     source_path: Path
     raw: Mapping[str, Any]
+    modal: ModalSpec | None = None
+    te_sweeps: TeSweepSpec | None = None
 
     @property
     def rate_hz(self) -> float:
@@ -878,6 +1042,9 @@ def load_lab_config(path: str | Path) -> LabConfig:
     schema = raw.get("schema")
     if schema != SCHEMA:
         raise ConfigError(f"{source}: schema must be {SCHEMA!r}, got {schema!r}")
+    unknown = sorted(set(raw) - set(TOP_LEVEL_KEYS))
+    if unknown:
+        raise ConfigError(f"{source}: unknown top-level key(s) {unknown}; allowed: {list(TOP_LEVEL_KEYS)}")
     robot = str(_require(raw, "robot", source))
     if robot not in _HARDWARE_CHOICES:
         raise ConfigError(f"{source}: robot must be one of {sorted(_HARDWARE_CHOICES)}, got {robot!r}")
@@ -899,12 +1066,16 @@ def load_lab_config(path: str | Path) -> LabConfig:
     consumer = _load_consumer(raw, source)
     recording = _load_recording(raw, source)
     safety = _load_safety(raw, source)
+    joint_order = tuple(description.joint_map.values())
+    modal = _load_modal(raw, source, poses, joint_order)
+    te_sweeps = _load_te_sweeps(raw, source, poses, joint_order)
 
     config = LabConfig(
         robot=robot, hardware=hardware, operator=operator, connection=connection,
         description=description, limits=limits, scene=scene, poses=poses,
         excitation=excitation, identification=identification, consumer=consumer,
         recording=recording, safety=safety, source_path=source_path, raw=raw,
+        modal=modal, te_sweeps=te_sweeps,
     )
 
     _check_domain_separation(config, source)

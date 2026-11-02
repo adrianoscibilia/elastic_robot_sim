@@ -26,9 +26,9 @@ assert_environment(require_ros=False, require_pinocchio=True)
 
 from .bagio import build_iiwa_raw_frame, find_segment_start, read_bag_topic, iiwa_cycle_health  # noqa: E402
 from .config import LabConfig, load_lab_config  # noqa: E402
-from .contract import (differentiation_from_reference, excitation_block_from_plan, load_reference,  # noqa: E402
-                       real_baselines, real_contract, segments_block,
-                       resolve_reference, write_real_contract)
+from .contract import (DATASET_SPLITS, add_segment_columns, differentiation_from_reference,  # noqa: E402
+                       excitation_block_from_plan, load_reference, real_baselines, real_contract, segment_details,
+                       segments_block, resolve_reference, write_real_contract)
 from .convert import iiwa_dataset_frame  # noqa: E402
 from .planning import PlanBundle, load_plan  # noqa: E402
 from .profile import profile_for  # noqa: E402
@@ -296,7 +296,9 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
 
     bundle: PlanBundle = load_plan(run_dir / "plan")
     raw = pd.read_parquet(run_dir / "raw.parquet")
-    excitation_segments = [s for s in bundle.segments if s.kind == "excitation"]
+    # RR_23: excitations (`test`), chirps (`modal_reference`), sweeps (`calibration`)
+    excitation_segments = [s for s in bundle.segments if s.kind in DATASET_SPLITS]
+    details = segment_details(run_dir / "plan")
     events = json.loads((run_dir / "events.json").read_text())
     bounds = excitation_windows(raw, events, excitation_segments)
     losses = load_losses(run_dir)
@@ -360,12 +362,13 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
             measured=(bracket_stamps, _prefixed(bracketed, "q", n_dof)),
         )
         window["bag"] = segment.segment_id
-        window["split"] = "test"
+        window["split"] = DATASET_SPLITS[segment.kind]
         rows.append(window)
     if not rows:
         (run_dir / "validation.json").write_text(json.dumps({"ok": False, "status": "invalid",
                                                             "segments": segment_checks}, indent=2))
-        raise RuntimeError("convert_cli: no excitation segment's window could be recovered from the bag/events")
+        raise RuntimeError("convert_cli: no dataset segment's window (excitation, modal_chirp or calibration_sweep) "
+                           "could be recovered from the bag/events")
     windowed = to_model_torque_sign(pd.concat(rows, ignore_index=True), n_dof=n_dof, hardware=config.hardware)
 
     used_segments = list(dict.fromkeys(str(b) for b in windowed["bag"]))
@@ -376,10 +379,10 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
         reference_path=reference_contract_path,
     )
     time_step = 1.0 / config.rate_hz
-    frame = iiwa_dataset_frame(
+    frame = add_segment_columns(iiwa_dataset_frame(
         windowed, n_dof=n_dof, sg_window=differentiation["sg_window"], sg_poly=differentiation["sg_poly"],
         time_step=time_step,
-    )
+    ), details)
 
     from elastic_sim.assets import AssetRegistry
 
@@ -402,7 +405,7 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
         "schema_version": 2, "n_dof": n_dof, "joint_names": list(config.joint_order),
         "signals": {"target": "link_torque", "target_source": "measured", "target_kind": "joint_torque_sensor"},
         "differentiation": {"sg_window": differentiation["sg_window"], "sg_poly": differentiation["sg_poly"]},
-        "split": "test", "sample_time_step": time_step,
+        "split": dataset_split(windowed), "sample_time_step": time_step,
         "noise": {"dq": {"source": "position_derivative"}},
     }
     contract = real_contract(
@@ -421,7 +424,8 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
 
     contract["reference_synthetic"] = bool(reference_contract.get("synthetic", False))
     contract["excitation"] = excitation_block
-    contract["segments"] = segments_block(used_segments)
+    kinds = {s.segment_id: s.kind for s in excitation_segments}
+    contract["segments"] = segments_block(used_segments, kinds=kinds, details=details)
 
     from .convert import write_real_dataset
 
@@ -452,6 +456,14 @@ def _convert_iiwa(config: LabConfig, run_dir: Path, reference_contract: dict[str
     validation["segments"] = segment_checks
     return _finish_validation(config, run_dir, validation, contract, differentiation, events,
                               {"dataset": str(csv_path), "contract": str(contract_path)})
+
+
+def dataset_split(frame: pd.DataFrame) -> str:
+    """The file's one split (RR_23: a plan is excitations, chirps or sweeps, never mixed)."""
+    splits = sorted(set(frame["split"]))
+    if len(splits) != 1:
+        raise RuntimeError(f"convert_cli: one dataset mixes splits {splits}")
+    return splits[0]
 
 
 def _mock_tracking_note(config: LabConfig, check: dict[str, Any]) -> dict[str, Any]:
@@ -519,6 +531,20 @@ def _reference_block_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
     return dict((contract.get("real") or {}).get("reference") or {})
 
 
+def commissioning_only(run_dir: Path) -> str | None:
+    """RR_23: the run executed segments, none of them a dataset kind (an
+    excitation ladder or a modal ladder rung): the kinds it ran, else ``None``."""
+    if not (run_dir / "events.json").is_file():
+        return None
+    manifest = json.loads((run_dir / "plan" / "plan.manifest.json").read_text(encoding="utf-8"))
+    kinds = {s["segment_id"]: s["kind"] for s in manifest.get("segments", [])}
+    events = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))
+    ran = {kinds[e["segment_id"]] for e in events if e["segment_id"] in kinds and e["kind"].endswith("_start")}
+    if not ran or ran & set(DATASET_SPLITS):
+        return None
+    return ", ".join(sorted(ran))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="erd_recording.convert_cli")
     parser.add_argument("--config", required=True)
@@ -540,6 +566,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "reason": str(exc)}))
         return 2
 
+    commissioning = commissioning_only(Path(args.run_dir))
+    if commissioning:
+        print(json.dumps({"ok": True, "status": "recorded", "dataset": None, "validation_ok": None,
+                          "nulls": [], "simulator_limits": [], "warnings": [],
+                          "note": f"commissioning only ({commissioning}): never a dataset; see `quicklook`"}))
+        return 0
     if config.robot == "kuka_lbr_iiwa_14_r820":
         result = _convert_iiwa(config, Path(args.run_dir), reference)
     else:

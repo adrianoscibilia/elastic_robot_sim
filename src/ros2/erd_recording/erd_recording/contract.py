@@ -437,10 +437,52 @@ def excitation_block_from_plan(plan_dir: Path, segment_ids: list[str]) -> dict[s
     }
 
 
-def segments_block(segment_ids: list[str], *, kind: str = "excitation", split: str = "test") -> list[dict[str, str]]:
+#: RR_23: the plan segment kinds ``convert`` writes into a dataset, and their
+#: split. Everything else (approaches, returns, ``*_commissioning``) never is.
+DATASET_SPLITS = {"excitation": "test", "modal_chirp": "modal_reference", "calibration_sweep": "calibration"}
+
+
+def segment_details(plan_dir: Path) -> dict[str, dict[str, Any]]:
+    """Per-segment contract fields of a ``--modal``/``--te-sweeps`` plan
+    (``plan.manifest.json`` ``modal``/``te_sweeps`` ``segments``); empty otherwise."""
+    manifest = json.loads((Path(plan_dir) / "plan.manifest.json").read_text(encoding="utf-8"))
+    return {**(manifest.get("modal") or {}).get("segments", {}), **(manifest.get("te_sweeps") or {}).get("segments", {})}
+
+
+def segments_block(segment_ids: list[str], *, kind: str = "excitation", split: str = "test",
+                   kinds: Mapping[str, str] | None = None,
+                   details: Mapping[str, Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
     """RR_20 T8 (spec S6): ``segments[]`` with ``kind`` and ``split`` (the
-    consumer scores only ``test``)."""
-    return [{"segment_id": sid, "kind": kind, "split": split} for sid in segment_ids]
+    consumer scores only ``test``). RR_23: ``kinds`` gives each segment's own
+    kind (its split from :data:`DATASET_SPLITS`), and ``details`` adds the
+    chirp's ``joint``, ``pose_name``, ``pose_q``, ``f0``, ``f1``, ``T``, ``a_max``,
+    ``repeat``, ``rung``, ``M_jj``, ``dg_dq_jj``, ``Q_used`` (or the sweep's
+    ``joint``, ``speed``, ``plateau_start_s``, ``plateau_end_s``)."""
+    block = []
+    for sid in segment_ids:
+        own = (kinds or {}).get(sid, kind)
+        entry = {"segment_id": sid, "kind": own, "split": DATASET_SPLITS.get(own, split) if kinds else split}
+        extra = dict((details or {}).get(sid, {}))
+        extra.pop("kind", None), extra.pop("split", None)
+        block.append({**entry, **extra})
+    return block
+
+
+def add_segment_columns(frame, details: Mapping[str, Mapping[str, Any]]):
+    """RR_23 C4: r8's ``add_modal_columns`` on a real file -- ``modal_joint``,
+    ``modal_pose``, ``modal_repeat``, ``modal_f0``, ``modal_f1`` per ``bag``
+    (``tools/modal_fit.py`` reads real and simulated files the same way).
+    Unchanged when no ``bag`` is a chirp."""
+    chirps = {sid: d for sid, d in details.items() if "f0" in d}
+    if not chirps or not frame["bag"].isin(list(chirps)).any():
+        return frame
+    frame = frame.copy()
+    bags = frame["bag"].astype(str)
+    for column, key in (("modal_joint", "joint"), ("modal_pose", "pose_name"), ("modal_repeat", "repeat"),
+                        ("modal_f0", "f0"), ("modal_f1", "f1")):
+        frame[column] = bags.map(lambda bag, key=key: chirps[bag][key])
+    frame["modal_repeat"] = frame["modal_repeat"].astype(int)
+    return frame
 
 
 def write_real_contract(dataset_path: Path, contract: Mapping[str, Any]) -> Path:

@@ -207,7 +207,9 @@ ABORT_OVERRIDE_MAX_LADDER = 0.1
 
 #: The plan segment kinds that excite the arm (everything else is an
 #: approach, a return or a hold).
-EXCITATION_KINDS = frozenset({"excitation", "excitation_commissioning", "identify_excitation", "identify_sweep"})
+EXCITATION_KINDS = frozenset({"excitation", "excitation_commissioning", "identify_excitation", "identify_sweep",
+                              # RR_23 C4/C5: P2 chirps and TE sweeps
+                              "modal_chirp", "modal_chirp_commissioning", "calibration_sweep"})
 
 
 def segment_tracking_rad(kind: str | None, *, file_rad: float, excitation_override: float | None) -> float:
