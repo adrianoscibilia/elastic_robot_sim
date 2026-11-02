@@ -238,6 +238,8 @@ round8:
       lines: [32, 48]
       acceleration_share: 0.7    # weighting acceleration 70 %, position 30 %
       fraction: [0.5, 1.0]       # additive budget
+      lowest_line_hz: 1.5        # 03 F1: as the UR10 real comb
+      line_amplitude_max: 0.005  # 03 F1: per line [rad]; a line over it is scaled down
     real_like:                   # the real P1 comb (RR_20 Sec 3.3): 21 lines 2.0 ... 23.2 Hz on the 0.2 Hz grid
       base_frequency: 0.2
       n_periods: 2

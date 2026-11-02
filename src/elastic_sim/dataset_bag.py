@@ -617,6 +617,10 @@ def rollout_frame(
                 frame[f"te_amplitude__{name}"] = float(amplitude[index])
                 frame[f"te_order__{name}"] = float(order[index])
                 frame[f"te_phase__{name}"] = float(error.phase[index]) if error.phase else 0.0
+                if error.amplitude_n:
+                    frame[f"te_amplitude_n__{name}"] = float(error.amplitude_n[index])
+                    frame[f"te_order_n__{name}"] = float(error.order_n[index])
+                    frame[f"te_phase_n__{name}"] = float(error.phase_n[index]) if error.phase_n else 0.0
     return pd.DataFrame(frame)
 
 

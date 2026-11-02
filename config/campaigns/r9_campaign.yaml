@@ -1,0 +1,61 @@
+# identified_filter/07 Sec 2 (r9): settings of scripts/r8_campaign.py --config config/campaigns/r9_campaign.yaml.
+# r8's (config/campaigns/r8_campaign.yaml) except: the r9 datasets, the step-2 filter (`filter:`), the sampled K as
+# the privileged K_0 (05 D2, 06 Sec 2), the reduced queue T, P, ID, R, R7 (05 Sec 3) and its own results folder.
+run_id: r9-campaign
+unit: r9-campaign                 # systemd --user unit of `launch`
+data_root: data/identification/r9
+results_dir: REFACTOR_SPECS/identified_filter/results/r9   # r8's campaign_plan.json and progress.md stay as they are
+deadline: null                    # 07 Sec 2: the owner's; otherwise the plan's time + deadline_hours
+deadline_hours: 36
+parallel_seeds: 3                 # 07 S1.4: 2 seeds for P, R, R7 (J2, J11, J5) if the plan does not fit 36 h at 3
+seeds: [0, 1, 2]
+epochs: 150
+patience: 20
+student_epochs: 40
+student_patience: 8
+grad_clip_norm: 1.0               # 04 C2
+fail_fast_epochs: 10              # 04 C2
+coupling: full
+min_free_gb: 50
+# 05 D2, 06 Sec 2: the encoder's and the teacher's K_0 is the sampled K, the catalogue curve's middle slope.
+privileged_source: sampled
+
+# The step-2 filter (06 Sec 2, 07 S1; dynamic_model_nn identified_filter.py): the tangent catalogue spring with the
+# region at the fixed point of its own spring torque, warm-started from |tau_r| low-passed at warm_cutoff_ratio x the
+# lowest main-joint f_n; M_f = alpha M_URDF, alpha in alpha_range; D = 2 zeta sqrt(K_0 Mbar_f), zeta in the prior's
+# own range; K_0 in the sampling range; M_phi pre-fitted to M_URDF for inertia_prefit_steps; lambda_M set like
+# lambda_delta.
+filter:
+  spring: tangent
+  warm_cutoff_ratio: 0.5
+  alpha_range: [0.7, 1.4]
+  stiffness_widening: 1.0
+  inertia_prefit_steps: 500
+
+platforms:
+  iiwa_drive:
+    config: config/identification/kuka_lbr_iiwa_14_r820_table_drive_round9.yaml
+    stem: kuka_lbr_iiwa_14_r820_table_drive_round9
+    r7_chain: runs/r7-taufree-20261015-1231/chain-iiwa_drive-taufree.yaml
+    r7_epochs: {kalnn_twomass_id: 299, lnn_twomass_id: 109, kalnn_twomass: 299, kalnn_tau_res: 68, default: 200}
+    decimation: 1
+    main_joints: [iiwa_A1, iiwa_A2, iiwa_A4]
+  ur10:
+    config: config/identification/ur10_table_round9.yaml
+    stem: ur10_table_round9
+    r7_chain: runs/r7-taufree-20261015-1231/chain-ur10-taufree.yaml
+    r7_epochs: {kalnn_twomass_id: 208, lnn_twomass_id: 135, kalnn_twomass: 208, kalnn_tau_res: 52, default: 150}
+    decimation: 4
+    decimation_p: 0.5
+    identified_lr_scale: 0.5      # 04 C2
+    main_joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint]
+
+# 05 Sec 3's reduced queue, under r8's job names (the script's stage names are T, P, R, S, J, so a job named T would
+# read as a student's own teacher): J1 = T, J2 = P, J3 = ID, J11 = R (the anchored friction-only residual, 04 B4's
+# accuracy reference), J5 = R7.
+jobs:
+  J1:  {priority: 1, kind: teacher}                                   # T: true K_0, zeta; alpha = 1
+  J2:  {priority: 1, kind: phys}                                      # P: one constant (K_0, zeta) per joint
+  J3:  {priority: 1, kind: student}                                   # ID: the encoder, log K_0, log zeta, log alpha
+  J11: {priority: 1, kind: r7_residual, model_kwargs: {residual_inputs: dq_joint, drop_base_angle: true}}   # R
+  J5:  {priority: 2, kind: r7_twomass}                                # R7: the r7 two-mass, for continuity

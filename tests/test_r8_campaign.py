@@ -76,6 +76,21 @@ def test_all_stops_without_a_contract(campaign, monkeypatch, tmp_path):
     assert campaign.cmd_all({"platforms": {"ur10": {}}, "run_id": "t"}, types.SimpleNamespace()) == 1
 
 
+def test_all_trains_the_platforms_that_built_and_skips_the_others(campaign, monkeypatch, tmp_path):
+    """03 F5: a failed build costs that platform, not the campaign."""
+    (tmp_path / "ur10.contract.json").write_text("{}")
+    seen = []
+    monkeypatch.setattr(campaign, "cmd_data", lambda s, a: 1)
+    monkeypatch.setattr(campaign, "cmd_plan", lambda s, a: seen.append(sorted(s["platforms"])) or 0)
+    monkeypatch.setattr(campaign, "cmd_run", lambda s, a: seen.append(sorted(s["platforms"])) or 0)
+    monkeypatch.setattr(campaign, "platform_paths", lambda s, p: {"production": tmp_path / f"{p}.parquet"})
+    settings = {"platforms": {"ur10": {}, "iiwa_drive": {}}, "run_id": "t"}
+    assert campaign.cmd_all(settings, types.SimpleNamespace()) == 0
+    assert seen == [["ur10"], ["ur10"]]
+    log = (campaign.run_dir(settings) / "campaign.log").read_text()
+    assert "SKIP  all: no r8 production contract for ['iiwa_drive']; training on ['ur10']" in log
+
+
 def _fake_quiet(inhibit_ok, masked):
     def quiet(command):
         if command[0] == "systemd-inhibit":
@@ -86,15 +101,14 @@ def _fake_quiet(inhibit_ok, masked):
     return quiet
 
 
-@pytest.mark.parametrize("inhibit_ok,masked,expect", [(True, False, "inhibit"), (False, True, "masked"),
-                                                       (False, False, "refuse")])
+# systemd-inhibit is never used: polkit denies it inside the --user unit even when the terminal allows it.
+@pytest.mark.parametrize("inhibit_ok,masked,expect", [(True, False, "refuse"), (True, True, "masked"),
+                                                       (False, True, "masked"), (False, False, "refuse")])
 def test_sleep_guard(campaign, monkeypatch, inhibit_ok, masked, expect):
     monkeypatch.setattr(campaign.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(campaign, "_quiet", _fake_quiet(inhibit_ok, masked))
     prefix, message = campaign.sleep_guard()
-    if expect == "inhibit":
-        assert prefix[0] == "systemd-inhibit" and "sleep:idle:handle-lid-switch" in prefix[1]
-    elif expect == "masked":
+    if expect == "masked":
         assert prefix == [] and "masked: OK" in message
     else:
         assert prefix is None and "sudo systemctl mask sleep.target" in message
@@ -145,3 +159,119 @@ def test_config_budget_is_r8_sized(campaign):
     assert (settings["student_epochs"], settings["student_patience"]) == (40, 8)
     assert settings["privileged_source"] == "effective"
     json.dumps(settings)
+
+
+def test_stage_timeout_scales_with_parallel_seeds_and_has_a_floor(campaign):
+    # 2026-10-31: 1.5 x a one-seed estimate killed three J1 seeds sharing the GPU.
+    assert campaign.stage_timeout_s({"parallel_seeds": 3}, 1.0) == 12 * 3600.0
+    assert campaign.stage_timeout_s({"parallel_seeds": 3}, 4.0) == 1.5 * 4.0 * 3 * 3600.0
+    assert campaign.stage_timeout_s({"parallel_seeds": 1, "min_stage_timeout_h": 2}, 1.0) == 2 * 3600.0
+
+
+def _done(campaign, run, job, stage, **row):
+    done = campaign.stage_done(run, job, "ur10", 0, stage)
+    done.parent.mkdir(parents=True, exist_ok=True)
+    done.write_text(json.dumps(row))
+
+
+def test_student_skips_a_teacher_at_the_zero_predictor(campaign):
+    run = campaign.run_dir({})
+    student = {"name": "S", "init": "J1"}
+    assert "no result" in campaign.teacher_failure(run, "J3", "ur10", 0, student)
+    _done(campaign, run, "J1", "T", best_val_rmse="25.3", val_zero_rmse="25.4")
+    assert "zero predictor" in campaign.teacher_failure(run, "J3", "ur10", 0, student)
+    _done(campaign, run, "J1", "T", best_val_rmse="5.9", val_zero_rmse="25.4")
+    assert campaign.teacher_failure(run, "J3", "ur10", 0, student) is None
+    _done(campaign, run, "J1", "T", best_val_rmse="25.3")   # a run predating val_zero_rmse is not judged
+    assert campaign.teacher_failure(run, "J3", "ur10", 0, student) is None
+    # An own-teacher job reads its own T; a stage continuing its student, or with no init, has no teacher.
+    assert "J9" in campaign.teacher_failure(run, "J9", "ur10", 0, {"name": "S", "init": "T"})
+    assert campaign.teacher_failure(run, "J3", "ur10", 0, {"name": "J", "init": "S"}) is None
+    assert campaign.teacher_failure(run, "J2", "ur10", 0, {"name": "P"}) is None
+
+
+def test_failed_teacher_means_no_student_stage(campaign, monkeypatch):
+    started = []
+
+    def fake_stage(settings, run, job_name, job, platform, seed, stage, dataset, timeout_s, epochs=None):
+        started.append(stage["name"])
+        return {"rmse": "1.0", "checkpoint_path": "x"}
+
+    monkeypatch.setattr(campaign, "run_stage", fake_stage)
+    monkeypatch.setattr(campaign, "stage_runs", lambda s, j, p: [{"name": "S", "init": "J1"}, {"name": "J", "init": "S"}])
+    monkeypatch.setattr(campaign, "evaluate_job", lambda *a: None)
+    monkeypatch.setattr(campaign, "nvidia_logger", lambda run, stop: None)
+    monkeypatch.setattr(campaign, "free_gb", lambda path: 1e6)
+    monkeypatch.setattr(campaign, "platform_paths", lambda s, p: {"production": Path("x.parquet")})
+    settings = {"run_id": "t", "deadline": "2999-01-01T00:00", "parallel_seeds": 1, "seeds": [0], "min_free_gb": 50,
+                "platforms": {"ur10": {}}, "jobs": {"J3": {"priority": 1}}}
+    assert campaign.cmd_run(settings, types.SimpleNamespace(job=["J3"])) == 0
+    assert started == []
+    assert "SKIP  J3 ur10 s0 S: teacher J1 s0 left no result" in (campaign.run_dir(settings) / "campaign.log").read_text()
+
+
+def test_an_aborted_stage_is_not_retried(campaign, monkeypatch, tmp_path):
+    calls = []
+
+    class Finished:
+        pid = 1
+
+        def __init__(self, command, **kwargs):
+            calls.append(command)
+
+        def wait(self, timeout=None):
+            return campaign.STAGE_ABORT_EXIT
+
+    run = campaign.run_dir({})
+    monkeypatch.setattr(campaign.subprocess, "Popen", Finished)
+    monkeypatch.setattr(campaign, "write_chain", lambda *a: tmp_path / "chain.yaml")
+    row = campaign.run_stage({}, run, "J1", {}, "ur10", 0, {"name": "T"}, Path("x"), 10.0)
+    assert row is None and len(calls) == 1
+    assert campaign.stage_done(run, "J1", "ur10", 0, "T").with_suffix(".failed").exists()
+    assert "zero predictor, not retried" in (run / "campaign.log").read_text()
+
+
+def test_identified_learning_rate_is_halved_on_the_ur10_only(campaign):
+    settings = campaign.load_settings()
+    job = {"kind": "phys"}
+    ur10 = campaign.stage_runs(settings, job, "ur10")[0]["overrides"]
+    iiwa = campaign.stage_runs(settings, job, "iiwa_drive")[0]["overrides"]
+    r7, _ = campaign.r7_runs(settings, "ur10")
+    assert ur10["learning_rate"] == pytest.approx(0.5 * r7["kalnn_twomass"]["training_overrides"]["learning_rate"])
+    r7, _ = campaign.r7_runs(settings, "iiwa_drive")
+    assert iiwa["learning_rate"] == pytest.approx(r7["kalnn_twomass"]["training_overrides"]["learning_rate"])
+    for overrides in (ur10, iiwa):
+        assert (overrides["grad_clip_norm"], overrides["fail_fast_epochs"]) == (1.0, 10)
+    residual = campaign.stage_runs(settings, {"kind": "r7_residual"}, "ur10")[0]["overrides"]
+    assert "grad_clip_norm" not in residual and "fail_fast_epochs" not in residual
+
+
+def test_modal_file_gets_no_privileged_evaluation(campaign, monkeypatch, tmp_path):
+    names = {k: tmp_path / f"{k}.parquet" for k in ("production", "gainshift", "oop", "modal")}
+    for path in names.values():
+        path.touch()
+    commands = []
+    monkeypatch.setattr(campaign, "platform_paths", lambda s, p: names)
+    monkeypatch.setattr(campaign, "contract_kwargs", lambda s, p: {"burn_in_s": 1.0})
+    monkeypatch.setattr(campaign.subprocess, "call", lambda command, **kw: commands.append(command) or 0)
+    campaign.evaluate_job({}, campaign.run_dir({}), "J1", "ur10", {0: {"checkpoint_path": "c", "base_name": "J1_T"}})
+    privileged = [c[c.index("--dataset") + 1] for c in commands if "--privileged" in c]
+    assert sorted(Path(p).stem for p in privileged) == ["gainshift", "oop", "production"]
+    assert any(Path(c[c.index("--dataset") + 1]).stem == "modal" for c in commands)
+
+
+def test_r9_step2_kwargs_carry_the_plant_curve_the_warm_cutoff_and_the_urdf(campaign):
+    """identified_filter/07 Sec 2: the step-2 filter's kwargs from the r9 config; r8 has none."""
+    root = SCRIPT.parents[1] / "config" / "campaigns"
+    r9 = campaign.load_settings(root / "r9_campaign.yaml")
+    r8 = campaign.load_settings(root / "r8_campaign.yaml")
+    assert campaign.step2_kwargs(r8, "ur10") == {}
+    kwargs = campaign.step2_kwargs(r9, "ur10")
+    assert (kwargs["spring"], kwargs["inertia"], kwargs["damping"]) == ("tangent", "urdf", "zeta")
+    assert kwargs["spring_knees"][1] == [29.0, 108.0] and kwargs["spring_knees"][2] == [14.0, 48.0]   # size 32 / 25
+    assert kwargs["spring_factors"][1] == [0.69, 1.0, 1.44]
+    assert abs(kwargs["spring_warm_cutoff_hz"] - 0.5 * 4.18) < 0.01   # 0.5 x the pan's f_n,min (band table)
+    assert len(kwargs["urdf_chain"]["joints"]) == 6 and kwargs["lambda_inertia"] is None
+    assert kwargs["stiffness_widening"] == 1.0 and kwargs["alpha_range"] == [0.7, 1.4]
+    assert set(r9["jobs"]) == {"J1", "J2", "J3", "J11", "J5"} and r9["privileged_source"] == "sampled"
+    assert r9["results_dir"] != r8.get("results_dir")

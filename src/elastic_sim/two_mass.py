@@ -33,6 +33,16 @@ Two discretisations, both unconditionally stable for positive ``K`` and ``D``:
   above FR_04 Sec 4's 1e-3 modal acceptance, which the trapezoidal rule meets
   (FR_04 implementation report).
 
+``K`` may vary per sample (`identified_filter/05` D2): the recursion is then
+linear in the state with time-varying coefficients, ``K_{k+1}`` in the new step.
+``spring="total"`` is that spring, ``K_k delta_k``, which steps by ``dK delta`` when
+``K`` moves faster than ``delta``.  ``spring="tangent"`` reads ``K`` as the slope
+along the curve instead, ``S' = K delta'``, with ``S`` a state and ``tau_s = S + D delta'``:
+no step, and with a constant ``K`` the same sequence as ``"total"``.  Each step takes the
+step's mean stiffness, ``S_{k+1} = S_k + (K_k + K_{k+1}) / 2 (delta_{k+1} - delta_k)``
+(`identified_filter/06` Sec 1.2): a step and its reversal then cancel exactly, where the new
+sample's ``K_{k+1}`` alone ratchets ``S`` up the curve on every oscillation inside a knee's blend.
+
 ``tau_s,k = K delta_k + D v_k``.  The initial condition is quasi-static:
 ``delta_0 = tau_r,0 / K``, ``v_0 = a_0 = 0``, so ``tau_s,0 = tau_r,0``; exact
 when the sequence starts at rest.
@@ -47,9 +57,13 @@ import numpy as np
 
 COUPLINGS = ("diagonal", "full")
 INTEGRATORS = ("trapezoidal", "backward_euler")
+SPRINGS = ("total", "tangent")
 
 #: Burn-in rounding step (FR_04 Sec 3.1: "rounded up to 0.05 s").
 BURN_IN_QUANTUM_S = 0.05
+
+#: Half-width of the blend across a catalogue knee, as a fraction of its torque (`identified_filter/05` D2).
+KNEE_BLEND = 0.1
 
 
 def burn_in_seconds(zeta_min: float, frequency_min_hz: float, quantum: float = BURN_IN_QUANTUM_S) -> float:
@@ -74,22 +88,99 @@ def mean_diagonal(inertia: np.ndarray) -> np.ndarray:
     return diagonal.mean(axis=0)
 
 
+def knee_factor(torque: np.ndarray, factors: np.ndarray, knees: np.ndarray, blend: float = KNEE_BLEND) -> np.ndarray:
+    """``phi_j(|tau|)``: the catalogue spring's region factor at a torque, ``[T, n]`` (`identified_filter/05` D2).
+
+    ``factors`` is ``[n, r + 1]`` or one shared row, ``knees`` ``[n, r]``.  A smoothstep over ``knee x (1 +- blend)``
+    joins the regions; outside those intervals the factor is exactly the catalogue's.
+    """
+    magnitude = np.abs(np.asarray(torque, dtype=float))
+    n = magnitude.shape[-1]
+    knees = np.broadcast_to(np.atleast_2d(np.asarray(knees, dtype=float)), (n, np.shape(np.atleast_2d(knees))[-1]))
+    factors = np.broadcast_to(np.atleast_2d(np.asarray(factors, dtype=float)),
+                              (n, np.shape(np.atleast_2d(factors))[-1]))
+    out = np.broadcast_to(factors[:, 0], magnitude.shape).copy()
+    for r in range(knees.shape[1]):
+        s = np.clip(0.5 + 0.5 * (magnitude - knees[:, r]) / (blend * knees[:, r]), 0.0, 1.0)
+        out = out + (factors[:, r + 1] - factors[:, r]) * s * s * (3.0 - 2.0 * s)
+    return out
+
+
+def _curve_tables(stiffness: np.ndarray, factors: np.ndarray, knees: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Per joint: region slopes ``[n, r + 1]``, knee torques and knee deflections ``[n, r]``."""
+    stiffness = np.asarray(stiffness, dtype=float).reshape(-1)
+    n = len(stiffness)
+    knees = np.broadcast_to(np.atleast_2d(np.asarray(knees, dtype=float)), (n, np.shape(np.atleast_2d(knees))[-1]))
+    factors = np.broadcast_to(np.atleast_2d(np.asarray(factors, dtype=float)),
+                              (n, np.shape(np.atleast_2d(factors))[-1]))
+    slopes = factors * stiffness[:, None]
+    widths = np.diff(np.concatenate([np.zeros((n, 1)), knees], axis=1), axis=1)
+    return slopes, knees, np.cumsum(widths / slopes[:, :-1], axis=1)
+
+
+def catalogue_torque(deflection: np.ndarray, stiffness: np.ndarray, factors: np.ndarray,
+                     knees: np.ndarray) -> np.ndarray:
+    """``f(delta)``: the catalogue spring with its knees at torques ``knees``, odd in ``delta``, ``[T, n]``.
+
+    The plant's curve (``plant_extras.StiffnessNonlinearity.from_torque_knees``), unblended: region ``r`` has slope
+    ``factors[r] K_0``.
+    """
+    slopes, knee_torque, knee_deflection = _curve_tables(stiffness, factors, knees)
+    magnitude = np.abs(np.asarray(deflection, dtype=float))
+    lower = np.concatenate([np.zeros((slopes.shape[0], 1)), knee_deflection], axis=1)
+    base = np.concatenate([np.zeros((slopes.shape[0], 1)), knee_torque], axis=1)
+    region = np.stack([np.searchsorted(lower[j], magnitude[..., j], side="right") - 1
+                       for j in range(slopes.shape[0])], axis=-1)
+    pick = lambda table: np.take_along_axis(np.broadcast_to(table, magnitude.shape + table.shape[-1:]),  # noqa: E731
+                                            region[..., None], axis=-1)[..., 0]
+    return np.sign(deflection) * (pick(base) + pick(slopes) * (magnitude - pick(lower)))
+
+
+def catalogue_deflection(torque: np.ndarray, stiffness: np.ndarray, factors: np.ndarray,
+                         knees: np.ndarray) -> np.ndarray:
+    """``f^-1(tau)``: the deflection of the catalogue spring at a torque, ``[..., n]``."""
+    slopes, knee_torque, knee_deflection = _curve_tables(stiffness, factors, knees)
+    magnitude = np.abs(np.asarray(torque, dtype=float))
+    lower = np.concatenate([np.zeros((slopes.shape[0], 1)), knee_torque], axis=1)
+    base = np.concatenate([np.zeros((slopes.shape[0], 1)), knee_deflection], axis=1)
+    region = np.stack([np.searchsorted(lower[j], magnitude[..., j], side="right") - 1
+                       for j in range(slopes.shape[0])], axis=-1)
+    pick = lambda table: np.take_along_axis(np.broadcast_to(table, magnitude.shape + table.shape[-1:]),  # noqa: E731
+                                            region[..., None], axis=-1)[..., 0]
+    return np.sign(torque) * (pick(base) + (magnitude - pick(lower)) / pick(slopes))
+
+
 def filter_sequence(
     tau_r: np.ndarray, inertia: np.ndarray, stiffness: np.ndarray, damping: np.ndarray, time_step: float,
-    *, coupling: str = "diagonal", integrator: str = "trapezoidal",
+    *, coupling: str = "diagonal", integrator: str = "trapezoidal", spring: str = "total",
+    initial_deflection: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Run the filter along one sequence; returns ``tau_s``, ``delta``, ``delta_dot`` (each ``[T, n]``).
 
     ``inertia`` is ``[T, n]`` (diagonals) or ``[T, n, n]``; ``coupling="diagonal"``
     reads only the diagonal of a full matrix, ``"full"`` needs the matrices.
+    ``stiffness`` is ``[n]``, or ``[T, n]`` for a time-varying spring.
+    ``initial_deflection`` replaces ``tau_r,0 / K_0`` (``spring="tangent"`` only, where
+    ``delta`` never enters the dynamics, so ``tau_s`` does not depend on it): the
+    catalogue curve's ``f^-1(tau_r,0)``, which keeps ``S = f(delta)`` at the start.
     """
     if coupling not in COUPLINGS:
         raise ValueError(f"coupling must be one of {COUPLINGS}, got {coupling!r}")
     if integrator not in INTEGRATORS:
         raise ValueError(f"integrator must be one of {INTEGRATORS}, got {integrator!r}")
+    if spring not in SPRINGS:
+        raise ValueError(f"spring must be one of {SPRINGS}, got {spring!r}")
+    if spring == "tangent" and integrator != "trapezoidal":
+        raise ValueError("spring='tangent' is implemented for the trapezoidal integrator")
+    if initial_deflection is not None and spring != "tangent":
+        raise ValueError("initial_deflection is for spring='tangent'; the total form starts at tau_r,0 / K_0")
     tau_r = np.asarray(tau_r, dtype=float)
     inertia = np.asarray(inertia, dtype=float)
-    stiffness = np.asarray(stiffness, dtype=float).reshape(-1)
+    stiffness = np.asarray(stiffness, dtype=float)
+    varying = stiffness.ndim == 2
+    if not varying:
+        stiffness = stiffness.reshape(-1)
+    k_at = (lambda k: stiffness[k]) if varying else (lambda k: stiffness)
     damping = np.asarray(damping, dtype=float).reshape(-1)
     h = float(time_step)
     steps, n = tau_r.shape
@@ -111,22 +202,42 @@ def filter_sequence(
 
     delta = np.empty((steps, n))
     velocity = np.empty((steps, n))
-    delta[0] = tau_r[0] / stiffness
+    delta[0] = tau_r[0] / k_at(0) if initial_deflection is None else np.asarray(initial_deflection, float).reshape(-1)
     velocity[0] = 0.0
+    if spring == "tangent":
+        acceleration = np.zeros(n)
+        force = np.asarray(tau_r[0], dtype=float).copy()
+        forces = np.empty((steps, n))
+        forces[0] = force
+        for k in range(steps - 1):
+            k_new = 0.5 * (k_at(k) + k_at(k + 1))
+            system = mass(k + 1) + diag(0.5 * h * damping + 0.25 * h * h * k_new)
+            predicted_v = velocity[k] + 0.5 * h * acceleration
+            predicted_d = delta[k] + h * velocity[k] + 0.25 * h * h * acceleration
+            new = solve(system, tau_r[k + 1] - damping * predicted_v
+                        - (force + 0.5 * h * k_new * (velocity[k] + predicted_v)))
+            velocity[k + 1] = predicted_v + 0.5 * h * new
+            delta[k + 1] = predicted_d + 0.25 * h * h * new
+            force = force + 0.5 * h * k_new * (velocity[k] + velocity[k + 1])
+            forces[k + 1] = force
+            acceleration = new
+        return {"tau_s": forces + damping * velocity, "delta": delta, "delta_dot": velocity}
     if integrator == "trapezoidal":
         acceleration = np.zeros(n)
         for k in range(steps - 1):
-            system = mass(k + 1) + diag(0.5 * h * damping + 0.25 * h * h * stiffness)
+            k_new = k_at(k + 1)
+            system = mass(k + 1) + diag(0.5 * h * damping + 0.25 * h * h * k_new)
             predicted_v = velocity[k] + 0.5 * h * acceleration
             predicted_d = delta[k] + h * velocity[k] + 0.25 * h * h * acceleration
-            new = solve(system, tau_r[k + 1] - damping * predicted_v - stiffness * predicted_d)
+            new = solve(system, tau_r[k + 1] - damping * predicted_v - k_new * predicted_d)
             velocity[k + 1] = predicted_v + 0.5 * h * new
             delta[k + 1] = predicted_d + 0.25 * h * h * new
             acceleration = new
     else:
         for k in range(steps - 1):
             m = mass(k + 1)
-            velocity[k + 1] = solve(m + diag(h * damping + h * h * stiffness),
-                                    apply(m, velocity[k]) + h * (tau_r[k + 1] - stiffness * delta[k]))
+            k_new = k_at(k + 1)
+            velocity[k + 1] = solve(m + diag(h * damping + h * h * k_new),
+                                    apply(m, velocity[k]) + h * (tau_r[k + 1] - k_new * delta[k]))
             delta[k + 1] = delta[k] + h * velocity[k + 1]
     return {"tau_s": stiffness * delta + damping * velocity, "delta": delta, "delta_dot": velocity}

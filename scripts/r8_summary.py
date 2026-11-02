@@ -25,6 +25,7 @@ import pandas as pd
 
 SIM = Path(__file__).resolve().parents[1]
 RESULTS = SIM / "REFACTOR_SPECS" / "identified_filter" / "results"
+FINAL_STAGES = ("J", "T", "P", "R")   # r8_real_eval: the last stage a job's seed finishes
 JOB_NAMES = {"J1": "2M-KALNN-T (teacher, privileged)", "J2": "2M-KALNN-PHYS", "J3": "2M-KALNN-ID",
              "J4": "KALNN residual (r7)", "J5": "2M-KALNN (r7 config)", "J6": "J3, lambda_p = 0",
              "J7": "J3, lambda_delta = 0", "J8": "J3, causal encoder", "J9": "2M-LNN-ID", "J10": "J3, q_dq residual",
@@ -35,8 +36,47 @@ def _read(path):
     return pd.read_csv(path) if path.exists() and path.stat().st_size else pd.DataFrame()
 
 
+def markdown(frame: pd.DataFrame) -> str:
+    """A GitHub table of ``frame`` (the environment has no ``tabulate`` for ``DataFrame.to_markdown``)."""
+    def cell(value):
+        return "" if value is None or value != value else str(value)
+
+    header = [str(c) for c in frame.columns]
+    rows = ["| " + " | ".join(cell(v) for v in row) + " |" for row in frame.itertuples(index=False)]
+    return "\n".join(["| " + " | ".join(header) + " |", "|" + "---|" * len(header), *rows])
+
+
+def deployed_checkpoints(run: Path) -> dict[str, dict]:
+    """04 C1: per job and platform, the seed a deployment would pick: the final stage's best validation RMSE.
+
+    ``checkpoint -> {job, platform, seed, best_val_rmse}`` of those seeds only.  Selection on validation, never
+    on the test RMSE the tables report.
+    """
+    best: dict = {}
+    for done in sorted((run / "jobs").glob("*/*/s*_*.done.json")):
+        job, platform = done.parts[-3], done.parts[-2]
+        seed, stage = done.name.split(".")[0].split("_")
+        row = json.loads(done.read_text())
+        try:
+            value = float(row["best_val_rmse"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        best.setdefault((job, platform, seed), {})[stage] = {"checkpoint": row["checkpoint_path"], "value": value}
+    out: dict = {}
+    for (job, platform, seed), stages in best.items():
+        final = stages[next(s for s in FINAL_STAGES if s in stages)] if any(s in stages for s in FINAL_STAGES) else None
+        if final is None:
+            continue
+        current = out.get((job, platform))
+        if current is None or final["value"] < current["best_val_rmse"]:
+            out[(job, platform)] = {"job": job, "platform": platform, "seed": seed, "best_val_rmse": final["value"],
+                                    "checkpoint": final["checkpoint"]}
+    return {entry["checkpoint"]: entry for entry in out.values()}
+
+
 def simulated_table(run: Path) -> pd.DataFrame:
     rows = []
+    deployed = deployed_checkpoints(run)
     for csv in sorted((run / "eval").glob("*/*.csv")):
         if csv.name.endswith(".per_bag.csv"):
             continue
@@ -49,13 +89,19 @@ def simulated_table(run: Path) -> pd.DataFrame:
             rows.append({"job": job, "model": JOB_NAMES.get(job, job), "file": tag, "rmse": r["rmse"],
                          "rigid": r.get("baseline_rigid_masked"), "nominal": r.get("baseline_rigid_elastic_nominal"),
                          "oracle": r.get("baseline_rigid_elastic_oracle"), "privileged_eval": r.get("privileged_eval"),
-                         "checkpoint": r["checkpoint"]})
+                         "checkpoint": r["checkpoint"],
+                         "deployed_seed": deployed.get(r["checkpoint"], {}).get("seed")})
     table = pd.DataFrame(rows)
     if not len(table):
         return table
-    return table.groupby(["file", "job", "model", "privileged_eval"], dropna=False).agg(
-        rmse_mean=("rmse", "mean"), rmse_min=("rmse", "min"), seeds=("rmse", "size"), rigid=("rigid", "first"),
+    keys = ["file", "job", "model", "privileged_eval"]
+    grouped = table.groupby(keys, dropna=False).agg(
+        rmse_mean=("rmse", "mean"), seeds=("rmse", "size"), rigid=("rigid", "first"),
         nominal=("nominal", "first"), oracle=("oracle", "first")).reset_index()
+    chosen = table[table["deployed_seed"].notna()].groupby(keys, dropna=False).agg(
+        deployed_seed=("deployed_seed", "first"), rmse_deployed=("rmse", "first")).reset_index()
+    columns = keys + ["deployed_seed", "rmse_deployed", "rmse_mean", "seeds", "rigid", "nominal", "oracle"]
+    return grouped.merge(chosen, on=keys, how="left")[columns]
 
 
 def _log_r2(est, truth):
@@ -76,6 +122,8 @@ def identification_table(run: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not parts:
         return pd.DataFrame(), pd.DataFrame()
     table = pd.concat(parts, ignore_index=True)
+    if "checkpoint" in table.columns:  # 04 C1: the deployed seed of each job, not a pool with its failed seeds
+        table = table[table["checkpoint"].isin(deployed_checkpoints(run))]
     rows = []
     keys = ["job", "file", "joint_name", "regime"]
     for key, part in table[np.isfinite(table["K_true"])].groupby(keys, dropna=False):
@@ -152,7 +200,8 @@ def main(argv=None) -> int:
     figures = RESULTS / "figures"
     figures.mkdir(parents=True, exist_ok=True)
     lines = ["# 2M-ID weekend campaign: summary (descriptive)", "",
-             "Generated by `scripts/r8_summary.py`; the owner decides what goes to `final_results/` and the paper.", ""]
+             "Generated by `scripts/r8_summary.py`; the owner decides what goes to `final_results/` and the paper.",
+             "Every model row is the job's deployed seed: its best validation RMSE (the test RMSE plays no part).", ""]
 
     lines += ["## 1. What ran", ""]
     plan = RESULTS / "campaign_plan.json"
@@ -172,18 +221,18 @@ def main(argv=None) -> int:
 
     sim = simulated_table(run)
     lines += ["", "## 2. Simulated (test / gain-shift / out-of-prior / modal files)", ""]
-    lines.append(sim.round(4).to_markdown(index=False) if len(sim) else "pending")
+    lines.append(markdown(sim.round(4)) if len(sim) else "pending")
 
     table, ident = identification_table(run)
     lines += ["", "## 3. Identification (K_hat vs truth per held-out robot)", "",
               "`logR2_Keff` is against the bag's effective linear pair (the identifiable target of a nonlinear spring); "
               "corr(delta_hat, delta) is secondary (00_plan D-4).", ""]
-    lines.append(ident.round(3).to_markdown(index=False) if len(ident) else "pending")
+    lines.append(markdown(ident.round(3)) if len(ident) else "pending")
     if len(table):
         from_consistency = table[np.isfinite(table["K_true"])].groupby(["job", "file", "tier", "joint_name"])["K_hat"]
         spread = (from_consistency.max() / from_consistency.min() - 1).groupby(["job", "file", "joint_name"]).median()
         lines += ["", "Consistency of K_hat across a test robot's bags (median max/min - 1):", "",
-                  spread.rename("K_hat_spread").reset_index().round(3).to_markdown(index=False)]
+                  markdown(spread.rename("K_hat_spread").reset_index().round(3))]
 
     lines += ["", "## 4. Phase 0", ""]
     for path in sorted((RESULTS / "phase0").glob("*.json")):
@@ -196,9 +245,10 @@ def main(argv=None) -> int:
             continue
         frame = _read(csv)
         if len(frame):
+            frame = frame[frame["checkpoint"].isin(deployed_checkpoints(run))]  # 04 C1: one row per job, its deployed seed
             cols = [c for c in ("checkpoint", "input", "exclude_head_s", "filter_time_step", "rmse") if c in frame] \
                 + [c for c in frame.columns if c.startswith("rmse_joint_")]
-            lines += [f"### {csv.stem}", "", frame[cols].round(4).to_markdown(index=False), ""]
+            lines += [f"### {csv.stem}", "", markdown(frame[cols].round(4)), ""]
     for js in sorted(real.glob("modal_fit_*.json")):
         lines += [f"### {js.stem}", "", "```json", js.read_text()[:3000], "```", ""]
     if not any(real.glob("*.csv")):

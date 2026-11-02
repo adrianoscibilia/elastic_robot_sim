@@ -20,7 +20,7 @@ import pandas as pd
 from .assets import AssetSpec
 from .backend_comparison import compare_backends, format_report, summarize
 from .controllers import ControllerDraw, describe_controller, effective_bandwidth, sample_velocity_loop
-from .excitation import FourierExcitationConfig, optimize_excitation
+from .excitation import FourierExcitationConfig, InfeasibleExcitation, optimize_excitation
 from .identification import FrictionModel
 from .kinematics import PortableKinematics
 from .materialized import MaterializedTrajectory
@@ -131,11 +131,26 @@ def sample_payloads(sampling: PayloadSampling, seed: int, count: int) -> tuple[P
 
 #: Round 8 (Sec 1.1.3): trajectory-seed offset per regeneration attempt (`elastic_sim.round8`).
 RESEED_STRIDE = 1_000_000_007
+#: Round 8 (`identified_filter/03` F1): new seeds a bag with no feasible trajectory gets before it is dropped.
+FEASIBILITY_RESEEDS = 3
+#: `identified_filter/05` D1: stream of the ``te_randomised`` amplitudes, ``(seed, 23, robot)``: new, so no existing
+#: draw moves, and separate from the robots' ``(seed, 1)``, so an amplitude tells nothing about K.
+TE_TIER_STREAM = 23
 
 
 def _robot_stream(robot: str) -> int:
     """A stable integer per robot name, so the draw survives adding robots."""
     return int.from_bytes(hashlib.blake2b(str(robot).encode("utf-8"), digest_size=4).digest(), "big")
+
+
+def torque_knees(sampling: PlantExtrasSampling, effort: np.ndarray | None) -> np.ndarray:
+    """The spring's knees in torque: the config's, or its effort fractions of the URDF limits (`R6_00` Sec 5.2)."""
+    if sampling.stiffness_breakpoints_torque:
+        return np.asarray(sampling.stiffness_breakpoints_torque, dtype=float)
+    if effort is None:
+        raise ValueError("breakpoints_effort_fraction needs the joints' effort limits")
+    return np.outer(np.asarray(effort, dtype=float),
+                    np.asarray(sampling.stiffness_breakpoints_effort_fraction, dtype=float))
 
 
 def plant_extras_for_bag(
@@ -161,7 +176,10 @@ def plant_extras_for_bag(
     effort-fraction knees into torques (`R6_00` Sec 5.2).  Without a
     stiffness -- the rigid tier -- there is no spring to bend.  The
     transmission error's phase is drawn per bag from stream
-    ``(seed, 12, trajectory_seed)`` (Sec 5.3).
+    ``(seed, 12, trajectory_seed)`` (Sec 5.3).  The ``te_randomised`` tier
+    draws its amplitudes per robot and joint from stream ``(seed, 23, robot)``
+    (`identified_filter/05` D1); its order-n phase follows the order-2n one in
+    stream 12.
     """
     if sampling.is_empty:
         return NO_EXTRAS
@@ -186,13 +204,7 @@ def plant_extras_for_bag(
         )
     elif (sampling.stiffness_breakpoints_torque or sampling.stiffness_breakpoints_effort_fraction) \
             and stiffness is not None:
-        if sampling.stiffness_breakpoints_torque:
-            knees = np.asarray(sampling.stiffness_breakpoints_torque, dtype=float)
-        else:
-            if effort is None:
-                raise ValueError("breakpoints_effort_fraction needs the joints' effort limits")
-            knees = np.outer(np.asarray(effort, dtype=float),
-                             np.asarray(sampling.stiffness_breakpoints_effort_fraction, dtype=float))
+        knees = torque_knees(sampling, effort)
         nonlinearity = StiffnessNonlinearity.from_torque_knees(
             np.asarray(sampling.stiffness_factors, dtype=float), knees,
             _per_joint(stiffness, n_dof, "stiffness"),
@@ -209,6 +221,17 @@ def plant_extras_for_bag(
             amplitude=tuple(_per_joint(sampling.transmission_error_amplitude, n_dof, "transmission_error.amplitude")),
             order=tuple(_per_joint(sampling.transmission_error_order, n_dof, "transmission_error.order")),
         )
+        if sampling.transmission_error_tier == "te_randomised":
+            if robot is None:
+                raise ValueError("plant_extras.transmission_error.tier: te_randomised needs the robot (tier) name")
+            rng = np.random.default_rng((int(dataset_seed), TE_TIER_STREAM, _robot_stream(robot)))
+            bound = np.asarray(transmission_error.amplitude)
+            transmission_error = replace(
+                transmission_error,
+                amplitude=tuple(bound * _log_uniform(rng, sampling.transmission_error_amplitude_factor, n_dof)),
+                amplitude_n=tuple(bound * _log_uniform(rng, sampling.transmission_error_amplitude_n_factor, n_dof)),
+                order_n=tuple(0.5 * np.asarray(transmission_error.order)),
+            )
         if sampling.transmission_error_random_phase:
             rng = np.random.default_rng((int(dataset_seed), 12, int(trajectory_seed_value)))
             transmission_error = transmission_error.with_phase(rng, n_dof)
@@ -277,6 +300,8 @@ def trajectories_for(config: DatasetConfig, tier: Tier, labels: Mapping[str, str
 
 
 def bag_wanted(config: DatasetConfig, tier: Tier, index: int) -> bool:
+    if (tier.name, int(index)) in {(str(a), int(b)) for a, b in getattr(config, "excluded_bags", ())}:
+        return False
     only = getattr(config, "only_bags", None)
     return only is None or (tier.name, int(index)) in {(str(a), int(b)) for a, b in only}
 
@@ -556,6 +581,18 @@ def attached_payload(config: DatasetConfig, drawn: Payload | None, tier: Tier) -
                    size=float(sampling.fixed_size))
 
 
+def collision_payload(config: DatasetConfig, drawn: Payload | None, tier: Tier) -> Payload | None:
+    """The body a bag's trajectory is collision-checked with.
+
+    Round 8 checks what the plant carries (`identified_filter/03` F1): under
+    ``payload.mode: none`` no body exists, and on the iiwa the draws' boxes above
+    0.2 m reject all 48 candidates on 18 of 392 bags, whatever the regime; the
+    bare arm rejects none.  Earlier rounds keep the draw, so that their three
+    payload modes share trajectories bit for bit.
+    """
+    return drawn if getattr(config, "round8", None) is None else attached_payload(config, drawn, tier)
+
+
 @dataclass(frozen=True)
 class ResolvedBag:
     """One ``(tier, trajectory index)`` bag's payload-aware trajectory and gains."""
@@ -634,9 +671,9 @@ def resolve_bag(
         stack = contextlib.ExitStack()
         try:
             if kinematics_for is not None:
-                kinematics = kinematics_for(payload)
+                kinematics = kinematics_for(collision_payload(config, payload, tier))
             else:
-                asset_p = stack.enter_context(payload_asset(asset, payload))
+                asset_p = stack.enter_context(payload_asset(asset, collision_payload(config, payload, tier)))
                 kinematics = PortableKinematics(asset_p)
             trajectory = optimize_excitation(
                 asset, excitation, seed=traj_seed, n_candidates=config.candidates, kinematics=kinematics,
@@ -660,6 +697,7 @@ def trajectory_key(
     """
     traj_seed = trajectory_seed(config, tier, index)
     _, excitation = bag_excitation(config, tier, index)
+    payload = collision_payload(config, payload, tier)
     payload_key = () if payload is None or payload.is_empty else (payload.mass, payload.offset, payload.size)
     modal = () if getattr(config, "modal", None) is None else ("modal", repr(config.modal))
     return (asset.name, str(asset.urdf_path), tier.name if config.trajectories_per_robot else "", index,
@@ -670,6 +708,55 @@ def _optimize_trajectory(args: tuple) -> MaterializedTrajectory:
     """Process-pool entry point: one bag's trajectory, own kinematics."""
     config, asset, tier, index, payload = args
     return resolve_bag(config, asset, tier, index, payload).trajectory
+
+
+def _optimize_or_none(args: tuple) -> MaterializedTrajectory | None:
+    """:func:`_optimize_trajectory`, ``None`` for a bag whose seed has no feasible candidate."""
+    try:
+        return _optimize_trajectory(args)
+    except InfeasibleExcitation:
+        return None
+
+
+def settle_trajectories(config: DatasetConfig, asset: AssetSpec, work: Sequence[tuple[Tier, int, Payload | None]],
+                        trajectory_cache: dict, map_function: Callable = map) -> tuple[DatasetConfig, list[dict]]:
+    """Optimize ``work``'s ``(tier, index, payload)`` bags, reseeding what has no feasible trajectory.
+
+    A bag gets :data:`FEASIBILITY_RESEEDS` new seeds (``RESEED_STRIDE``), then is
+    dropped and recorded: one bag never fails the file (`identified_filter/03`
+    F1).  Returns the config with the final ``reseed`` and ``excluded_bags``, and
+    the dropped bags.
+    """
+    reseed = {(str(t), int(i)): int(a) for t, i, a in config.reseed}
+    tries = {(tier.name, int(index)): 0 for tier, index, _ in work}
+    todo = list(work)
+    while todo:
+        current = replace(config, reseed=tuple((t, i, a) for (t, i), a in reseed.items()))
+        pending: dict[tuple, tuple] = {}
+        for tier, index, payload in todo:
+            key = trajectory_key(current, asset, tier, index, payload)
+            if key not in trajectory_cache:
+                pending.setdefault(key, (current, asset, tier, index, payload))
+        built = dict(zip(pending, map_function(_optimize_or_none, pending.values())))
+        trajectory_cache.update({key: trajectory for key, trajectory in built.items() if trajectory is not None})
+        failed = [(tier, index, payload) for tier, index, payload in todo
+                  if trajectory_key(current, asset, tier, index, payload) not in trajectory_cache]
+        config = current
+        todo = []
+        for tier, index, payload in failed:
+            bag = (tier.name, int(index))
+            if tries[bag] < FEASIBILITY_RESEEDS:
+                tries[bag] += 1
+                reseed[bag] = reseed.get(bag, 0) + 1
+                todo.append((tier, index, payload))
+    dropped = [{"tier": tier.name, "trajectory": int(index), "tries": tries[(tier.name, int(index))] + 1,
+                "reason": "no feasible excitation trajectory"}
+               for tier, index, payload in work
+               if trajectory_key(config, asset, tier, index, payload) not in trajectory_cache]
+    excluded = tuple(config.excluded_bags) + tuple((row["tier"], row["trajectory"]) for row in dropped)
+    gone = set(excluded)
+    return replace(config, excluded_bags=excluded,
+                   reseed=tuple(r for r in config.reseed if (r[0], r[1]) not in gone)), dropped
 
 
 #: The round-6 target and inputs, as the manifest and the contract state them (`R6_00` Sec 1).
@@ -907,6 +994,13 @@ def generate(
         resolve_tiers = config.tiers if config.trajectories_per_robot else config.tiers[:1]
         if config.only_tiers is not None and config.trajectories_per_robot:
             resolve_tiers = tuple(t for t in resolve_tiers if t.name in config.only_tiers)
+        dropped_bags: list[dict] = []
+        if getattr(config, "round8", None) is not None and getattr(config, "modal", None) is None \
+                and config.trajectories_per_robot:
+            config, dropped_bags = settle_trajectories(
+                config, asset, [(tier, index, _payload_for(tier, index)) for tier in resolve_tiers
+                                for index in range(trajectories_for(config, tier)) if bag_wanted(config, tier, index)],
+                trajectory_cache, pool.map if pool is not None else map)
         pending: dict[tuple, tuple] = {}
         for tier in resolve_tiers:
             for index in range(trajectories_for(config, tier)):
@@ -1192,6 +1286,9 @@ def generate(
         "distinct_trajectories": len(trajectories),
         # One digest per (tier, trajectory index): identical across every
         # matched mode x extras row of a platform (`R5_10` T-3.3).
+        # Round 8: the final seeds and the dropped bags, what a paired file must reuse (`identified_filter/03` F1, F2).
+        **({"reseed": [list(r) for r in config.reseed], "excluded_bags": [list(b) for b in config.excluded_bags],
+            "dropped_bags": dropped_bags} if getattr(config, "round8", None) is not None else {}),
         "trajectory_digests": {f"{name or 'shared'}/t{index}": trajectory.digest()
                                for (name, index), trajectory in trajectories.items()},
         "backends": list(config.backends),

@@ -70,6 +70,9 @@ class FourierExcitationConfig:
     # same expected acceleration amplitude -- what a real robot's motion
     # floor, roughly flat in acceleration, needs at the low lines.
     probe_weighting: str = "position"
+    # Largest position amplitude of one probe line [rad], 0 for none (round 8's
+    # ``full`` regime, `identified_filter/03` F1): a line over it is scaled down, not dropped.
+    probe_line_amplitude_max: float = 0.0
     # Per-joint ``(lower, upper)`` [rad], overriding the URDF limit for that
     # joint before ``limit_margin`` is applied.  Empty means every joint keeps
     # its URDF limit (the iiwa's historical behaviour).  Needed on robots
@@ -373,6 +376,35 @@ def _scale_block(
     return a * scale[:, None], b * scale[:, None]
 
 
+def _cap_probe_lines(
+    a: np.ndarray, b: np.ndarray, omega: float, indices: np.ndarray, cap: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Scale every probe line down to position amplitude ``cap``, keeping the block's rest at ``t = 0``.
+
+    Line ``k``'s position amplitude is ``hypot(a_k, b_k) / (k omega)``.  Clipping
+    breaks the block's two boundary sums (:func:`project_coefficients`), so they
+    are restored on the lines the cap left alone, with a final per-joint scale
+    down, which keeps the sums at zero, for whatever that correction pushed over.
+    """
+    harmonics = np.asarray(indices, dtype=float)
+    limit = cap * harmonics * omega
+    a, b = a.copy(), b.copy()
+    for _ in range(8):
+        amplitude = np.hypot(a, b)
+        capped = amplitude > limit
+        scale = np.where(capped, limit / np.maximum(amplitude, 1.0e-300), 1.0)
+        a, b = a * scale, b * scale
+        for j in range(a.shape[0]):
+            free = ~capped[j]
+            if not free.any():
+                free = np.ones_like(free)
+            a[j, free] -= a[j].sum() / free.sum()
+            b[j, free] -= (b[j] @ harmonics) * harmonics[free] / float(harmonics[free] @ harmonics[free])
+    worst = (np.hypot(a, b) / limit).max(axis=1)
+    shrink = 1.0 / np.maximum(worst, 1.0)
+    return a * shrink[:, None], b * shrink[:, None]
+
+
 def _fit_to_limits(
     a: np.ndarray,
     b: np.ndarray,
@@ -388,6 +420,7 @@ def _fit_to_limits(
     probe_count: int = 0,
     probe_acceleration_fraction: float = 0.0,
     probe_budget: str = "split",
+    probe_line_amplitude_max: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Scale each joint's series to the largest feasible amplitude.
 
@@ -433,6 +466,14 @@ def _fit_to_limits(
             a[:, n_main:], b[:, n_main:], omega, fine_time, probe_indices, unconstrained, unconstrained,
             np.full(n_joints, probe_acceleration_fraction * max_acceleration),
         )
+        if probe_line_amplitude_max > 0.0:
+            a_probe, b_probe = _cap_probe_lines(a_probe, b_probe, omega, probe_indices, probe_line_amplitude_max)
+            # The boundary-sum correction can lift the peak acceleration a little: scale back, never up.
+            _, _, ddq_probe = evaluate_series(a_probe, b_probe, np.zeros(n_joints), omega, fine_time,
+                                              indices=probe_indices)
+            budget = probe_acceleration_fraction * max_acceleration
+            down = np.minimum(1.0, budget / np.maximum(np.abs(ddq_probe).max(axis=0), 1.0e-12))
+            a_probe, b_probe = a_probe * down[:, None], b_probe * down[:, None]
         q_probe, dq_probe, _ = evaluate_series(
             a_probe, b_probe, np.zeros(a_probe.shape[0]), omega, fine_time, indices=probe_indices
         )
@@ -492,8 +533,12 @@ def sample_candidate(
         a, b, omega, time, safe_lower, safe_upper, velocity_limit, config.max_acceleration,
         rng=rng, centre_jitter=config.centre_jitter, indices=indices,
         probe_count=len(config.probe_harmonics), probe_acceleration_fraction=config.probe_acceleration_fraction,
-        probe_budget=config.probe_budget,
+        probe_budget=config.probe_budget, probe_line_amplitude_max=config.probe_line_amplitude_max,
     )
+
+
+class InfeasibleExcitation(RuntimeError):
+    """Every candidate of one seed was rejected; the caller may try another seed."""
 
 
 def optimize_excitation(
@@ -563,7 +608,7 @@ def optimize_excitation(
                 "q": q, "dq": dq, "ddq": ddq}
 
     if best is None:
-        raise RuntimeError(
+        raise InfeasibleExcitation(
             f"No feasible excitation trajectory found for {asset.name!r} in {n_candidates} candidates "
             f"({rejected_for_collision} rejected for collision)"
         )
@@ -586,6 +631,8 @@ def optimize_excitation(
         **({"probe_budget": "additive"} if config.probe_budget == "additive" else {}),
         # Only when not the default, for the same reason (`RR_20` T3).
         **({"probe_weighting": config.probe_weighting} if config.probe_weighting != "position" else {}),
+        **({"probe_line_amplitude_max": float(config.probe_line_amplitude_max)}
+           if config.probe_line_amplitude_max > 0.0 else {}),
         "probe_top_hz": float(config.probe_harmonics[-1] * config.base_frequency) if config.probe_harmonics else 0.0,
         "candidates": int(n_candidates),
         "candidate_index": int(best["index"]),

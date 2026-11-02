@@ -216,11 +216,18 @@ class TransmissionError:
 
     ``phase`` is drawn per bag, like the torque ripple's, so a network cannot
     learn one fixed map of it.
+
+    ``amplitude_n``, ``order_n``, ``phase_n`` add the once-per-wave-generator-turn
+    line of the ``te_randomised`` tier (`identified_filter/05` D1); empty, the
+    error is the single line above, operation for operation.
     """
 
     amplitude: tuple[float, ...] = (0.0,)
     order: tuple[float, ...] = (1.0,)
     phase: tuple[float, ...] = ()
+    amplitude_n: tuple[float, ...] = ()
+    order_n: tuple[float, ...] = ()
+    phase_n: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         amplitude = tuple(float(v) for v in np.atleast_1d(self.amplitude))
@@ -232,38 +239,69 @@ class TransmissionError:
         object.__setattr__(self, "amplitude", amplitude)
         object.__setattr__(self, "order", order)
         object.__setattr__(self, "phase", tuple(float(v) for v in self.phase))
+        amplitude_n = tuple(float(v) for v in self.amplitude_n)
+        order_n = tuple(float(v) for v in self.order_n)
+        if any(v < 0.0 for v in amplitude_n):
+            raise ValueError("plant_extras.transmission_error.amplitude_n must be non-negative")
+        if amplitude_n and (not order_n or any(v <= 0.0 for v in order_n)):
+            raise ValueError("plant_extras.transmission_error.order_n must be positive")
+        object.__setattr__(self, "amplitude_n", amplitude_n)
+        object.__setattr__(self, "order_n", order_n)
+        object.__setattr__(self, "phase_n", tuple(float(v) for v in self.phase_n))
 
     @property
     def is_empty(self) -> bool:
-        return all(v == 0.0 for v in self.amplitude)
+        return all(v == 0.0 for v in self.amplitude) and all(v == 0.0 for v in self.amplitude_n)
 
     def with_phase(self, rng: np.random.Generator, n_dof: int) -> "TransmissionError":
         if self.is_empty:
             return self
         from dataclasses import replace
 
-        return replace(self, phase=tuple(rng.uniform(0.0, 2.0 * np.pi, size=n_dof)))
+        phase = tuple(rng.uniform(0.0, 2.0 * np.pi, size=n_dof))
+        if not self.amplitude_n:
+            return replace(self, phase=phase)
+        return replace(self, phase=phase, phase_n=tuple(rng.uniform(0.0, 2.0 * np.pi, size=n_dof)))
+
+    @staticmethod
+    def _line(motor_position: np.ndarray, amplitude: tuple, order: tuple, phase: tuple
+              ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        motor_position = np.asarray(motor_position, dtype=float)
+        amplitude = np.broadcast_to(np.asarray(amplitude, dtype=float), motor_position.shape[-1:])
+        order = np.broadcast_to(np.asarray(order, dtype=float), motor_position.shape[-1:])
+        phase = np.asarray(phase, dtype=float) if phase else np.zeros(motor_position.shape[-1])
+        return amplitude, order, order * motor_position + phase
 
     def _terms(self, motor_position: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        motor_position = np.asarray(motor_position, dtype=float)
-        amplitude = np.broadcast_to(np.asarray(self.amplitude, dtype=float), motor_position.shape[-1:])
-        order = np.broadcast_to(np.asarray(self.order, dtype=float), motor_position.shape[-1:])
-        phase = np.asarray(self.phase, dtype=float) if self.phase else np.zeros(motor_position.shape[-1])
-        return amplitude, order, order * motor_position + phase
+        return self._line(motor_position, self.amplitude, self.order, self.phase)
+
+    def _terms_n(self, motor_position: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._line(motor_position, self.amplitude_n, self.order_n, self.phase_n)
 
     def error(self, motor_position: np.ndarray) -> np.ndarray:
         """``e(theta)``."""
         amplitude, _, angle = self._terms(motor_position)
-        return amplitude * np.sin(angle)
+        error = amplitude * np.sin(angle)
+        if self.amplitude_n:
+            amplitude, _, angle = self._terms_n(motor_position)
+            error = error + amplitude * np.sin(angle)
+        return error
 
     def slope(self, motor_position: np.ndarray) -> np.ndarray:
         """``de/dtheta``."""
         amplitude, order, angle = self._terms(motor_position)
-        return amplitude * order * np.cos(angle)
+        slope = amplitude * order * np.cos(angle)
+        if self.amplitude_n:
+            amplitude, order, angle = self._terms_n(motor_position)
+            slope = slope + amplitude * order * np.cos(angle)
+        return slope
 
     def max_slope(self) -> np.ndarray:
         """``A n``: the largest ``|de/dtheta|``, for the explicit-term bound."""
-        return np.asarray(self.amplitude, dtype=float) * np.asarray(self.order, dtype=float)
+        slope = np.asarray(self.amplitude, dtype=float) * np.asarray(self.order, dtype=float)
+        if self.amplitude_n:
+            slope = slope + np.asarray(self.amplitude_n, dtype=float) * np.asarray(self.order_n, dtype=float)
+        return slope
 
 
 @dataclass(frozen=True)
@@ -500,6 +538,12 @@ class PlantExtras:
                 "order": list(self.transmission_error.order),
                 "phase": list(self.transmission_error.phase),
             }
+            if self.transmission_error.amplitude_n:
+                record["transmission_error"].update(
+                    amplitude_n=list(self.transmission_error.amplitude_n),
+                    order_n=list(self.transmission_error.order_n),
+                    phase_n=list(self.transmission_error.phase_n),
+                )
         return record
 
 

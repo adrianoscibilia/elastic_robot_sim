@@ -56,6 +56,15 @@ class FullRegime:
     lines: tuple[int, int] = (32, 48)
     acceleration_share: float = 0.7
     fraction: tuple[float, float] = (0.5, 1.0)
+    #: Caps of `identified_filter/03` F1: the lowest line [Hz], as the UR10 real comb, and one line's position
+    #: amplitude [rad], a line over it scaled down.
+    lowest_line_hz: float = 1.5
+    line_amplitude_max: float = 0.005
+    #: `identified_filter/04` B3 (r9): the comb over these joints' modes only, ``[0.5 f_n,min, band_high_factor
+    #: f_n,max]``, capped at ``band_cap_hz``.  Empty (r8): every resolvable joint, ``[0.5 f_n,min, 1.5 f_n,max]``.
+    band_joints: tuple[str, ...] = ()
+    band_high_factor: float = 1.5
+    band_cap_hz: float | None = None
 
 
 @dataclass(frozen=True)
@@ -131,7 +140,10 @@ class Round8Spec:
     def as_dict(self) -> dict[str, Any]:
         return {
             "full": {"lines": list(self.full.lines), "acceleration_share": self.full.acceleration_share,
-                     "fraction": list(self.full.fraction), "budget": "additive"},
+                     "fraction": list(self.full.fraction), "budget": "additive",
+                     "lowest_line_hz": self.full.lowest_line_hz, "line_amplitude_max": self.full.line_amplitude_max,
+                     **({"band_joints": list(self.full.band_joints), "band_high_factor": self.full.band_high_factor,
+                         "band_cap_hz": self.full.band_cap_hz} if self.full.band_joints else {})},
             "real_like": {"base_frequency": self.real_like.base_frequency, "n_periods": self.real_like.n_periods,
                           "n_harmonics": self.real_like.n_harmonics, "harmonics": list(self.real_like.harmonics),
                           "fraction": self.real_like.fraction, "weighting": self.real_like.weighting,
@@ -156,7 +168,12 @@ def parse_round8(raw: Mapping[str, Any] | None, source: Any) -> Round8Spec | Non
     full_raw, real_raw = regimes.get("full") or {}, regimes.get("real_like") or {}
     full = FullRegime(lines=tuple(int(v) for v in full_raw.get("lines", (32, 48))),
                       acceleration_share=float(full_raw.get("acceleration_share", 0.7)),
-                      fraction=tuple(float(v) for v in full_raw.get("fraction", (0.5, 1.0))))
+                      fraction=tuple(float(v) for v in full_raw.get("fraction", (0.5, 1.0))),
+                      lowest_line_hz=float(full_raw.get("lowest_line_hz", 1.5)),
+                      line_amplitude_max=float(full_raw.get("line_amplitude_max", 0.005)),
+                      band_joints=tuple(str(j) for j in full_raw.get("band_joints", ())),
+                      band_high_factor=float(full_raw.get("band_high_factor", 1.5)),
+                      band_cap_hz=None if full_raw.get("band_cap_hz") is None else float(full_raw["band_cap_hz"]))
     real = RealLikeRegime(base_frequency=float(real_raw.get("base_frequency", 0.2)),
                           n_periods=int(real_raw.get("n_periods", 2)),
                           n_harmonics=int(real_raw.get("n_harmonics", 5)),
@@ -165,6 +182,8 @@ def parse_round8(raw: Mapping[str, Any] | None, source: Any) -> Round8Spec | Non
                           weighting=str(real_raw.get("weighting", "acceleration")))
     if not real.harmonics:
         raise ValueError(f"{source}: round8.probe_regimes.real_like.harmonics is required (the real P1 comb)")
+    if full.band_joints and (full.band_high_factor <= 0.5 or (full.band_cap_hz is not None and full.band_cap_hz <= 0)):
+        raise ValueError(f"{source}: round8 full band_high_factor must exceed 0.5 and band_cap_hz be positive")
     if not (0.0 < full.fraction[0] <= full.fraction[1] <= 1.0):
         raise ValueError(f"{source}: round8 full fraction must lie in (0, 1] (additive budget)")
     oop_raw = raw.get("oop") or {}
@@ -240,7 +259,25 @@ def resolve_round8(config: Any, asset: Any = None) -> Any:
 
         asset = AssetRegistry.for_repository(Path(__file__).resolve().parents[2]).load(config.asset)
     table, comb = modal_band(config, asset, n_samples=config.transmission.inertia_samples)
+    if spec.full.band_joints:
+        comb = band_comb(table, spec.full)
     return replace(config, round8=replace(spec, band=tuple(table), comb_hz=comb))
+
+
+def band_comb(table: Sequence[Mapping[str, Any]], full: FullRegime) -> tuple[float, float]:
+    """`identified_filter/04` B3: ``(f_lo, f_hi)`` over ``full.band_joints`` only, ``[0.5 f_n,min, k f_n,max]``,
+    ``f_hi`` capped at ``full.band_cap_hz`` and at the SG band."""
+    rows = [row for row in table if row["joint"] in full.band_joints]
+    missing = sorted(set(full.band_joints) - {row["joint"] for row in rows})
+    if missing:
+        raise ValueError(f"round8 full band_joints {missing} are not joints of the band table")
+    if not all(row["resolvable"] for row in rows):
+        raise ValueError("round8 full band_joints must be resolvable joints")
+    cap = min(float(row["f_sg_hz"]) for row in rows)
+    if full.band_cap_hz is not None:
+        cap = min(cap, float(full.band_cap_hz))
+    return (min(0.5 * float(row["f_n_min_hz"]) for row in rows),
+            min(cap, max(full.band_high_factor * float(row["f_n_max_hz"]) for row in rows)))
 
 
 # ------------------------------------------------------------------- regimes -----
@@ -281,11 +318,12 @@ def regime_draw(spec: Round8Spec, base: Any, split: str, index: int, dataset_see
     f_lo, f_hi = spec.comb_hz
     if f_hi <= 0.0:
         raise ValueError("round8 band not resolved: load the config with load_config (resolve_round8)")
-    bottom = max(f_lo, (base.n_harmonics + 1) * base.base_frequency)
+    bottom = max(f_lo, spec.full.lowest_line_hz, (base.n_harmonics + 1) * base.base_frequency)
     harmonics = tuple(sorted({h for h in log_spaced_probe_harmonics(bottom, f_hi, lines, base.base_frequency)
                               if h > base.n_harmonics and h * base.base_frequency <= f_hi + 1e-9}))
     return regime, replace(base, probe_harmonics=harmonics, probe_budget="additive",
                            probe_acceleration_fraction=min(1.0, fraction),
+                           probe_line_amplitude_max=spec.full.line_amplitude_max,
                            probe_weighting="acceleration" if accel else "position")
 
 
@@ -529,6 +567,26 @@ def fit_two_mass_multistart(tau_r, inertia, target, kept, step, stiffness, dampi
     return best[1], best[2]
 
 
+#: A fit further than this factor from the sampled K has run away: nothing else limits ``log K`` in the fit.
+FIT_RUNAWAY = 3.0
+
+
+def fit_usable(fit: Mapping[str, Any], group: pd.DataFrame, names: Sequence[str], priors: Mapping[str, Any],
+               f_sg: float) -> np.ndarray:
+    """Per joint of a :func:`verify_bags` row: the oracle fit ran, stayed within :data:`FIT_RUNAWAY` of the sampled
+    K and inside the contract's K and D ranges, the only values a two-mass filter of that contract can represent."""
+    joints = priors.get("joints") or [{}] * len(names)
+    usable = []
+    for name, joint in zip(names, joints):
+        k, d = fit[f"ident_K__{name}"], fit[f"ident_D__{name}"]
+        sampled = float(group[f"stiffness__{name}"].iloc[0])
+        k_low, k_high = joint.get("stiffness_range", (0.0, np.inf))
+        d_low, d_high = joint.get("damping_range", (0.0, np.inf))
+        usable.append(fit[f"f_n_filter__{name}"] <= f_sg and sampled / FIT_RUNAWAY <= k <= sampled * FIT_RUNAWAY
+                      and k_low <= k <= k_high and d_low <= d <= d_high)
+    return np.asarray(usable, dtype=bool)
+
+
 def verify_bags(frame: pd.DataFrame, manifest: Mapping[str, Any], contract: Mapping[str, Any], asset: Any,
                 spec: Round8Spec, *, keep: Sequence[str] | None = None, states: str = "clean") -> pd.DataFrame:
     """Per elastic bag and joint: ``ident_K_relerr``, ``ident_D_relerr``, ``elastic_snr``, ``observable``.
@@ -663,6 +721,61 @@ def effective_transmission(group: pd.DataFrame, n: int, stiffness: np.ndarray, d
     return k_eff, d_eff
 
 
+def target_rmse(group: pd.DataFrame, fit: Mapping[str, Any], manifest: Mapping[str, Any], contract: Mapping[str, Any],
+                asset: Any, score_after_s: float = 0.0) -> dict[str, np.ndarray]:
+    """In-band ``tau_s`` RMSE per joint of the two-mass filter with the true ``tau_r`` and each candidate (K, D).
+
+    ``{"sampled", "effective", "oracle_fit"}`` (the fit where :func:`fit_usable`, the effective pair elsewhere: a
+    run-away fit could never be a target), band ``[0.5, 2] f_n`` of that joint,
+    against the clean transmission torque; ``fit`` is the bag's :func:`verify_bags`
+    row.  ``NaN`` where the joint's mode is above ``f_SG``.  The target whose filter
+    follows the plant best is the one the dynamics support (`identified_filter/03` F3).
+    A fit minimises this very error on its own rows, so a fair comparison fits on a
+    bag's head and scores after ``score_after_s``.
+    """
+    from .diagnostics import savitzky_golay_acceleration
+    from .identification import FrictionModel
+    from .round7 import _block, _model_for, _rigid
+    from .two_mass import filter_sequence
+
+    n, names = int(manifest["n_dof"]), list(manifest["joint_names"])
+    step = float(manifest["sample_time_step"])
+    differentiation = contract.get("differentiation") or {}
+    q, dq = _block(group, "q_motor_clean", n), _block(group, "dq_motor_clean", n)
+    ddq = savitzky_golay_acceleration(dq, step, window=int(differentiation.get("sg_window") or 11),
+                                      order=int(differentiation.get("sg_poly") or 3))
+    tau_rnea, inertia = _rigid(*_model_for(asset, None, {}), q, dq, ddq)
+    friction = FrictionModel(*(np.asarray([float(group[f"{law}__{x}"].iloc[0]) for x in names])
+                               for law in ("link_viscous", "link_coulomb")))
+    tau_r = tau_rnea + friction.torque(dq)
+    clean = _block(group, "ft_clean", n)
+    head = float((contract.get("transmission_priors") or {}).get("burn_in_s", 0.0))
+    time = group["t"].to_numpy(dtype=float)
+    kept = (time - time[0]) >= max(head, float(score_after_s)) - 1e-9
+    rate, f_sg = 1.0 / step, SG_BAND_FRACTION / step
+    k_eff = np.asarray([fit[f"K_eff__{x}"] for x in names], dtype=float)
+    d_eff = np.asarray([fit[f"D_eff__{x}"] for x in names], dtype=float)
+    usable = fit_usable(fit, group, names, contract.get("transmission_priors") or {}, f_sg)
+    pairs = {"sampled": (np.asarray([float(group[f"stiffness__{x}"].iloc[0]) for x in names]),
+                         np.asarray([float(group[f"damping__{x}"].iloc[0]) for x in names])),
+             "effective": (k_eff, d_eff),
+             "oracle_fit": (np.where(usable, [fit[f"ident_K__{x}"] for x in names], k_eff),
+                            np.where(usable, [fit[f"ident_D__{x}"] for x in names], d_eff))}
+    out = {}
+    for label, (k, d) in pairs.items():
+        tau_s = filter_sequence(tau_r, inertia, k, d, step, coupling="full")["tau_s"]
+        rmse = np.full(n, np.nan)
+        for j, x in enumerate(names):
+            f_n = float(fit[f"f_n_filter__{x}"])
+            if f_n > f_sg:
+                continue
+            band = _bandpass(np.column_stack([tau_s[:, j] - clean[:, j]]), 0.5 * f_n, 2.0 * f_n, rate)
+            if band is not None:
+                rmse[j] = float(np.sqrt(np.mean(band[kept, 0] ** 2)))
+        out[label] = rmse
+    return out
+
+
 def gate_joints(spec: Round8Spec) -> list[str]:
     """The joints the gate counts: the main joints plus every resolvable wrist (Sec 1.1.3)."""
     resolvable = [row["joint"] for row in spec.band if row["resolvable"]]
@@ -670,16 +783,20 @@ def gate_joints(spec: Round8Spec) -> list[str]:
 
 
 def coverage_report(verification: pd.DataFrame, regimes: Mapping[str, str], spec: Round8Spec) -> dict[str, Any]:
-    """Observable fraction per joint and regime; the ``full`` gate; the bags to regenerate.
+    """Observable fraction per joint and regime; the ``full`` gate (report mode); the bags to regenerate.
 
     The gate counts the resolvable joint-bags (``f_n <= f_SG`` for that robot)
-    of the gate joints in ``full`` bags.
+    of the gate joints in ``full`` bags.  A failing bag is either
+    excitation-limited (a failing main joint's in-band SNR below the threshold:
+    a new seed may help) or fit-limited (SNR fine, K wrong: a new seed cannot
+    help), and only the first is regenerated (`identified_filter/03` F6).
     """
     table = verification.copy()
     table["regime"] = table["bag"].map(regimes).fillna("unknown")
     joints = gate_joints(spec)
     per_joint: dict[str, Any] = {}
     failing_bags: set[str] = set()
+    excitation_limited: set[str] = set()
     raise_joints, gate_ok = [], True
     for regime, group in table.groupby("regime"):
         per_joint[regime] = {}
@@ -700,10 +817,14 @@ def coverage_report(verification: pd.DataFrame, regimes: Mapping[str, str], spec
                 if fraction < spec.verification.raise_fraction:
                     raise_joints.append(joint)
                 if joint in spec.verification.main_joints:
-                    failing_bags |= set(group.loc[resolvable & ~observable, "bag"])
-    return {"gate_joints": joints, "per_regime": per_joint, "gate_ok": bool(gate_ok),
+                    failed = resolvable & ~observable
+                    failing_bags |= set(group.loc[failed, "bag"])
+                    excitation_limited |= set(group.loc[failed & (group[f"elastic_snr__{joint}"]
+                                                                  < spec.verification.snr_min), "bag"])
+    return {"gate_joints": joints, "per_regime": per_joint, "gate_ok": bool(gate_ok), "mode": "report",
             "gate_fraction": spec.verification.gate_fraction, "raise_joints": raise_joints,
-            "failing_full_bags": sorted(failing_bags)}
+            "failing_full_bags": sorted(failing_bags), "excitation_limited_bags": sorted(excitation_limited),
+            "fit_limited_bags": sorted(failing_bags - excitation_limited)}
 
 
 def regimes_of(config: Any, frame: pd.DataFrame) -> dict[str, str]:

@@ -146,6 +146,9 @@ def write_dataset(
     }
     if int(manifest.get("schema_version", 0) or 0) >= 3:
         contract.update(_round6_contract(manifest, n_dof))
+    te_tier = te_tier_contract(manifest.get("plant_extras"))
+    if te_tier is not None:
+        contract["te_tier"] = te_tier
     contract_path = csv_path.with_suffix(".contract.json")
     contract_path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
     comparison_path = None
@@ -153,6 +156,19 @@ def write_dataset(
         comparison_path = comparison_report_path(csv_path)
         comparison.to_csv(comparison_path, index=False)
     return csv_path, manifest_path, comparison_path
+
+
+def te_tier_contract(extras: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The contract's ``te_tier`` of a randomised build (`identified_filter/05` D1); ``None`` otherwise, so an r8 contract is unchanged."""
+    if not extras or extras.get("transmission_error_tier", "fixed") == "fixed":
+        return None
+    return {"tier": extras["transmission_error_tier"],
+            "bound_rad": extras["transmission_error_amplitude"],
+            "order_2n": extras["transmission_error_order"],
+            "amplitude_2n_factor": extras["transmission_error_amplitude_factor"],
+            "amplitude_n_factor": extras["transmission_error_amplitude_n_factor"],
+            "drawn": "log-uniform per robot and joint; phases per bag; recorded in te_amplitude[_n]__<joint>",
+            "justification": extras["transmission_error_justification"]}
 
 
 def _round6_contract(manifest: Mapping[str, Any], n_dof: int) -> dict[str, Any]:

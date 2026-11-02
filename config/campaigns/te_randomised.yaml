@@ -1,0 +1,13 @@
+# identified_filter/05 D1: the te_randomised plant tier, overlaid on a platform's config by the ladder's rung L3p.
+# The config's transmission_error.amplitude (the catalogue accuracy, 2e-4 rad, a maximum) is the top of the range.
+# Amplitudes per robot and joint, log-uniform, stream (seed, 23, robot); phases per bag; orders 2n (the config's) and n.
+transmission_error:
+  tier: te_randomised
+  amplitude_factor: [0.1, 1.0]     # order-2n line, x the bound
+  amplitude_n_factor: [0.05, 0.5]  # order-n line, x the bound: once per wave-generator turn
+  justification: >-
+    Randomised within the datasheet bound, not calibrated to real data. The catalogue transmission accuracy is a
+    maximum, so it tops the range. The real/sim order-2n ratios of identified_filter/04 A2 (iiwa torque 0.08-0.46,
+    UR10 proxy 0.10-0.59, against a median of the range of 0.32) are a check, not a fit; the lowest, iiwa B A2 at
+    0.08, is an upper bound at the noise floor on 3 of its 5 speed bins. The order-n line is the once-per-turn
+    component of a harmonic drive, also seen on iiwa B A1 and A2 (orders 150-160).

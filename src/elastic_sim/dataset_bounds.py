@@ -169,7 +169,12 @@ def explicit_term_table(config: DatasetConfig, asset: Any, *, n_samples: int = 2
             rotor_high = nominal_rotor * (sampling.rotor_inertia_factor[1] if sampling.rotor_inertia_nominal else 1.0)
             # d = 2 zeta sqrt(k J_eff) <= 2 zeta_max sqrt(k_max J_rotor,max).
             d_high = 2.0 * sampling.damping_ratio[1] * np.sqrt(k_high * rotor_high)
-            spring_damping = d_high * (amplitude * order) ** 2
+            slope_high = amplitude * order
+            if extras.transmission_error_tier == "te_randomised":
+                # The largest draw of both lines (`identified_filter/05` D1).
+                slope_high = amplitude * (extras.transmission_error_amplitude_factor[1] * order
+                                          + extras.transmission_error_amplitude_n_factor[1] * 0.5 * order)
+            spring_damping = d_high * slope_high ** 2
         for j, name in enumerate(names):
             rows.append(BoundRow("elastic", name, "rotor", "motor friction", float(motor_slope[j]), h_elastic,
                                  float(rotor_low[j]), "explicit"))

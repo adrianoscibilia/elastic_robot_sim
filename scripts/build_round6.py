@@ -117,6 +117,22 @@ def variant_config(config, variant: str):
     raise ValueError(f"unknown variant {variant!r}")
 
 
+def paired_with_production(gainshift_config, production_manifest: dict):
+    """The gain-shift config on the production file's final seeds and dropped bags (`identified_filter/03` F2)."""
+    return replace(gainshift_config,
+                   reseed=tuple(tuple(r) for r in production_manifest.get("reseed", ())),
+                   excluded_bags=tuple(tuple(b) for b in production_manifest.get("excluded_bags", ())))
+
+
+def accept_sag_failures(report: dict) -> None:
+    """Round 8 (`identified_filter/03` F4): a bag over the sag limit is reported, not a refusal of the file."""
+    sag = next(g for g in report["gates"] if g["gate"].startswith("2"))
+    if sag["ok"]:
+        return
+    report["sag_failing_bags"] = sag.get("failing_bags", [])
+    report["ok"] = all(c["ok"] for c in report["hard_checks"]) and all(g["ok"] for g in report["gates"] if g is not sag)
+
+
 def _verify(frame, manifest, contract, asset, spec, jobs: int):
     """``verify_bags`` over the elastic bags, one bag per task in a pool when ``jobs > 1``."""
     import concurrent.futures
@@ -146,9 +162,11 @@ def round8_verification(variant_cfg, asset, frame, manifest, *, jobs: int, verbo
                         trajectory_cache: dict):
     """Sec 1.1.3: verify every elastic bag; on the production file regenerate failing ``full`` bags.
 
-    Returns ``(frame, manifest, verification, coverage, attempts)``.  A failing
-    bag (a resolvable main joint not observable) is rebuilt at the next seed,
-    at most ``retries`` times, then kept and flagged (``regen_attempt``).
+    Returns ``(frame, manifest, verification, coverage, attempts)``.  An
+    excitation-limited bag (a resolvable main joint not observable, its SNR below
+    the threshold) is rebuilt at the next seed, at most ``retries`` times, then
+    kept and flagged (``regen_attempt``).  A fit-limited bag is never rebuilt:
+    its SNR is fine, so a new seed cannot help (`identified_filter/03` F6).
     """
     from elastic_sim.dataset_config import differentiation_policy
     from elastic_sim.round7 import transmission_priors
@@ -162,10 +180,10 @@ def round8_verification(variant_cfg, asset, frame, manifest, *, jobs: int, verbo
     regimes = regimes_of(variant_cfg, frame)
     coverage = coverage_report(verification, regimes, spec)
     attempts: dict[str, int] = {}
-    reseed = list(variant_cfg.reseed)
+    reseed = {(r[0], int(r[1])): int(r[2]) for r in variant_cfg.reseed}
     previous_failing = 0
     for attempt in range(1, spec.verification.retries + 1 if gate else 1):
-        failing = [b for b in coverage["failing_full_bags"] if attempts.get(b, 0) == attempt - 1]
+        failing = [b for b in coverage["excitation_limited_bags"] if attempts.get(b, 0) == attempt - 1]
         if not failing:
             break
         if attempt > 1 and len(failing) > (1.0 - REGEN_MIN_RECOVERY) * previous_failing:
@@ -175,27 +193,33 @@ def round8_verification(variant_cfg, asset, frame, manifest, *, jobs: int, verbo
                                                 f"of {previous_failing} bags")
             break
         previous_failing = len(failing)
-        pairs = []
+        pairs, proposed = [], dict(reseed)
         for bag in failing:
             tier = str(frame.loc[frame["bag"] == bag, "tier"].iloc[0])
             index = int(str(bag).split("_")[0][1:])
             pairs.append((tier, index))
-            reseed = [r for r in reseed if (r[0], r[1]) != (tier, index)] + [(tier, index, attempt)]
+            proposed[(tier, index)] = proposed.get((tier, index), 0) + 1
         if verbose:
             print(f"[round8] regenerating {len(failing)} full bag(s), attempt {attempt}: {failing[:6]}...")
-        sub = replace(variant_cfg, reseed=tuple(reseed), only_bags=tuple(pairs))
+        sub = replace(variant_cfg, reseed=tuple((t, i, a) for (t, i), a in proposed.items()), only_bags=tuple(pairs))
         new_frame, new_manifest, _ = generate(sub, asset, verbose=False, jobs=jobs, trajectory_cache=trajectory_cache)
         done = sorted(set(new_frame["bag"]) & set(failing))
         frame, manifest = _splice(frame, manifest, new_frame, new_manifest, done)
+        # A bag the retry could not build keeps its previous version, so it keeps that version's seed.
+        final = {(r[0], int(r[1])): int(r[2]) for r in new_manifest.get("reseed", ())}
+        for bag in done:
+            pair = (str(frame.loc[frame["bag"] == bag, "tier"].iloc[0]), int(str(bag).split("_")[0][1:]))
+            reseed[pair] = final[pair]
         for bag in done:
             attempts[bag] = attempt
         fresh = _verify(frame[frame["bag"].isin(done)], manifest, contract, asset, spec, jobs)
         verification = pd.concat([verification[~verification["bag"].isin(done)], fresh], ignore_index=True)
-        variant_cfg = sub
+        variant_cfg = replace(variant_cfg, reseed=tuple((t, i, a) for (t, i), a in reseed.items()))
         regimes = regimes_of(variant_cfg, frame)
         coverage = coverage_report(verification, regimes, spec)
     coverage["regenerated"] = attempts
     coverage["still_failing"] = coverage["failing_full_bags"]
+    manifest["reseed"] = [[t, i, a] for (t, i), a in reseed.items()]
     # Escalation (stronger lines) can only help a joint whose full-regime in-band SNR is below the threshold.
     full = coverage["per_regime"].get("full", {})
     coverage["excitation_limited"] = sorted(
@@ -209,8 +233,14 @@ def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs
                   save: bool, trajectory_cache: dict, production_manifest: dict | None = None,
                   taufree: bool = False, priors: dict | None = None, round8: bool = False) -> dict:
     variant_cfg = variant_config(config, variant)
+    if variant == "gainshift" and production_manifest is not None:
+        variant_cfg = paired_with_production(variant_cfg, production_manifest)
     frame, manifest, comparison = generate(variant_cfg, asset, verbose=verbose, jobs=jobs,
                                            trajectory_cache=trajectory_cache)
+    if round8:
+        # What generate settled: the seeds and the dropped bags every later step of this file must read.
+        variant_cfg = replace(variant_cfg, reseed=tuple(tuple(r) for r in manifest.get("reseed", ())),
+                              excluded_bags=tuple(tuple(b) for b in manifest.get("excluded_bags", ())))
     coverage = None
     if round8 and variant != "modal":
         frame, manifest, _, coverage, _ = round8_verification(
@@ -227,6 +257,9 @@ def build_variant(config, asset, variant: str, *, out_dir: Path, stem: str, jobs
         report["gates"].append(gate_gainshift(production_manifest, manifest))
         report["ok"] = bool(report["ok"] and report["gates"][-1]["ok"]
                             and next(g for g in report["gates"] if g["gate"].startswith("1"))["ok"])
+    if round8:
+        accept_sag_failures(report)
+        report["dropped_bags"] = manifest.get("dropped_bags", [])
     report["variant"] = variant
     report["bags"] = int(manifest["n_bags"])
     if coverage is not None:

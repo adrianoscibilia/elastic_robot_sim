@@ -98,6 +98,7 @@ from .dataset_worklist import (  # noqa: F401
     ResolvedBag,
     sample_all_payloads,
     sample_control_gains,
+    torque_knees,
     sample_friction,
     sample_payloads,
     sampling_coverage_report,

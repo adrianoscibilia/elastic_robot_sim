@@ -1,5 +1,5 @@
 # identified_filter/01 Sec 1: round-8 copy of ur10_table_round7_nopayload.yaml (r8 datasets for 2M-ID).
-# Changed: robots 180 (120/30/30), stiffness_factor x [0.5, 2] of r7, link friction per robot
+# Changed: robots 180 (120/30/30), link friction per robot
 # x [0.05, 1.5], seed, output, trajectories by split, and the round8 block (probe regimes,
 # out-of-prior tier, modal chirps, per-bag verification).  Everything else is r7's.
 #
@@ -35,7 +35,9 @@ transmission:
   # nominal = K2 / 3 of HD sizes 32/32/25/17/17/17 (inferred, [S-5, S-6, S-7]);
   # see docs/PARAMETER_PROVENANCE.md for the round-6 size-17 correction.
   stiffness_nominal: [2.6e4, 2.6e4, 1.23e4, 5.7e3, 5.7e3, 5.7e3]   # Nm/rad
-  stiffness_factor: [0.1666666667, 6.0]   # r8: x [0.5, 2] of r7's [1/3, 3] (01 Sec 1; owner may veto -> r7)
+  # r7's (03 F4): the 01 Sec 1 widening x [0.5, 2] came from an iiwa observation only, and here its production
+  # sag reached 43-49 %, outside the first-order two-mass model's validity.
+  stiffness_factor: [0.3333333333, 3.0]
   stiffness_common_fraction: 0.0
   stiffness_provenance: [D, D, D, D, D, D]
   damping_ratio: [0.05, 0.2]
@@ -211,11 +213,8 @@ simulation:
 
 gates:
   sag_max_fraction: 0.05
-  # r8: reported, not gated.  The widened K prior (x [0.5, 2] of r7, 01 Sec 1) adds robots soft enough that
-  # some bag exceeds 5 % sag (a 4-robot preflight already did: 6.1 %), and one bag refuses the whole file.
-  # OWNER: coupled to the widening -- a veto of the widening restores sag_mode: gate.
-  sag_mode: report
-  sag_reason: "r8 widened stiffness prior (identified_filter/01 Sec 1)"
+  # r7's mode with r7's K range (03 F4).  An r8 build lists a failing bag and keeps the file (build_round6.py).
+  sag_mode: gate
   # Round 5's pd level (reports/round5/qc3_ur10_summary.csv, extras on).  That
   # build ran at 125 Hz on the cell target with (M + J)-sized gains, so the
   # reference is the same platform, not the same settings.
@@ -239,6 +238,8 @@ round8:
       lines: [32, 48]
       acceleration_share: 0.7    # weighting acceleration 70 %, position 30 %
       fraction: [0.5, 1.0]       # additive budget
+      lowest_line_hz: 1.5        # 03 F1: as the UR10 real comb
+      line_amplitude_max: 0.005  # 03 F1: per line [rad]; a line over it is scaled down
     real_like:                   # the real P1 comb (RR_20 Sec 3.3): 16 lines 1.6 ... 9.6 Hz on the 0.2 Hz grid
       base_frequency: 0.2
       n_periods: 2

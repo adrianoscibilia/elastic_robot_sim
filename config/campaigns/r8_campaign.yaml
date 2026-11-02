@@ -2,19 +2,22 @@
 run_id: r8-campaign
 unit: r8-campaign                 # systemd --user unit of `launch`
 data_root: data/identification/r8
-deadline: "2026-11-02T06:00"      # Sec 4: past it, drop jobs from the tail (P3 first, then P2), never P1
+deadline: "2026-11-02T18:00"      # moved by owner 2026-10-31
 parallel_seeds: 3                 # r7's; 2 if the plan shows the GPU does not fit three
 seeds: [0, 1, 2]
 epochs: 150                       # 02 R2: r8 has ~6.7x r7's train windows per epoch (r7: 300 / 30)
 patience: 20
 student_epochs: 40                # 02 R2 (01 Sec 2.7 had 60 / 10)
 student_patience: 8
+grad_clip_norm: 1.0               # 04 C2: identified classes; UR10 teacher seeds 0-1 diverged in r8
+fail_fast_epochs: 10              # 04 C2: abort a stage still within 5 % of the zero predictor after this many epochs
 coupling: full                    # the r7 preflight's choice on both arms (runs/r7-taufree-*/coupling.env)
 min_free_gb: 50
 # Which per-bag (K, D) the teacher and the parameter loss read: `effective` (the bag's LS linear pair of the
 # clean transmission torque on the true deflection, round8.effective_transmission) or `sampled` (the robot's
 # middle spring segment).  The r6/r7 plant's spring is nonlinear and carries the transmission error, so the
-# sampled K is not what a linear filter can identify (results/datasets.md, the oracle fit).  Confirmed (02 Sec 0).
+# sampled K is not what a linear filter can identify (results/datasets.md, the oracle fit).  Confirmed (02 Sec 0);
+# 03 F3 found no target that beats it (results/oracle_verdict.md), so `oracle_fit` was not added.
 privileged_source: effective
 
 platforms:
@@ -31,6 +34,7 @@ platforms:
     r7_epochs: {kalnn_twomass_id: 208, lnn_twomass_id: 135, kalnn_twomass: 208, kalnn_tau_res: 52, default: 150}
     decimation: 4                 # Sec 2.4: one checkpoint for the 500 Hz simulation and the 125 Hz real files
     decimation_p: 0.5
+    identified_lr_scale: 0.5      # 04 C2: halved for the identified classes; the r7 classes keep theirs
 
 # Sec 5.  kind: teacher | phys | student | r7_residual | r7_twomass.  A student loads J1's seed of the same index
 # (Sec 2.7) unless own_teacher (J9's MLP backbone and J10's q_dq residual need their own teacher).

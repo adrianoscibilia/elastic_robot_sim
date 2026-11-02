@@ -635,6 +635,7 @@ class SignalPolicy:
 
 #: The link-friction background as a declared experimental axis (`R5_07` T-16).
 LINK_FRICTION_TIERS = ("off", "fixed", "per_robot")
+TRANSMISSION_ERROR_TIERS = ("fixed", "te_randomised")
 
 
 def _log_uniform(rng: np.random.Generator, bracket: tuple[float, float], size: int) -> np.ndarray:
@@ -702,6 +703,15 @@ class PlantExtrasSampling:
     transmission_error_amplitude: tuple[float, ...] = ()
     transmission_error_order: tuple[float, ...] = (1.0,)
     transmission_error_random_phase: bool = True
+    #: ``fixed``: the amplitude above, as written (rounds 6-8).  ``te_randomised``
+    #: (`identified_filter/05` D1): that amplitude is the datasheet bound, and per
+    #: robot and joint the order-2n line draws ``amplitude x amplitude_factor`` and an
+    #: order-n line (``order / 2``) draws ``amplitude x amplitude_n_factor``, log-uniformly.
+    transmission_error_tier: str = "fixed"
+    transmission_error_amplitude_factor: tuple[float, float] = (1.0, 1.0)
+    transmission_error_amplitude_n_factor: tuple[float, float] = (0.0, 0.0)
+    #: Why the tier's range, copied to the contract's ``te_tier``.
+    transmission_error_justification: str = ""
     #: ``explicit`` (rounds 4-5) or ``implicit`` (`R6_00` Sec 3; see
     #: ``torque_runners._ImplicitLinkFriction``).  Same law, same magnitudes.
     link_friction_integration: str = "explicit"
@@ -743,6 +753,19 @@ class PlantExtrasSampling:
             raise ValueError("plant_extras.link_friction.integration must be 'explicit' or 'implicit'")
         if any(float(v) < 0.0 for v in self.transmission_error_amplitude):
             raise ValueError("plant_extras.transmission_error.amplitude must be non-negative")
+        if self.transmission_error_tier not in TRANSMISSION_ERROR_TIERS:
+            raise ValueError(
+                f"plant_extras.transmission_error.tier must be one of {TRANSMISSION_ERROR_TIERS}, "
+                f"got {self.transmission_error_tier!r}"
+            )
+        if self.transmission_error_tier == "te_randomised":
+            for name in ("amplitude_factor", "amplitude_n_factor"):
+                low, high = (float(v) for v in getattr(self, f"transmission_error_{name}"))
+                if low <= 0.0 or high < low:
+                    raise ValueError(f"plant_extras.transmission_error.{name} must be a positive "
+                                     "[low, high] bracket with low <= high")
+            if not self.has_transmission_error:
+                raise ValueError("plant_extras.transmission_error.tier: te_randomised needs the bound as amplitude")
 
     @property
     def has_link_friction(self) -> bool:
@@ -948,6 +971,8 @@ class DatasetConfig:
     reseed: tuple = ()
     #: Build only these ``(tier, trajectory index)`` bags; every draw is still the full build's.
     only_bags: tuple | None = None
+    #: ``(tier, trajectory index)`` bags left out: no feasible trajectory in any try (`identified_filter/03` F1).
+    excluded_bags: tuple = ()
 
     @property
     def is_round6(self) -> bool:
@@ -1064,7 +1089,8 @@ _STIFFNESS_NONLINEARITY_KEYS = {
 _TORQUE_RIPPLE_KEYS = {"amplitude", "order", "random_phase", "provenance"}
 
 
-_TRANSMISSION_ERROR_KEYS = {"amplitude", "order", "random_phase", "provenance"}
+_TRANSMISSION_ERROR_KEYS = {"amplitude", "order", "random_phase", "provenance", "tier", "amplitude_factor",
+                            "amplitude_n_factor", "justification"}
 
 
 _MOTOR_FRICTION_KEYS = {"viscous_fraction", "coulomb_fraction", "epsilon", "per_robot", "provenance"}
@@ -1202,6 +1228,10 @@ def _plant_extras_sampling(extras_cfg: Mapping[str, Any], *, round6: bool = Fals
         transmission_error_amplitude=tuple(float(v) for v in np.atleast_1d(error_cfg.get("amplitude", []) or [])),
         transmission_error_order=tuple(float(v) for v in np.atleast_1d(error_cfg.get("order", 1.0))),
         transmission_error_random_phase=bool(error_cfg.get("random_phase", True)),
+        transmission_error_tier=str(error_cfg.get("tier", "fixed")),
+        transmission_error_amplitude_factor=tuple(float(v) for v in error_cfg.get("amplitude_factor", (1.0, 1.0))),
+        transmission_error_amplitude_n_factor=tuple(float(v) for v in error_cfg.get("amplitude_n_factor", (0.0, 0.0))),
+        transmission_error_justification=str(error_cfg.get("justification", "")),
         link_friction_integration=str(friction_cfg.get("integration", "implicit" if round6 else "explicit")),
     )
 

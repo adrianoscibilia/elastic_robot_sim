@@ -17,7 +17,10 @@ start after the deadline is skipped (``02_review_round2`` R2); a P1 stage always
 >= 50 GB free disk; ``nvidia-smi`` every 10 min; one line per finished job in ``results/progress.md``.
 Never writes outside the two repositories and ``REFACTOR_SPECS/identified_filter/``.  No commits.
 
-Settings live in ``config/campaigns/r8_campaign.yaml`` (CLI flags override).
+Settings live in ``config/campaigns/r8_campaign.yaml`` (CLI flags override).  r9 (``identified_filter/07``):
+``config/campaigns/r9_campaign.yaml`` with ``--config``; its ``filter:`` block switches the identified classes to the
+step-2 filter (tangent spring, URDF inertia x alpha, zeta damping), and ``deadline: null`` means the plan's time +
+``deadline_hours``.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -43,6 +47,9 @@ CONFIG = SIM / "config" / "campaigns" / "r8_campaign.yaml"
 RESULTS = SIM / "REFACTOR_SPECS" / "identified_filter" / "results"
 SIM_PY = ["uv", "run", "--project", str(SIM), "python"]
 NN_PY = ["uv", "run", "--project", str(NN), "python"]
+#: dynamic_model_nn's ``model_workflow``: a stage aborted at the zero predictor, and that predictor's share (04 C2).
+STAGE_ABORT_EXIT = 3
+ZERO_PREDICTOR_SHARE = 0.95
 
 
 def load_settings(path: Path = CONFIG) -> dict:
@@ -71,7 +78,13 @@ def progress(step: str, platform: str = "", seeds: str = "", result: str = "", h
 
 
 def deadline_of(settings: dict) -> dt.datetime:
-    return dt.datetime.fromisoformat(settings["deadline"])
+    """The owner's deadline, or (``deadline: null``, 07 Sec 2) the plan's creation + ``deadline_hours``."""
+    if settings.get("deadline"):
+        return dt.datetime.fromisoformat(settings["deadline"])
+    path = RESULTS / "campaign_plan.json"
+    if path.exists():
+        return dt.datetime.fromisoformat(json.loads(path.read_text())["deadline"])
+    return dt.datetime.now() + dt.timedelta(hours=float(settings.get("deadline_hours", 36.0)))
 
 
 # ------------------------------------------------------------------------- data ---
@@ -136,6 +149,9 @@ def datasets_report(settings: dict) -> None:
                 lines.append(f"| {row['joint']} | {row['f_n_min_hz']:.2f} | {row['f_n_max_hz']:.1f} | "
                              f"{row['f_lo_hz']:.2f} | {row['f_hi_hz']:.1f} | {row['resolvable']} |")
         lines.append("")
+    # 03 F3: the oracle-fit diagnosis and the target it chose (tools/r8_oracle_diagnosis.py; bags off the old build).
+    lines += [(RESULTS / name).read_text(encoding="utf-8") for name in ("oracle_verdict.md", "oracle_diagnosis.md")
+              if (RESULTS / name).exists()]
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "datasets.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -179,6 +195,49 @@ def contract_kwargs(settings: dict, platform: str) -> dict:
             "zeta_max": [max(1.0, 1.5 * j["damping_ratio_range"][1]) for j in joints]}
 
 
+_STEP2_CACHE: dict = {}
+
+
+def step2_kwargs(settings: dict, platform: str) -> dict:
+    """The step-2 filter's constructor kwargs (07 Sec 2) from the settings' ``filter:`` block and the platform's
+    config and asset; ``{}`` without the block (r8).
+
+    The catalogue curve the plant uses (``spring_factors`` per joint, ``spring_knees`` in torque), the warm-start
+    cutoff 0.5 x the lowest main-joint f_n of the band table (07 S1 (iii)) and the bare URDF's chain table.
+    """
+    block = settings.get("filter")
+    if not block:
+        return {}
+    if platform not in _STEP2_CACHE:
+        sys.path[:0] = [str(SIM / "src"), str(SIM / "scripts")]
+        import numpy as np
+
+        from diagnose_controller_modes import _load_asset
+        from elastic_sim.dataset import load_config, torque_knees
+        from elastic_sim.inertia_table import chain_table
+
+        config = load_config(platform_paths(settings, platform)["config"])
+        asset = _load_asset(config.asset)
+        n = len(asset.joint_names)
+        effort = np.asarray([np.inf if j.effort is None else j.effort for j in asset.resolve_active_joints()])
+        factors = np.atleast_2d(np.asarray(config.plant_extras.stiffness_factors, dtype=float))
+        knees = np.atleast_2d(torque_knees(config.plant_extras, effort))
+        main = set(settings["platforms"][platform]["main_joints"])
+        cutoff = float(block.get("warm_cutoff_ratio", 0.5)) * min(
+            float(row["f_n_min_hz"]) for row in config.round8.band if row["joint"] in main)
+        table = chain_table(asset, check_samples=0)
+        table.pop("check")
+        _STEP2_CACHE[platform] = {
+            "spring": block.get("spring", "tangent"), "inertia": "urdf", "damping": "zeta",
+            "spring_factors": np.broadcast_to(factors, (n, factors.shape[1])).tolist(),
+            "spring_knees": np.broadcast_to(knees, (n, knees.shape[1])).tolist(),
+            "spring_warm_cutoff_hz": cutoff, "urdf_chain": table,
+            "alpha_range": list(block.get("alpha_range", [0.7, 1.4])),
+            "stiffness_widening": float(block.get("stiffness_widening", 1.0)),
+            "inertia_prefit_steps": int(block.get("inertia_prefit_steps", 500)), "lambda_inertia": None}
+    return copy.deepcopy(_STEP2_CACHE[platform])
+
+
 def privileged_source(settings: dict, platform: str) -> str:
     import pyarrow.parquet as pq
 
@@ -189,7 +248,7 @@ def privileged_source(settings: dict, platform: str) -> str:
 
 def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
     """One dict per stage of ``job`` on ``platform``: class, kwargs, overrides, init (by stage name)."""
-    runs, _ = r7_runs(settings, platform)
+    runs, defaults = r7_runs(settings, platform)
     kw = contract_kwargs(settings, platform)
     spec = settings["platforms"][platform]
     kan = {k: v for k, v in (runs["kalnn_twomass"].get("model_kwargs") or {}).items() if k.startswith("kan_")}
@@ -203,10 +262,15 @@ def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
                                            "reference_inertia", "damping_range", "input_lowpass_hz")}
         kwargs.update(coupling=settings["coupling"], integrator="trapezoidal", filter_param=filter_param,
                       decimation=decimation, **(kan if backbone == "kalnn" else {}))
+        kwargs.update(step2_kwargs(settings, platform))
         kwargs.update(extra)
         overrides = dict(runs[base]["training_overrides"], epochs=epochs, early_stopping_patience=patience,
                          selection="val", resume=True, privileged_source=privileged_source(settings, platform),
-                         decimation_p=float(spec.get("decimation_p", 0.0)) if decimation > 1 else 0.0)
+                         decimation_p=float(spec.get("decimation_p", 0.0)) if decimation > 1 else 0.0,
+                         grad_clip_norm=settings.get("grad_clip_norm"), fail_fast_epochs=settings.get("fail_fast_epochs"))
+        # 04 C2: the identified classes only; the r7 comparison classes keep their r7 training.
+        overrides["learning_rate"] = float(overrides.get("learning_rate", defaults["learning_rate"])) \
+            * float(spec.get("identified_lr_scale", 1.0))
         return {"class_path": f"{base}_id.LagrangianNN", "model_kwargs": kwargs, "overrides": overrides}
 
     def student(teacher_stage, backbone="kalnn", s_selection="val_param", **extra):
@@ -259,6 +323,36 @@ def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
 def model_path(settings: dict, job: str, platform: str, seed: int, stage: str) -> Path:
     # The file name carries job and platform: dynamic_model_nn keys its loss files on the basename.
     return NN / "models" / settings["run_id"] / job / platform / f"{job}_{platform}_s{seed}_{stage}.pt"
+
+
+def teacher_of(job_name: str, stage: dict) -> tuple[str, str] | None:
+    """``(job, stage)`` of the teacher a stage initialises from; ``None`` for a stage continuing its own student."""
+    init = stage.get("init")
+    if init is None or init == "S":
+        return None
+    return (job_name, "T") if init == "T" else (init, "T")
+
+
+def teacher_failure(run: Path, job_name: str, platform: str, seed: int, stage: dict) -> str | None:
+    """04 C3: why this stage's teacher can't initialise a student, or ``None``.
+
+    A teacher fails when it left no result, or its best val RMSE stayed within 5 % of the zero predictor's.
+    A run predating ``val_zero_rmse`` is not judged on the second count.
+    """
+    teacher = teacher_of(job_name, stage)
+    if teacher is None:
+        return None
+    done = stage_done(run, teacher[0], platform, seed, teacher[1])
+    if not done.exists():
+        return f"teacher {teacher[0]} s{seed} left no result"
+    row = json.loads(done.read_text())
+    try:
+        best, zero = float(row["best_val_rmse"]), float(row["val_zero_rmse"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if best >= ZERO_PREDICTOR_SHARE * zero:
+        return f"teacher {teacher[0]} s{seed} stayed at the zero predictor (val {best:.4g} vs {zero:.4g})"
+    return None
 
 
 def checkpoint_of(path: Path) -> Path:
@@ -316,6 +410,14 @@ def nvidia_logger(run: Path, stop: threading.Event) -> None:
         stop.wait(600)
 
 
+def stage_timeout_s(settings: dict, estimate_h: float) -> float:
+    """Per-stage timeout.  The plan's estimate is one seed alone on the GPU; the queue runs ``parallel_seeds``
+    at once, so scale by it, and never below ``min_stage_timeout_h`` (default 12 h): the epoch cap, not the
+    timeout, bounds a healthy training (2026-10-31: 1.5 x the one-seed estimate killed all three J1 seeds)."""
+    scaled = 1.5 * float(estimate_h) * max(1, int(settings.get("parallel_seeds", 1)))
+    return 3600.0 * max(scaled, float(settings.get("min_stage_timeout_h", 12.0)))
+
+
 def run_stage(settings: dict, run: Path, job_name: str, job: dict, platform: str, seed: int, stage: dict,
               dataset: Path, timeout_s: float, epochs: int | None = None) -> dict | None:
     done = stage_done(run, job_name, platform, seed, stage["name"])
@@ -331,10 +433,27 @@ def run_stage(settings: dict, run: Path, job_name: str, job: dict, platform: str
         with logfile.open("a") as out:
             out.write(f"\n=== attempt {attempt} {dt.datetime.now()}\n")
             out.flush()
+            # Own process group, so a timeout kills uv *and* the python trainer under it (2026-10-31: killing
+            # only uv left the trainers running beside the retry); unbuffered, so the log shows the epochs.
+            proc = subprocess.Popen(command, cwd=NN, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                                    env={**os.environ, "PYTHONUNBUFFERED": "1"})
             try:
-                code = subprocess.call(command, cwd=NN, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s)
+                code = proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 code = "timeout"
+                for sig, grace in ((signal.SIGTERM, 60), (signal.SIGKILL, 30)):
+                    try:
+                        os.killpg(proc.pid, sig)
+                    except ProcessLookupError:
+                        break
+                    try:
+                        proc.wait(timeout=grace)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+        if code == STAGE_ABORT_EXIT:
+            log(run, f"FAIL  {job_name} {platform} s{seed} {stage['name']}: at the zero predictor, not retried ({logfile})")
+            break
         if code == 0 and summary.exists():
             row = next(csv.DictReader(summary.open()))
             row.update(wall_s=time.time() - started, attempt=attempt)
@@ -343,6 +462,7 @@ def run_stage(settings: dict, run: Path, job_name: str, job: dict, platform: str
                 done.write_text(json.dumps(row, indent=1))
             return row
         log(run, f"FAIL  {job_name} {platform} s{seed} {stage['name']} attempt {attempt}: {code} ({logfile})")
+    done.parent.mkdir(parents=True, exist_ok=True)   # a job's first stage may never have finished
     (done.with_suffix(".failed")).write_text(str(code))
     return None
 
@@ -358,7 +478,8 @@ def evaluate_job(settings: dict, run: Path, job_name: str, platform: str, rows: 
         for name in ("production", "gainshift", "oop", "modal"):
             if not paths[name].exists():
                 continue
-            for privileged in ([False, True] if row.get("base_name", "").endswith("_T") else [False]):
+            # 04 C4: the chirp file has no verification, so no K_eff, D_eff for the privileged path to read.
+            for privileged in ([False, True] if row.get("base_name", "").endswith("_T") and name != "modal" else [False]):
                 tag = f"{platform}-{name}" + ("-privileged" if privileged else "")
                 marker = out_dir / f"{tag}-s{seed}.done"
                 if marker.exists():
@@ -420,9 +541,13 @@ def cmd_run(settings: dict, args) -> int:
                             log(run, f"SKIP  {job_name} {platform} s{seed} {stage['name']}: would start after the "
                                      f"deadline {deadline}")
                             return
+                        failure = teacher_failure(run, job_name, platform, seed, stage)
+                        if failure:
+                            log(run, f"SKIP  {job_name} {platform} s{seed} {stage['name']}: {failure}")
+                            return
                         estimate = estimates.get((job_name, platform, stage["name"]), {}).get("hours", 12.0)
                         row = run_stage(settings, run, job_name, job, platform, seed, stage, dataset,
-                                        timeout_s=1.5 * estimate * 3600)
+                                        timeout_s=stage_timeout_s(settings, estimate))
                         if row is None:
                             return
                     results[seed] = row
@@ -553,12 +678,16 @@ def cmd_plan(settings: dict, args) -> int:
                                    "expected_epochs": expected, "hours": hours, "seeds": seeds,
                                    "wall_hours": hours * passes, "smoke_ok": row is not None})
     start = dt.datetime.now()
-    deadline = deadline_of(settings)
+    deadline = dt.datetime.fromisoformat(settings["deadline"]) if settings.get("deadline") \
+        else start + dt.timedelta(hours=float(settings.get("deadline_hours", 36.0)))
     dropped, reasons, total = schedule(stages_out, start, deadline, settings["run_id"])
-    plan = {"created": start.isoformat(timespec="minutes"), "deadline": settings["deadline"],
+    plan = {"created": start.isoformat(timespec="minutes"), "deadline": deadline.isoformat(timespec="minutes"),
+            "deadline_source": "owner" if settings.get("deadline") else f"plan + {settings.get('deadline_hours', 36)} h",
             "parallel_seeds": settings["parallel_seeds"], "total_hours": total, "dropped": dropped,
             "dropped_reasons": reasons,
             "fits": start + dt.timedelta(hours=total) <= deadline, "stages": stages_out}
+    if settings.get("filter"):
+        plan["selector_cost"] = selector_cost(settings, run, stages_out)
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "campaign_plan.json").write_text(json.dumps(plan, indent=1), encoding="utf-8")
     print(f"plan: {total:.1f} h at {settings['parallel_seeds']} parallel seeds; dropped {dropped or 'none'}; "
@@ -566,10 +695,32 @@ def cmd_plan(settings: dict, args) -> int:
     return 0 if all(s["smoke_ok"] for s in stages_out) else 1
 
 
+def selector_cost(settings: dict, run: Path, stages_out: list[dict]) -> dict:
+    """07 S1.4: per platform, the teacher's smoke s/epoch with the fixed-point selector against one pass."""
+    out = {}
+    for job_name, job in settings["jobs"].items():
+        if job["kind"] != "teacher":
+            continue
+        for platform in settings["platforms"]:
+            stage = copy.deepcopy(stage_runs(settings, job, platform)[0])
+            stage["model_kwargs"]["spring_passes"] = 1
+            stage["name"] = "T1pass"
+            smoke_settings = copy.deepcopy(settings)
+            smoke_settings["run_id"] = settings["run_id"] + "-smoke"
+            row = run_stage(smoke_settings, run / "smoke", job_name, job, platform, 0, stage,
+                            smoke_subset(settings, platform, run), timeout_s=3600, epochs=2)
+            one = float(row["seconds_per_epoch"]) if row and row.get("seconds_per_epoch") else float("nan")
+            fixed = next((s["smoke_seconds_per_epoch"] for s in stages_out
+                          if s["job"] == job_name and s["platform"] == platform and s["stage"] == "T"), float("nan"))
+            out[platform] = {"job": job_name, "fixed_point_seconds_per_epoch": fixed, "one_pass_seconds_per_epoch": one,
+                             "ratio": fixed / one if one == one and one > 0 else float("nan")}
+    return out
+
+
 # -------------------------------------------------------------------------- all ---
 
 def cmd_all(settings: dict, args) -> int:
-    """R1: data -> datasets.md -> plan -> run, unattended.  Only a data failure that leaves no contract stops it."""
+    """R1: data -> datasets.md -> plan -> run, unattended.  It stops only when no platform has a contract."""
     run = run_dir(settings)
     steps = (("data", cmd_data), ("plan", cmd_plan), ("run", cmd_run))
     for name, step in steps:
@@ -582,13 +733,18 @@ def cmd_all(settings: dict, args) -> int:
         hours = (time.time() - started) / 3600
         log(run, f"all: {name} exit {code} ({hours:.2f} h)")
         progress(f"all: {name}", result=f"exit {code}", hours=hours)
-        if name == "data" and code != 0:
-            missing = [p for p in settings["platforms"]
-                       if not platform_paths(settings, p)["production"].with_suffix(".contract.json").exists()]
-            if missing:
+        if name == "data":
+            # 03 F5: train what exists.  A platform whose build failed is logged and skipped.
+            built = {p: spec for p, spec in settings["platforms"].items()
+                     if platform_paths(settings, p)["production"].with_suffix(".contract.json").exists()}
+            missing = sorted(set(settings["platforms"]) - set(built))
+            if not built:
                 log(run, f"STOP  all: no r8 production contract for {missing}; nothing to train")
                 return 1
-            log(run, "all: data failed on some file but every production contract exists; going on")
+            if missing:
+                log(run, f"SKIP  all: no r8 production contract for {missing}; training on {sorted(built)}")
+                progress("all: skipped", platform=" ".join(missing), result="no production contract")
+            settings = {**settings, "platforms": built}
         if name == "plan" and code != 0:
             # The plan's smoke failures are in campaign_plan.json `dropped`; the queue runs the rest.
             log(run, "all: plan reported smoke failures (dropped in campaign_plan.json); going on")
@@ -612,20 +768,18 @@ def _quiet(command: list[str]) -> subprocess.CompletedProcess | None:
 
 
 def sleep_guard() -> tuple[list[str] | None, str]:
-    """R3: ``(prefix, message)``: the systemd-inhibit prefix when polkit allows it, ``[]`` when the sleep
-    targets are masked, ``None`` (refuse) otherwise."""
-    probe = _quiet(INHIBIT + ["true"]) if shutil.which("systemd-inhibit") else None
-    if probe is not None and probe.returncode == 0:
-        return INHIBIT, "sleep: systemd-inhibit allowed; the unit runs under it"
+    """R3: ``(prefix, message)``.  ``[]`` when the sleep targets are masked (the only reliable guard on peepo),
+    ``None`` (refuse) otherwise.  ``systemd-inhibit`` is not used: polkit allows it from the desktop terminal
+    but denies it inside a ``systemd-run --user`` unit, which has no session (2026-10-30: the unit failed
+    with "Failed to inhibit: Access denied")."""
     states = {}
     for target in SLEEP_TARGETS:
         out = _quiet(["systemctl", "show", "-p", "LoadState", "--value", target])
         states[target] = out.stdout.strip() if out is not None else "unknown"
-    why = (probe.stderr.strip().splitlines() or ["refused"])[-1] if probe is not None else "not available"
     if all(state == "masked" for state in states.values()):
-        return [], f"sleep: systemd-inhibit {why}; the sleep targets are masked: OK"
-    return None, (f"sleep: systemd-inhibit {why}, and the sleep targets are not all masked ({states}).\n"
-                  f"  mask them with:  sudo systemctl mask {' '.join(SLEEP_TARGETS)}")
+        return [], "sleep: the sleep targets are masked: OK"
+    return None, (f"sleep: the sleep targets are not all masked ({states}); systemd-inhibit cannot be used "
+                  f"inside the --user unit.\n  mask them with:  sudo systemctl mask {' '.join(SLEEP_TARGETS)}")
 
 
 def linger_check() -> str:
@@ -644,8 +798,10 @@ def cmd_launch(settings: dict, args) -> int:
     print(sleep_message)
     print(linger_check())
     step = "run" if args.only_run else "all"
+    uv = shutil.which("uv") or "uv"
     command = ["systemd-run", "--user", f"--unit={unit}", "--collect", f"--working-directory={SIM}",
-               "--property=KillSignal=SIGTERM", *(prefix or []), *SIM_PY, str(Path(__file__).resolve()), step,
+               "--property=KillSignal=SIGTERM", f"--setenv=PATH={os.environ.get('PATH', '')}",
+               *(prefix or []), uv, *SIM_PY[1:], str(Path(__file__).resolve()), step,
                "--config", str(Path(args.config).resolve())]
     print(" ".join(command))
     print(f"unit: {unit}\nwatch: journalctl --user -u {unit} -f\n       python scripts/r8_campaign.py status\n"
