@@ -275,3 +275,65 @@ def test_r9_step2_kwargs_carry_the_plant_curve_the_warm_cutoff_and_the_urdf(camp
     assert kwargs["stiffness_widening"] == 1.0 and kwargs["alpha_range"] == [0.7, 1.4]
     assert set(r9["jobs"]) == {"J1", "J2", "J3", "J11", "J5"} and r9["privileged_source"] == "sampled"
     assert r9["results_dir"] != r8.get("results_dir")
+
+
+def test_nothing_starts_after_stop_at_whatever_the_priority(campaign, monkeypatch):
+    """09 Sec 2: past the hard stop no stage starts, P1 included, and the final sweep still runs."""
+    started, sweep = [], []
+
+    def fake_stage(settings, run, job_name, job, platform, seed, stage, dataset, timeout_s, epochs=None):
+        started.append(job_name)
+        return {"rmse": "1.0", "checkpoint_path": "x"}
+
+    monkeypatch.setattr(campaign, "run_stage", fake_stage)
+    monkeypatch.setattr(campaign, "stage_runs", lambda s, j, p: [{"name": "T"}])
+    monkeypatch.setattr(campaign, "evaluate_job", lambda *a: None)
+    monkeypatch.setattr(campaign, "nvidia_logger", lambda run, stop: None)
+    monkeypatch.setattr(campaign, "free_gb", lambda path: 1e6)
+    monkeypatch.setattr(campaign, "platform_paths", lambda s, p: {k: Path(f"missing-{k}.parquet") for k in
+                                                                  ("production", "gainshift")})
+    monkeypatch.setattr(campaign.subprocess, "call", lambda command, **kw: sweep.append(command) or 0)
+    settings = {"run_id": "t", "deadline": "2999-01-01T00:00", "stop_at": "2000-01-01T00:00", "parallel_seeds": 1,
+                "seeds": [0], "min_free_gb": 50, "platforms": {"ur10": {}}, "jobs": {"J1": {"priority": 1}}}
+    assert campaign.cmd_run(settings, types.SimpleNamespace(job=None)) == 0
+    assert started == []
+    log = (campaign.run_dir(settings) / "campaign.log").read_text()
+    assert "SKIP  J1 ur10 s0 T: would start after stop_at 2000-01-01 00:00:00" in log
+    assert any("run_real_eval.sh" in " ".join(map(str, c)) for c in sweep)
+    assert any("r8_summary.py" in " ".join(map(str, c)) for c in sweep)
+
+
+def test_a_running_stage_gets_stop_at_and_a_capped_wait_and_no_retry_after_it(campaign, monkeypatch, tmp_path):
+    seen = []
+
+    class Killed:
+        pid = 1
+
+        def __init__(self, command, **kwargs):
+            seen.append(kwargs["env"][campaign.STOP_AT_ENV])
+
+        def wait(self, timeout=None):
+            seen.append(timeout)
+            return 1
+
+    run = campaign.run_dir({})
+    monkeypatch.setattr(campaign.subprocess, "Popen", Killed)
+    monkeypatch.setattr(campaign, "write_chain", lambda *a: tmp_path / "chain.yaml")
+    soon = (dt.datetime.now() + dt.timedelta(hours=2)).replace(microsecond=0)
+    settings = {"stop_at": soon.isoformat(), "stop_grace_h": 0.5}
+    assert campaign.run_stage(settings, run, "J1", {}, "ur10", 0, {"name": "T"}, Path("x"), 10 * 3600.0) is None
+    assert seen[0] == soon.isoformat()
+    assert 2.4 * 3600 < seen[1] <= 2.5 * 3600        # stop_at + the grace, not the 10 h timeout
+    assert len(seen) == 4                             # before stop_at a failed stage is still retried once
+    past = {"stop_at": "2000-01-01T00:00"}
+    seen.clear()
+    campaign.run_stage(past, run, "J1", {}, "ur10", 0, {"name": "T"}, Path("x"), 10 * 3600.0)
+    assert seen[1] == 60.0 and len(seen) == 2       # the floor, and no second attempt
+    assert "no retry after stop_at" in (run / "campaign.log").read_text()
+    assert campaign.capped_timeout_s({}, 123.0) == 123.0
+
+
+def test_r9_config_has_the_09_deadline_and_hard_stop(campaign):
+    settings = campaign.load_settings(SCRIPT.parents[1] / "config" / "campaigns" / "r9_campaign.yaml")
+    assert campaign.stop_at_of(settings) == dt.datetime(2026, 11, 4, 11, 0)
+    assert dt.datetime.fromisoformat(settings["deadline"]) == dt.datetime(2026, 11, 4, 6, 0)

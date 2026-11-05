@@ -11,13 +11,18 @@ phase0/, real/}`` and writes ``results/SUMMARY.md`` plus figures under ``results
 4. Phase 0 (0a-0d) and the r8 0c rerun; 5-6. old and new real files; 7. figures; 8. a claims table
    with its evidence column left for the reader (supported / not supported is the owner's call).
 
-    python scripts/r8_summary.py [--run-id r8-campaign]
+    python scripts/r8_summary.py [--run-id r8-campaign] [--config config/campaigns/r8_campaign.yaml]
+
+r9 (``identified_filter/09`` Sec 3): ``--config`` (default: ``config/campaigns/<rN>_campaign.yaml`` of the run id,
+when it exists) sets the results folder (``results_dir``); with a ``filter:`` block the summary adds the deployed
+seed per job and the 04 B4 table on the gated joint-regimes (06 Sec 1.3), the other joint-regimes in a second table.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +34,19 @@ FINAL_STAGES = ("J", "T", "P", "R")   # r8_real_eval: the last stage a job's see
 JOB_NAMES = {"J1": "2M-KALNN-T (teacher, privileged)", "J2": "2M-KALNN-PHYS", "J3": "2M-KALNN-ID",
              "J4": "KALNN residual (r7)", "J5": "2M-KALNN (r7 config)", "J6": "J3, lambda_p = 0",
              "J7": "J3, lambda_delta = 0", "J8": "J3, causal encoder", "J9": "2M-LNN-ID", "J10": "J3, q_dq residual",
-             "J11": "KALNN residual + 2.1 + 2.2"}
+             "J11": "KALNN residual + 2.1 + 2.2",
+             # identified_filter/10: the LNN (MLP) counterparts and the r7-config residual on r9.
+             "J12": "LNN residual + 2.1 + 2.2", "J13": "LNN residual (r7)", "J14": "2M-LNN-PHYS",
+             "J15": "2M-LNN (r7 config)"}
+
+
+#: 06 Sec 1.3 (07 Sec 2): the joint-regimes the physics gate passed; B4 is read on these only.
+GATED = {("iiwa_drive", "iiwa_A2", "full"), ("ur10", "shoulder_lift_joint", "full"),
+         ("ur10", "shoulder_lift_joint", "real_like"), ("ur10", "elbow_joint", "full")}
+#: 04 B4's thresholds.
+B4_CORR, B4_FN, B4_RIGID = 0.7, 0.25, 0.9
+#: The B4 rows: the identified jobs, the r7 two-mass; J11 (R) is the accuracy reference.
+B4_JOBS = ("J1", "J2", "J3", "J5", "J14", "J15")
 
 
 def _read(path):
@@ -192,10 +209,154 @@ def band_figure(table: pd.DataFrame, out: Path) -> list[str]:
     return [str(path.relative_to(RESULTS))]
 
 
+def campaign_settings(run_id: str, config: str | None) -> tuple[dict, Path | None]:
+    """The campaign's settings: ``--config``, else ``config/campaigns/<rN>_campaign.yaml`` of ``rN-campaign``."""
+    import yaml
+
+    path = Path(config) if config else SIM / "config" / "campaigns" / f"{run_id.split('-')[0]}_campaign.yaml"
+    if not path.is_absolute():
+        path = SIM / path
+    return (yaml.safe_load(path.read_text(encoding="utf-8")), path) if path.exists() else ({}, None)
+
+
+def rigid_per_bag(settings: dict, platform: str) -> pd.DataFrame:
+    """Per test bag and joint of the production file, the nominal rigid model's RMSE on the scored rows.
+
+    The contract's ``rigid`` baseline (bare URDF RNEA at the recorded q, dq; ddq the consumer's SG derivative; rows
+    with ``t - t_bag_start >= exclude_head_s``), per bag instead of pooled over the split, so it can be read per
+    joint-regime.  Cached as ``rigid_per_bag_<platform>.csv`` beside the summary.
+    """
+    cache = RESULTS / f"rigid_per_bag_{platform}.csv"
+    if cache.exists():
+        return pd.read_csv(cache)
+    sys.path[:0] = [str(SIM / "src"), str(SIM / "scripts")]
+    import r8_campaign
+    from diagnose_controller_modes import _load_asset
+    from elastic_sim import identification as idn
+    from elastic_sim.dataset import load_config
+    from elastic_sim.diagnostics import savitzky_golay_acceleration
+
+    paths = r8_campaign.platform_paths(settings, platform)
+    contract = json.loads(paths["production"].with_suffix(".contract.json").read_text(encoding="utf-8"))
+    priors = contract["transmission_priors"]
+    joints = [j["joint"] for j in priors["joints"]]
+    head = float(contract["baselines"]["two_mass"]["exclude_head_s"])
+    step = float(priors["sample_time_step"])
+    window = int(contract["differentiation"]["sg_window"])
+    pin, model, data = idn.build_model(_load_asset(load_config(paths["config"]).asset))
+    n = len(joints)
+    columns = ["bag", "t", "split", "probe_regime", *[f"{p}{j}" for p in ("q", "dq", "ft") for j in range(n)]]
+    frame = pd.read_parquet(paths["production"], columns=columns)
+    rows = []
+    for bag, part in frame[frame["split"] == "test"].groupby("bag", sort=False):
+        q, dq, ft = (part[[f"{p}{j}" for j in range(n)]].to_numpy(float) for p in ("q", "dq", "ft"))
+        ddq = savitzky_golay_acceleration(dq, step, window=window)
+        t = part["t"].to_numpy(float)
+        kept = (t - t[0]) >= head - 1e-9
+        rigid = np.asarray([idn.inverse_dynamics(pin, model, data, q[i], dq[i], ddq[i]) for i in np.flatnonzero(kept)])
+        error = rigid - ft[kept]
+        for j, name in enumerate(joints):
+            rows.append({"bag": bag, "joint_name": name, "regime": part["probe_regime"].iloc[0],
+                         "rmse": float(np.sqrt(np.mean(error[:, j] ** 2)))})
+    out = pd.DataFrame(rows)
+    out.to_csv(cache, index=False)
+    return out
+
+
+def _pooled(rmse: pd.Series) -> float:
+    """RMS over bags of the per-bag RMSE (bags of one file have about the same length)."""
+    return float(np.sqrt(np.mean(np.square(rmse)))) if len(rmse) else float("nan")
+
+
+def _corr_log(est, truth) -> float:
+    ok = np.isfinite(est) & np.isfinite(truth) & (est > 0) & (truth > 0)
+    if ok.sum() < 3 or np.std(np.log(est[ok])) == 0 or np.std(np.log(truth[ok])) == 0:
+        return float("nan")
+    return float(np.corrcoef(np.log(est[ok]), np.log(truth[ok]))[0, 1])
+
+
+def b4_tables(run: Path, settings: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """``(deployed, gated, other)``: the deployed seed per job and platform, and 04 B4 per joint-regime.
+
+    Per job (its deployed seed, on the production test bags; the teacher J1 with its privileged evaluation):
+    the escape flag at the selected epoch (the final stage's ``escape_at_best``), corr(log K_hat_0, log K_0) and
+    median |f_n_hat / f_n - 1| on the observable bags, and the RMSE against R (J11) and 0.9 x rigid.
+    """
+    deployed = pd.DataFrame(deployed_checkpoints(run).values())
+    if not len(deployed):
+        return deployed, pd.DataFrame(), pd.DataFrame()
+    escape = {}
+    for _, entry in deployed.iterrows():
+        for stage in FINAL_STAGES:
+            done = run / "jobs" / entry["job"] / entry["platform"] / f"{entry['seed']}_{stage}.done.json"
+            if done.exists():
+                row = json.loads(done.read_text())
+                value = row.get("escape_at_best")
+                try:
+                    escape[(entry["job"], entry["platform"])] = json.loads(value) if isinstance(value, str) else value
+                except json.JSONDecodeError:
+                    escape[(entry["job"], entry["platform"])] = None
+                deployed.loc[_, "stage"] = stage
+                deployed.loc[_, "stopped_at"] = row.get("stopped_at")
+                break
+    chosen = set(deployed["checkpoint"])
+
+    def per_bag(job, platform, privileged=False):
+        tag = f"{platform}-production" + ("-privileged" if privileged else "")
+        frame = _read(run / "eval" / job / f"{tag}.per_bag.csv")
+        return frame[frame["checkpoint"].isin(chosen)] if len(frame) and "checkpoint" in frame else frame
+
+    rows = []
+    for platform in settings.get("platforms", {}):
+        reference = per_bag("J11", platform)
+        try:
+            rigid = rigid_per_bag(settings, platform)
+        except Exception as error:  # noqa: BLE001  (reported in the table, the summary still writes)
+            print(f"rigid per bag {platform}: {type(error).__name__}: {error}", file=sys.stderr)
+            rigid = pd.DataFrame(columns=["bag", "joint_name", "regime", "rmse"])
+        for job in B4_JOBS:
+            frame = per_bag(job, platform, privileged=job == "J1")
+            if not len(frame):
+                continue
+            flagged = escape.get((job, platform))
+            for (joint, regime), part in frame.groupby(["joint_name", "regime"], dropna=False):
+                index = int(part["joint"].iloc[0])
+                observable = part[part["observable"] > 0.5] if "observable" in part else part.iloc[:0]
+                ref = reference[(reference["joint_name"] == joint) & (reference["regime"] == regime)] \
+                    if len(reference) else reference
+                rig = rigid[(rigid["joint_name"] == joint) & (rigid["regime"] == regime)]
+                rmse, r_rmse, rigid_rmse = _pooled(part["rmse"]), _pooled(ref["rmse"]) if len(ref) else float("nan"), \
+                    _pooled(rig["rmse"])
+                corr = _corr_log(observable["K_hat"].to_numpy(float), observable["K_true"].to_numpy(float)) \
+                    if "K_hat" in observable else float("nan")
+                f_n = float(np.nanmedian(np.abs(observable["f_n_hat"] / observable["f_n_true"] - 1))) \
+                    if "f_n_hat" in observable and len(observable) else float("nan")
+                rows.append({"platform": platform, "joint": joint, "regime": regime, "job": job,
+                             "model": JOB_NAMES.get(job, job), "bags": len(part), "observable_bags": len(observable),
+                             "escape_at_selected": None if flagged is None else index in flagged,
+                             "corr_logK": corr, "med_fn_relerr": f_n, "rmse": rmse, "rmse_R": r_rmse,
+                             "rmse_rigid": rigid_rmse, "vs_R": rmse / r_rmse if r_rmse == r_rmse else float("nan"),
+                             "vs_rigid": rmse / rigid_rmse if rigid_rmse == rigid_rmse else float("nan"),
+                             "B4_ident": bool(corr >= B4_CORR and f_n <= B4_FN),
+                             "B4_accuracy": bool(rmse <= r_rmse and rmse <= B4_RIGID * rigid_rmse),
+                             "gated": (platform, joint, regime) in GATED})
+    table = pd.DataFrame(rows)
+    if not len(table):
+        return deployed, table, table
+    table["B4_no_escape"] = table["escape_at_selected"].eq(False)
+    gated, other = table[table["gated"]].drop(columns="gated"), table[~table["gated"]].drop(columns="gated")
+    return deployed, gated, other
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-id", default="r8-campaign")
+    parser.add_argument("--config", default=None, help="the campaign settings (default: the run id's, if any)")
     args = parser.parse_args(argv)
+    global RESULTS
+    settings, config = campaign_settings(args.run_id, args.config)
+    if settings.get("results_dir"):
+        RESULTS = SIM / settings["results_dir"]
     run = SIM / "runs" / args.run_id
     figures = RESULTS / "figures"
     figures.mkdir(parents=True, exist_ok=True)
@@ -218,6 +379,22 @@ def main(argv=None) -> int:
         lines += ["", f"Failures / skips ({len(fails)}):", ""] + [f"* `{f}`" for f in fails[:60]]
     if (RESULTS / "datasets.md").exists():
         lines += ["", "Datasets: see `datasets.md`."]
+
+    if settings.get("filter"):
+        deployed, gated, other = b4_tables(run, settings)
+        lines += ["", "## r9: deployed seed per job (validation selection) and 04 B4", "",
+                  f"Settings `{config.relative_to(SIM) if config else '?'}`. The deployed seed is the final stage's "
+                  "best validation RMSE; `stopped_at` marks a stage ended by the hard stop (09 Sec 2).", ""]
+        lines.append(markdown(deployed.round(4)) if len(deployed) else "pending")
+        lines += ["", "### B4 on the gated joint-regimes (06 Sec 1.3: iiwa A2 `full`; UR10 lift `full`, `real_like`; "
+                      "UR10 elbow `full`)", "",
+                  f"Production test bags. Identification on the observable bags: corr(log K_hat_0, log K_0) >= {B4_CORR}"
+                  f", median |f_n_hat / f_n - 1| <= {B4_FN:.0%}. Accuracy: RMSE <= R (J11) and <= {B4_RIGID} x rigid "
+                  "(the bare URDF, per bag). Escape: the flag at the selected epoch. J1 is scored with the true K_0 "
+                  "(privileged).", ""]
+        lines.append(markdown(gated.round(3)) if len(gated) else "pending")
+        lines += ["", "### The non-gated joint-regimes (reported, not judged)", ""]
+        lines.append(markdown(other.round(3)) if len(other) else "pending")
 
     sim = simulated_table(run)
     lines += ["", "## 2. Simulated (test / gain-shift / out-of-prior / modal files)", ""]

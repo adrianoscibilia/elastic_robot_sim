@@ -13,7 +13,10 @@
 Everything is resumable: a stage whose ``done.json`` exists is skipped and a killed training resumes
 from its last epoch (``training_overrides.resume``).  Per-stage timeout: 1.5 x the plan's estimate;
 a failed or timed-out stage is retried once, then logged and the queue goes on.  A P2/P3 stage that would
-start after the deadline is skipped (``02_review_round2`` R2); a P1 stage always runs.  Before each job:
+start after the deadline is skipped (``02_review_round2`` R2); a P1 stage always runs, up to ``stop_at``
+(``identified_filter/09`` Sec 2, the hard stop): no stage starts after it, a running training ends at its next
+epoch boundary with its best-val weights (``$TRAIN_STOP_AT``, ``model_workflow.past_stop_at``), and the final
+sweep still runs.  Before each job:
 >= 50 GB free disk; ``nvidia-smi`` every 10 min; one line per finished job in ``results/progress.md``.
 Never writes outside the two repositories and ``REFACTOR_SPECS/identified_filter/``.  No commits.
 
@@ -75,6 +78,31 @@ def progress(step: str, platform: str = "", seeds: str = "", result: str = "", h
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"| {dt.datetime.now():%a %H:%M} | {step} | {platform} | {seeds} | {result} | "
                      f"{'' if hours is None else f'{hours:.2f}'} |\n")
+
+
+#: dynamic_model_nn's ``model_workflow.STOP_AT_ENV``.
+STOP_AT_ENV = "TRAIN_STOP_AT"
+
+
+def stop_at_of(settings: dict) -> dt.datetime | None:
+    """09 Sec 2: the hard stop, ``None`` without one."""
+    return dt.datetime.fromisoformat(str(settings["stop_at"])) if settings.get("stop_at") else None
+
+
+def past_stop_at(settings: dict) -> bool:
+    stop_at = stop_at_of(settings)
+    return stop_at is not None and dt.datetime.now() >= stop_at
+
+
+def capped_timeout_s(settings: dict, timeout_s: float) -> float:
+    """The stage's timeout, cut to ``stop_at`` + ``stop_grace_h`` (default 1 h): the trainer ends itself at the
+    first epoch boundary past ``stop_at`` and still tests and saves; the grace covers that epoch and the test
+    pass, and only a training still running after it is killed."""
+    stop_at = stop_at_of(settings)
+    if stop_at is None:
+        return timeout_s
+    left = (stop_at - dt.datetime.now()).total_seconds() + 3600.0 * float(settings.get("stop_grace_h", 1.0))
+    return max(60.0, min(timeout_s, left))
 
 
 def deadline_of(settings: dict) -> dt.datetime:
@@ -287,7 +315,8 @@ def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
     if kind == "teacher":
         return [dict(phys("privileged", lambda_param=0.0), name="T")]
     if kind == "phys":
-        return [dict(phys("KD", lambda_param=0.0), name="P")]
+        # identified_filter/10: ``backbone: lnn`` gives 2M-LNN-PHYS (the MLP Lagrangian under the same filter).
+        return [dict(phys("KD", job.get("backbone", "kalnn"), lambda_param=0.0), name="P")]
     if kind == "student":
         extra = dict(job.get("model_kwargs") or {})
         teacher = job.get("teacher", "J1")
@@ -301,21 +330,23 @@ def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
         backbone = extra.pop("backbone", "kalnn")
         s_selection = "val" if float(extra.get("lambda_param", 1.0)) == 0.0 else "val_param"
         return stages + student(teacher, backbone, s_selection, **extra)
+    # identified_filter/10: ``backbone: lnn`` selects the r7 chain's LNN (MLP) entry and class.
+    prefix = "kalnn" if job.get("backbone", "kalnn") == "kalnn" else "lnn"
     if kind == "r7_residual":
-        run = runs["kalnn_tau_res"]
+        run = runs[f"{prefix}_tau_res"]
         kwargs = dict(run.get("model_kwargs") or {}, **(job.get("model_kwargs") or {}))
         overrides = dict(run["training_overrides"], epochs=epochs, early_stopping_patience=patience, selection="val",
                          resume=True)
-        return [{"name": "R", "class_path": "kalnn_tau_res.LagrangianNN", "model_kwargs": kwargs,
+        return [{"name": "R", "class_path": f"{prefix}_tau_res.LagrangianNN", "model_kwargs": kwargs,
                  "overrides": overrides}]
     if kind == "r7_twomass":
-        run = runs["kalnn_twomass"]
+        run = runs[f"{prefix}_twomass"]
         kwargs = dict(run.get("model_kwargs") or {})
         kwargs.update({k: kw[k] for k in ("time_step", "burn_in_s", "stiffness_range", "damping_ratio_range",
                                           "zeta_max")}, coupling=settings["coupling"], integrator="trapezoidal")
         overrides = dict(run["training_overrides"], epochs=epochs, early_stopping_patience=patience, selection="val",
                          resume=True)
-        return [{"name": "R", "class_path": "kalnn_twomass.LagrangianNN", "model_kwargs": kwargs,
+        return [{"name": "R", "class_path": f"{prefix}_twomass.LagrangianNN", "model_kwargs": kwargs,
                  "overrides": overrides}]
     raise ValueError(f"unknown job kind {kind!r}")
 
@@ -428,7 +459,13 @@ def run_stage(settings: dict, run: Path, job_name: str, job: dict, platform: str
     command = NN_PY + [str(NN / "train_chain_from_config.py"), "--config", str(chain), "--seeds", str(seed),
                        "--summary-out", str(summary)] + (["--epochs", str(epochs)] if epochs else [])
     logfile = chain.with_suffix(".log")
+    stop_at = stop_at_of(settings)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", STOP_AT_ENV: stop_at.isoformat() if stop_at else ""}
+    code = None
     for attempt in (1, 2):
+        if attempt > 1 and past_stop_at(settings):
+            log(run, f"SKIP  {job_name} {platform} s{seed} {stage['name']}: no retry after stop_at {stop_at}")
+            break
         started = time.time()
         with logfile.open("a") as out:
             out.write(f"\n=== attempt {attempt} {dt.datetime.now()}\n")
@@ -436,9 +473,9 @@ def run_stage(settings: dict, run: Path, job_name: str, job: dict, platform: str
             # Own process group, so a timeout kills uv *and* the python trainer under it (2026-10-31: killing
             # only uv left the trainers running beside the retry); unbuffered, so the log shows the epochs.
             proc = subprocess.Popen(command, cwd=NN, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
-                                    env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                                    env=env)
             try:
-                code = proc.wait(timeout=timeout_s)
+                code = proc.wait(timeout=capped_timeout_s(settings, timeout_s))
             except subprocess.TimeoutExpired:
                 code = "timeout"
                 for sig, grace in ((signal.SIGTERM, 60), (signal.SIGKILL, 30)):
@@ -456,7 +493,10 @@ def run_stage(settings: dict, run: Path, job_name: str, job: dict, platform: str
             break
         if code == 0 and summary.exists():
             row = next(csv.DictReader(summary.open()))
-            row.update(wall_s=time.time() - started, attempt=attempt)
+            row.update(wall_s=time.time() - started, attempt=attempt, stopped_at=past_stop_at(settings))
+            if row["stopped_at"]:
+                log(run, f"STOP  {job_name} {platform} s{seed} {stage['name']}: ended at stop_at {stop_at} "
+                         f"(best epoch {row.get('best_epoch')})")
             if epochs is None:
                 done.parent.mkdir(parents=True, exist_ok=True)
                 done.write_text(json.dumps(row, indent=1))
@@ -513,7 +553,8 @@ def cmd_run(settings: dict, args) -> int:
     stop = threading.Event()
     threading.Thread(target=nvidia_logger, args=(run, stop), daemon=True).start()
     deadline = deadline_of(settings)
-    log(run, f"queue start: run {settings['run_id']}, parallel seeds {settings['parallel_seeds']}, deadline {deadline}")
+    log(run, f"queue start: run {settings['run_id']}, parallel seeds {settings['parallel_seeds']}, deadline {deadline}, "
+             f"stop_at {stop_at_of(settings)}")
     try:
         for job_name, job in sorted(settings["jobs"].items(), key=lambda kv: (kv[1]["priority"], kv[0])):
             if args.job and job_name not in args.job:
@@ -535,6 +576,11 @@ def cmd_run(settings: dict, args) -> int:
                 def one_seed(seed):
                     row = None
                     for stage in stages:
+                        # 09 Sec 2: nothing starts after the hard stop, whatever the priority.
+                        if past_stop_at(settings) and not stage_done(run, job_name, platform, seed, stage["name"]).exists():
+                            log(run, f"SKIP  {job_name} {platform} s{seed} {stage['name']}: would start after "
+                                     f"stop_at {stop_at_of(settings)}")
+                            return
                         # R2: a P2/P3 stage that would start after the deadline is skipped; P1 always runs.
                         if job["priority"] > 1 and dt.datetime.now() >= deadline and \
                                 not stage_done(run, job_name, platform, seed, stage["name"]).exists():

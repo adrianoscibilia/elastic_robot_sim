@@ -5,7 +5,9 @@ run_id: r9-campaign
 unit: r9-campaign                 # systemd --user unit of `launch`
 data_root: data/identification/r9
 results_dir: REFACTOR_SPECS/identified_filter/results/r9   # r8's campaign_plan.json and progress.md stay as they are
-deadline: null                    # 07 Sec 2: the owner's; otherwise the plan's time + deadline_hours
+deadline: "2026-11-04T06:00"      # 09 Sec 2: the owner's (P2 stages do not start after it; the plan sizes to it)
+stop_at: "2026-11-04T11:00"       # 09 Sec 2: the hard stop for the Wed 14:00 lab; no stage starts after it, a running
+                                  # training ends at its next epoch (best-val weights kept), the final sweep still runs
 deadline_hours: 36
 parallel_seeds: 3                 # 07 S1.4: 2 seeds for P, R, R7 (J2, J11, J5) if the plan does not fit 36 h at 3
 seeds: [0, 1, 2]

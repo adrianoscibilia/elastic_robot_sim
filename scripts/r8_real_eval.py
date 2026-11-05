@@ -13,7 +13,7 @@
   then the models' zero-shot K_hat, D_hat and diag M_phi on the same file beside it.
 
 A result is skipped when its marker (checkpoint x file SHA-256) exists.  Output under
-``REFACTOR_SPECS/identified_filter/results/real/``.
+``REFACTOR_SPECS/identified_filter/results/real/`` (a run whose settings name a ``results_dir``: ``<results_dir>/real/``).
 """
 
 from __future__ import annotations
@@ -115,12 +115,19 @@ def evaluate(entry: dict, file_id: str, path: Path, dry_run: bool, head_s: float
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--run-id", default="r8-campaign")
+    parser.add_argument("--run-id", default="r9-campaign")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-old", action="store_true", help="only the files of real_files.yaml")
-    parser.add_argument("--config", default=str(r8_campaign.CONFIG), help="the campaign settings")
+    parser.add_argument("--config", default=None,
+                        help="the campaign settings (default: config/campaigns/<rN>_campaign.yaml of the run id)")
     args = parser.parse_args(argv)
-    settings = r8_campaign.load_settings(Path(args.config))
+    # 09 Sec 3: the run's own settings (its data, burn-in, jobs) and results folder, r8's otherwise.
+    config = Path(args.config) if args.config else \
+        SIM / "config" / "campaigns" / f"{args.run_id.split('-')[0]}_campaign.yaml"
+    settings = r8_campaign.load_settings(config if config.exists() else r8_campaign.CONFIG)
+    global OUT
+    if settings.get("results_dir"):
+        OUT = SIM / settings["results_dir"] / "real"
     OUT.mkdir(parents=True, exist_ok=True)
     checkpoints = final_checkpoints(args.run_id)
     if not checkpoints:

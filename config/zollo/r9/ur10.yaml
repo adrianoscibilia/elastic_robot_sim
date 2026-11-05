@@ -1,0 +1,52 @@
+# identified_filter/10 (2026-11-04): Zollo et al. A-pc on the r9 datasets, simulation only.
+# config/zollo/ur10.yaml (r7) with the r9 dataset, no real files, no trace figure, its own output folder.
+# Run by scripts/r9_complete.sh: --variant A --transmission per_robot_transmission, then --files sim.
+# Zollo et al. (2015) model-based baseline, UR10 (REFACTOR_SPECS/model_based_baseline/01_zollo_plan.md).
+# Shared by scripts/zollo_identify.py and scripts/zollo_evaluate.py; CLI flags override.
+platform: ur10                   # the `variant` key of the r7 result CSVs
+dataset: data/identification/r9/ur10/ur10_table_round9.parquet
+splits: [train]                  # identification data: the LNNs' training split only (plan Sec 2 rule 1)
+
+identification:
+  variant: B                     # A: Zollo-faithful [0; u]; B: tau_J-supervised (the predictors' default)
+  transmission: pooled           # pooled: one K, D per joint (predictors); per_robot: recovery check (G2);
+                                 # per_robot_motor (A-pr, 04); per_robot_transmission (A-pc, 06: K, D, motor per robot)
+  include_rigid_tier: true       # B only: the rigid tier's link rows (it has no spring rows)
+  link_friction: true            # the simulator has link-side friction (00_recon Sec 2); Zollo has none
+  spring_damping: true           # the simulator has spring damping D; Zollo has none
+  coupling_terms: false          # the simulator is Spong's reduced model: no rotor-link coupling
+  epsilon_link: 1.0e-3           # Coulomb smoothing, as the simulator's link friction (<= 0: sign)
+  epsilon_motor: 1.0e-2          # as the simulator's motor friction
+  rank_tolerance: 1.0e-6         # Gram-Schmidt residual below which a scaled column is dependent
+  weighted: false                # weighted LS, rows scaled by their equation's residual RMS
+  ridge_to_nominal: 0.0          # > 0 only if M(q) is not positive definite (plan Sec 5.6)
+  consistent: null               # C2 (06): LS constrained to physically consistent inertials; null: A-pc only
+  consistency_epsilon: 1.0e-6    # J_i >= eps I per body, units of J (kg m^2, kg m, kg)
+  consistency_solver: CLARABEL   # cvxpy solver (SCS the fallback)
+
+preprocessing:
+  cutoff_hz: 45.0                # contract sg_cutoff_hz = probe top; 20 Hz would cut the elastic modes (00_recon Sec 2)
+  order: 5                       # Zollo's 5th-order Butterworth, zero phase here
+  difference: central            # central | forward (Zollo's first-order differences)
+  parallel_filter: true
+  decimate: 4                    # 500 Hz -> 125 Hz after filtering
+  edge_s: 0.05                   # trimmed at both bag ends (filter transients)
+  low_speed_fraction: 0.05       # friction rows dropped below this fraction of the joint's peak speed in the bag
+
+evaluation:
+  sim_split: test
+  real: {}                       # simulation first (owner, 2026-11-04)
+  burn_in_s: null                # null: the r9 contract's transmission_priors.burn_in_s
+  elastic:
+    max_omega_h: 0.5             # substeps so that omega_max h <= this for the highest identified mode
+    divergence_rad: 0.2
+    max_substeps: 200
+    rigid_update: substep
+  plots: {}                      # the r7 bag names do not exist in r9
+
+references:
+  lnn_sim: REFACTOR_SPECS/final_results/data/model_comparison_taufree.csv   # r7 LNN numbers, printed beside only (not r9)
+  real_rows: REFACTOR_SPECS/final_results/data/real_zero_shot_rows.csv
+  harness_tolerance: 1.0e-3      # the scorer must reproduce the harness's rigid-URDF numbers to this [N m]
+
+output_dir: reports/zollo/r9/ur10

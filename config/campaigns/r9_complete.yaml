@@ -1,0 +1,66 @@
+# identified_filter/10 (2026-11-04): complete the r9 simulated table before any real run.
+# The r9 campaign's settings (config/campaigns/r9_campaign.yaml), same run_id and results folder, so the finished
+# stages (J1, J2, J3, J5, J11: done.json) are skipped and the summary covers every job. Added: the LNN (MLP)
+# counterparts and the r7-config KALNN residual, so the table has KALNN and LNN for residual and two-mass:
+#   J4  KALNN residual (r7)          r7 inputs (q, dq), the paper's residual
+#   J12 LNN residual + 2.1 + 2.2     the friction-only residual r(dq_j), no base angle: J11's MLP twin
+#   J13 LNN residual (r7)            r7 inputs (q, dq)
+#   J14 2M-LNN-PHYS                  J2's filter (tangent spring, alpha M_URDF, zeta damping) on the MLP Lagrangian
+#   J15 2M-LNN (r7 config)           J5's MLP twin, for continuity (P2: skipped if it would start after `deadline`)
+run_id: r9-campaign
+unit: r9-complete
+data_root: data/identification/r9
+results_dir: REFACTOR_SPECS/identified_filter/results/r9
+deadline: "2026-11-05T10:00"      # P2 (J15) does not start after it
+stop_at: "2026-11-05T20:00"       # nothing starts after it; a running training ends at its next epoch
+deadline_hours: 36
+parallel_seeds: 3
+seeds: [0, 1, 2]
+epochs: 150
+patience: 20
+student_epochs: 40
+student_patience: 8
+grad_clip_norm: 1.0
+fail_fast_epochs: 10
+coupling: full
+min_free_gb: 50
+privileged_source: sampled
+
+filter:
+  spring: tangent
+  warm_cutoff_ratio: 0.5
+  alpha_range: [0.7, 1.4]
+  stiffness_widening: 1.0
+  inertia_prefit_steps: 500
+
+platforms:
+  iiwa_drive:
+    config: config/identification/kuka_lbr_iiwa_14_r820_table_drive_round9.yaml
+    stem: kuka_lbr_iiwa_14_r820_table_drive_round9
+    r7_chain: runs/r7-taufree-20261015-1231/chain-iiwa_drive-taufree.yaml
+    r7_epochs: {kalnn_twomass_id: 299, lnn_twomass_id: 109, kalnn_twomass: 299, kalnn_tau_res: 68, default: 200}
+    decimation: 1
+    main_joints: [iiwa_A1, iiwa_A2, iiwa_A4]
+  ur10:
+    config: config/identification/ur10_table_round9.yaml
+    stem: ur10_table_round9
+    r7_chain: runs/r7-taufree-20261015-1231/chain-ur10-taufree.yaml
+    r7_epochs: {kalnn_twomass_id: 208, lnn_twomass_id: 135, kalnn_twomass: 208, kalnn_tau_res: 52, default: 150}
+    decimation: 4
+    decimation_p: 0.5
+    identified_lr_scale: 0.5
+    main_joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint]
+
+jobs:
+  # finished in r9 (skipped by their done.json; kept so the summary and status list them)
+  J1:  {priority: 1, kind: teacher}
+  J2:  {priority: 1, kind: phys}
+  J3:  {priority: 1, kind: student}
+  J11: {priority: 1, kind: r7_residual, model_kwargs: {residual_inputs: dq_joint, drop_base_angle: true}}
+  J5:  {priority: 2, kind: r7_twomass}
+  # new (identified_filter/10)
+  J12: {priority: 1, kind: r7_residual, backbone: lnn, model_kwargs: {residual_inputs: dq_joint, drop_base_angle: true}}
+  J13: {priority: 1, kind: r7_residual, backbone: lnn}
+  J14: {priority: 1, kind: phys, backbone: lnn}
+  J4:  {priority: 1, kind: r7_residual}
+  J15: {priority: 2, kind: r7_twomass, backbone: lnn}
