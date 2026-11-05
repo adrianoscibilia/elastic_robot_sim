@@ -316,7 +316,16 @@ def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
         return [dict(phys("privileged", lambda_param=0.0), name="T")]
     if kind == "phys":
         # identified_filter/10: ``backbone: lnn`` gives 2M-LNN-PHYS (the MLP Lagrangian under the same filter).
-        return [dict(phys("KD", job.get("backbone", "kalnn"), lambda_param=0.0), name="P")]
+        # 11 B1: ``filter_param: none`` is the anchored residual, PHYS with the filter removed.
+        stage = dict(phys(job.get("filter_param", "KD"), job.get("backbone", "kalnn"), lambda_param=0.0), name="P")
+        if job.get("continue_from"):
+            # 11 B2: continue another phys job's seed from its selected weights, with this job's epoch budget.
+            stage.update(init=job["continue_from"], init_stage="P")
+            stage["overrides"]["init_keep_loss_weights"] = True
+        for key, override in (("epochs", "epochs"), ("patience", "early_stopping_patience")):
+            if key in job:
+                stage["overrides"][override] = int(job[key])
+        return [stage]
     if kind == "student":
         extra = dict(job.get("model_kwargs") or {})
         teacher = job.get("teacher", "J1")
@@ -344,11 +353,21 @@ def stage_runs(settings: dict, job: dict, platform: str) -> list[dict]:
         kwargs = dict(run.get("model_kwargs") or {})
         kwargs.update({k: kw[k] for k in ("time_step", "burn_in_s", "stiffness_range", "damping_ratio_range",
                                           "zeta_max")}, coupling=settings["coupling"], integrator="trapezoidal")
-        overrides = dict(run["training_overrides"], epochs=epochs, early_stopping_patience=patience, selection="val",
-                         resume=True)
-        return [{"name": "R", "class_path": f"{prefix}_twomass.LagrangianNN", "model_kwargs": kwargs,
-                 "overrides": overrides}]
+        overrides = dict(run["training_overrides"], epochs=int(job.get("epochs", epochs)),
+                         early_stopping_patience=int(job.get("patience", patience)), selection="val", resume=True)
+        stage = {"name": "R", "class_path": f"{prefix}_twomass.LagrangianNN", "model_kwargs": kwargs,
+                 "overrides": overrides}
+        if job.get("continue_from"):     # 11 B2 (J15x): continue another job's seed from its selected weights
+            stage.update(init=job["continue_from"], init_stage="R")
+            stage["overrides"]["init_keep_loss_weights"] = True
+        return [stage]
     raise ValueError(f"unknown job kind {kind!r}")
+
+
+def job_platforms(settings: dict, job: dict) -> list[str]:
+    """The settings' platforms, or the job's own ``platforms`` among them (11 B2: J15x on the iiwa only)."""
+    wanted = job.get("platforms")
+    return [p for p in settings["platforms"] if wanted is None or p in wanted]
 
 
 def model_path(settings: dict, job: str, platform: str, seed: int, stage: str) -> Path:
@@ -361,7 +380,7 @@ def teacher_of(job_name: str, stage: dict) -> tuple[str, str] | None:
     init = stage.get("init")
     if init is None or init == "S":
         return None
-    return (job_name, "T") if init == "T" else (init, "T")
+    return (job_name, "T") if init == "T" else (init, stage.get("init_stage", "T"))
 
 
 def teacher_failure(run: Path, job_name: str, platform: str, seed: int, stage: dict) -> str | None:
@@ -398,7 +417,7 @@ def write_chain(settings: dict, job_name: str, job: dict, platform: str, seed: i
     overrides = dict(stage["overrides"])
     if stage.get("init"):
         teacher_job = job_name if stage["init"] in ("S", "T") else stage["init"]
-        teacher_stage = stage["init"] if stage["init"] in ("S", "T") else "T"
+        teacher_stage = stage["init"] if stage["init"] in ("S", "T") else stage.get("init_stage", "T")
         overrides["init_from"] = str(checkpoint_of(model_path(settings, teacher_job, platform, seed, teacher_stage)))
     chain = {"defaults": {**{k: v for k, v in defaults.items() if k not in ("seeds", "dataset_file")},
                           "dataset_file": str(dataset), "summary_dir": str(run / "log"), "stop_on_error": True},
@@ -559,7 +578,7 @@ def cmd_run(settings: dict, args) -> int:
         for job_name, job in sorted(settings["jobs"].items(), key=lambda kv: (kv[1]["priority"], kv[0])):
             if args.job and job_name not in args.job:
                 continue
-            for platform in settings["platforms"]:
+            for platform in job_platforms(settings, job):
                 if f"{job_name}:{platform}" in dropped or job_name in dropped:
                     reason = reasons.get(f"{job_name}:{platform}", "past the deadline")
                     log(run, f"SKIP  {job_name} {platform}: dropped by the plan (Sec 4): {reason}")
@@ -701,7 +720,7 @@ def cmd_plan(settings: dict, args) -> int:
     run = run_dir(settings)
     stages_out = []
     for job_name, job in sorted(settings["jobs"].items(), key=lambda kv: (kv[1]["priority"], kv[0])):
-        for platform in settings["platforms"]:
+        for platform in job_platforms(settings, job):
             subset = smoke_subset(settings, platform, run)
             full_train = pd.read_parquet(platform_paths(settings, platform)["production"], columns=["bag", "split"]) \
                 .groupby("bag")["split"].first().eq("train").sum()
@@ -864,7 +883,7 @@ def cmd_launch(settings: dict, args) -> int:
 def cmd_status(settings: dict, args) -> int:
     run = run_dir(settings)
     for job_name, job in sorted(settings["jobs"].items(), key=lambda kv: (kv[1]["priority"], kv[0])):
-        for platform in settings["platforms"]:
+        for platform in job_platforms(settings, job):
             states = []
             for seed in job.get("seeds", settings["seeds"]):
                 for stage in ("T", "P", "R", "S", "J"):
@@ -881,7 +900,7 @@ def cmd_chains(settings: dict, args) -> int:
     run = run_dir(settings)
     for job_name in args.job or settings["jobs"]:
         job = settings["jobs"][job_name]
-        for platform in settings["platforms"]:
+        for platform in job_platforms(settings, job):
             for seed in job.get("seeds", settings["seeds"]):
                 for stage in stage_runs(settings, job, platform):
                     print(write_chain(settings, job_name, job, platform, seed, stage,

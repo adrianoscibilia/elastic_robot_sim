@@ -34,6 +34,7 @@ import numpy as np
 import yaml
 
 from . import frames
+from .scene_points import ScenePointsError, wall_box_from_entry
 from .probe import PROBE_SG_BOUND_FRACTION, resolve_probe_comb  # noqa: F401  (re-exported)
 
 SCHEMA = "erd.lab/1"
@@ -346,6 +347,12 @@ def _load_limits(raw: Mapping[str, Any], source: str) -> LimitsSpec:
 #: Semantic scene types this loader expands into boxes/cylinders (RR_01 S4).
 SEMANTIC_TYPES = ("floor", "ceiling", "wall", "table")
 PRIMITIVE_TYPES = ("box", "cylinder", "sphere", "mesh", "keep_out")
+#: Measured-point types (owner 2026-11-05): expanded into a plain ``box`` first, so the
+#: scene clearance treats them exactly like a hand-written box.
+#: * ``wall_from_points``: vertical wall through P1-P2, allowed side given by ``inside``
+#:   (``scene_points.wall_box_from_points``);
+#: * ``floor_box``: a 6 x 6 m (``size``) slab whose top face is at ``z_top`` [m].
+POINT_TYPES = ("wall_from_points", "floor_box")
 _DEFAULT_PLANE_SIZE = 10.0
 #: A mesh whose bounding box exceeds this is almost certainly a unit typo
 #: (m vs mm), so the loader refuses it (RR_01 S4 "Scene rules").
@@ -464,6 +471,24 @@ def _expand_object(raw: Mapping[str, Any], clearance: float, source: str) -> Sce
             (float(centre_xy[0]), float(centre_xy[1]), top_z - thickness / 2.0 + inflate),
             (0.0, 0.0, 0.0), source_type="table",
         )
+    if kind == "wall_from_points":
+        try:
+            wall = wall_box_from_entry(raw)
+        except ScenePointsError as exc:
+            raise ConfigError(f"{source}[{obj_id}]: {exc}") from exc
+        box = _expand_object({"id": obj_id, "type": "box", "size": wall["size"], "xyz": wall["xyz"],
+                              "rpy": wall["rpy"]}, clearance, source)
+        return replace(box, source_type="wall_from_points")
+    if kind == "floor_box":
+        unknown = sorted(set(raw) - {"id", "type", "z_top", "size", "thickness"})
+        if unknown:
+            raise ConfigError(f"{source}[{obj_id}]: unknown key(s) {unknown}")
+        z_top = float(_require(raw, "z_top", f"{source}[{obj_id}]"))
+        size = raw.get("size", (6.0, 6.0))
+        thickness = float(raw.get("thickness", 0.2))
+        box = _expand_object({"id": obj_id, "type": "box", "size": (float(size[0]), float(size[1]), thickness),
+                              "xyz": (0.0, 0.0, z_top - thickness / 2.0)}, clearance, source)
+        return replace(box, source_type="floor_box")
     if kind == "box" or kind == "keep_out":
         size = _require(raw, "size", f"{source}[{obj_id}]")
         xyz = _require(raw, "xyz", f"{source}[{obj_id}]")

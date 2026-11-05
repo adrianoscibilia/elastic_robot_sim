@@ -134,17 +134,25 @@ limits:                                 # inside KUKA's axis limits
   approach: {velocity: 0.25, acceleration: 0.5}  # FAST: was 0.1 / 0.2 (approaches were ~2/3 of the 18 min run)
   abort: {tracking_rad: 0.03, torque_fraction: 0.6, stop_timeout_s: 3.0}   # conservative; RR_01 S9
 
-scene:                                  # STIIMA-Milan lab: virtual floor + virtual wall (see header)
+scene:                                  # STIIMA-Milan lab: virtual floor + virtual wall from P1/P2 (2026-11-05)
   reviewed: false                       # RR_20: owner re-sets (unchanged from iiwa_fast.yaml)                       
   frame: iiwa_base
   clearance: 0.03
   objects:
-    # Virtual floor: top face at z = 0.066 (box 6 x 6 x 0.2 m below it).
-    - {id: floor_66mm, type: box, size: [6.0, 6.0, 0.2], xyz: [0.0, 0.0, -0.034]}
-    # Virtual wall through P1/P2: yaw = atan2(P2 - P1) = 0.621356 rad; the box's
-    # local +y face lies on the P1-P2 line, facing the robot (local +y = safe
-    # side, (-0.5821, 0.8131)); 6 m long, 0.2 m thick, z -1 .. 3 m.
-    - {id: wall_p1_p2, type: box, size: [6.0, 0.2, 4.0], xyz: [0.156075, -0.217995, 1.0], rpy: [0.0, 0.0, 0.621356]}
+    # MEASURED VALUES (owner, smartPAD, World = iiwa_base, Flange). Edit only these when
+    # the cell changes; the boxes are derived at load (erd_recording/scene_points.py) and
+    # equal the previous hand-computed ones (2026-11-05: yaw identical, centre < 0.05 mm).
+    # Virtual floor: top face at the points' height.
+    - {id: floor_66mm, type: floor_box, z_top: 0.066}                 # [m]; 6 x 6 x 0.2 m slab below it
+    # Virtual wall through P1-P2; the robot works on the side of `inside`.
+    - id: wall_p1_p2
+      type: wall_from_points
+      unit: mm                    # p1, p2, inside in mm (z ignored: the wall is vertical)
+      p1: [-363.89, -467.28, 66]
+      p2: [559.6, 193.9, 66]
+      inside: [-319, 459, 406]    # P_EX: any point of the allowed workspace
+      offset: 0.0                 # [m] wall face on the P1-P2 line
+      # defaults: thickness 0.2, length 6.0 (centred between P1 and P2), z [-1.0, 3.0] (all m)
   allowed_contacts: [[iiwa_link_0, floor_66mm], [iiwa_link_0, wall_p1_p2]]   # the fixed base sits below 66 mm, 123 mm from the wall line
 
 poses:                                  # 2026-10-08

@@ -500,6 +500,36 @@ record_iiwa --config <file> handoff --run-id <id> --split test --write    # appe
 (standstill, mount check) hands off its `raw.parquet`, `identification/raw.parquet`
 or `bag_standstill/` (`format:` says which). An id already listed is refused.
 
+## Scene from measured points (2026-11-05)
+
+The virtual walls are written as the points you measure, not as boxes:
+
+```yaml
+scene:
+  clearance: 0.03
+  objects:
+    - {id: floor_66mm, type: floor_box, z_top: 0.066}      # [m] top face; 6 x 6 x 0.2 m slab below it
+    - id: wall_p1_p2
+      type: wall_from_points
+      unit: mm                  # mm | m, for p1, p2, inside (a z coordinate is ignored)
+      p1: [-363.89, -467.28, 66]
+      p2: [559.6, 193.9, 66]
+      inside: [-319, 459, 406]  # any point of the allowed workspace: picks the side
+      offset: 0.0               # [m] wall face on the line (> 0: set back, away from `inside`)
+      # optional, m: thickness 0.2, length 6.0 (centred between P1 and P2), z [-1.0, 3.0]
+```
+
+* The loader (`erd_recording/scene_points.py`) turns each entry into the same
+  `box` as before, then applies `clearance` to it like any box.
+* Refused: P1 and P2 closer than 5 cm, `inside` within 1 cm of the line, an
+  unknown key or unit, a negative offset.
+* After changing the points, look at the scene with `erd_scene_view` before
+  any motion, as for any scene change. The lab file's `scene.reviewed` goes
+  back to `false` until you have.
+* The iiwa and UR10 probe files use this form. Their derived walls equal the
+  reviewed boxes of `iiwa_fast.yaml` / `ur10_fast.yaml` to 0.05 mm
+  (`test/test_scene_points.py`).
+
 ## UR10 on the real robot
 
 The procedure (laptop, cell, lab files, rungs, E-ur-4, datasets A and B) is

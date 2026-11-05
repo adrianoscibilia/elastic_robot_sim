@@ -59,6 +59,9 @@ for platform in iiwa_drive ur10; do
   cfg="config/zollo/r9/$platform.yaml"
   out="reports/zollo/r9/$platform"
   mkdir -p "$out"
+  if [ -f "$out/evaluation_identification_Apc_pooled.csv" ]; then
+    say "zollo $platform: evaluation already there, skipped"; continue
+  fi
   ident="$out/identification_Apc_pooled.json"
   timeout 6h "$UV" run python scripts/zollo_identify.py --config "$cfg" --variant A \
       --transmission per_robot_transmission >"$out/identify.log" 2>&1

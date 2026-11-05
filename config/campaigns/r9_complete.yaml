@@ -11,8 +11,8 @@ run_id: r9-campaign
 unit: r9-complete
 data_root: data/identification/r9
 results_dir: REFACTOR_SPECS/identified_filter/results/r9
-deadline: "2026-11-05T10:00"      # P2 (J15) does not start after it
-stop_at: "2026-11-05T20:00"       # nothing starts after it; a running training ends at its next epoch
+deadline: "2026-11-06T04:30"      # P2 (J15) does not start after it
+stop_at: "2026-11-06T10:30"       # nothing starts after it; a running training ends at its next epoch
 deadline_hours: 36
 parallel_seeds: 3
 seeds: [0, 1, 2]
@@ -64,3 +64,14 @@ jobs:
   J14: {priority: 1, kind: phys, backbone: lnn}
   J4:  {priority: 1, kind: r7_residual}
   J15: {priority: 2, kind: r7_twomass, backbone: lnn}
+  # identified_filter/11 Part B (2026-11-05): the filter on / off ablation and enough epochs for the LNN two-mass.
+  #   J16 KALNN anchored residual: PHYS (J2) with the filter removed (filter_param none): rigid Lagrangian with M_phi
+  #       pre-fitted to and anchored on M_URDF + the friction-only residual, no low-pass. J2 - J16 = the filter.
+  #   J17 LNN anchored residual: the same on the MLP Lagrangian (J14's twin).
+  #   J14x J14 continued from each seed's selected weights (same loss weights), 150 more epochs (300 in all),
+  #       patience 20, validation selection; J14's own done.json and evaluation stay as they are.
+  #   J15x J15 iiwa s2 (best epoch 131 of 150) continued the same way.
+  J16: {priority: 1, kind: phys, filter_param: none}
+  J17: {priority: 1, kind: phys, backbone: lnn, filter_param: none}
+  J14x: {priority: 1, kind: phys, backbone: lnn, continue_from: J14, epochs: 150, patience: 20}
+  J15x: {priority: 2, kind: r7_twomass, backbone: lnn, continue_from: J15, epochs: 150, patience: 20, platforms: [iiwa_drive], seeds: [2]}

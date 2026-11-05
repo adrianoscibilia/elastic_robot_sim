@@ -37,7 +37,10 @@ JOB_NAMES = {"J1": "2M-KALNN-T (teacher, privileged)", "J2": "2M-KALNN-PHYS", "J
              "J11": "KALNN residual + 2.1 + 2.2",
              # identified_filter/10: the LNN (MLP) counterparts and the r7-config residual on r9.
              "J12": "LNN residual + 2.1 + 2.2", "J13": "LNN residual (r7)", "J14": "2M-LNN-PHYS",
-             "J15": "2M-LNN (r7 config)"}
+             "J15": "2M-LNN (r7 config)",
+             # identified_filter/11 Part B: the anchored residuals (PHYS without the filter) and the continuations.
+             "J16": "KALNN anchored residual (PHYS, no filter)", "J17": "LNN anchored residual (PHYS, no filter)",
+             "J14x": "2M-LNN-PHYS, continued to 300 epochs", "J15x": "2M-LNN (r7 config), iiwa s2 continued"}
 
 
 #: 06 Sec 1.3 (07 Sec 2): the joint-regimes the physics gate passed; B4 is read on these only.
@@ -46,7 +49,7 @@ GATED = {("iiwa_drive", "iiwa_A2", "full"), ("ur10", "shoulder_lift_joint", "ful
 #: 04 B4's thresholds.
 B4_CORR, B4_FN, B4_RIGID = 0.7, 0.25, 0.9
 #: The B4 rows: the identified jobs, the r7 two-mass; J11 (R) is the accuracy reference.
-B4_JOBS = ("J1", "J2", "J3", "J5", "J14", "J15")
+B4_JOBS = ("J1", "J2", "J3", "J5", "J14", "J15", "J14x", "J15x")
 
 
 def _read(path):

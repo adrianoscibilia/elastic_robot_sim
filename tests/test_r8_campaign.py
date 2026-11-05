@@ -337,3 +337,22 @@ def test_r9_config_has_the_09_deadline_and_hard_stop(campaign):
     settings = campaign.load_settings(SCRIPT.parents[1] / "config" / "campaigns" / "r9_campaign.yaml")
     assert campaign.stop_at_of(settings) == dt.datetime(2026, 11, 4, 11, 0)
     assert dt.datetime.fromisoformat(settings["deadline"]) == dt.datetime(2026, 11, 4, 6, 0)
+
+
+def test_11_continuation_reads_the_named_stage_and_jobs_can_pick_platforms(campaign):
+    stage = {"name": "P", "init": "J14", "init_stage": "P"}
+    assert campaign.teacher_of("J14x", stage) == ("J14", "P")
+    assert campaign.teacher_of("J3", {"name": "S", "init": "J1"}) == ("J1", "T")
+    settings = {"platforms": {"iiwa_drive": {}, "ur10": {}}}
+    assert campaign.job_platforms(settings, {"platforms": ["iiwa_drive"]}) == ["iiwa_drive"]
+    assert campaign.job_platforms(settings, {}) == ["iiwa_drive", "ur10"]
+    settings = campaign.load_settings(SCRIPT.parents[1] / "config" / "campaigns" / "r9_complete.yaml")
+    for name in ("J16", "J17"):
+        (built,) = campaign.stage_runs(settings, settings["jobs"][name], "ur10")
+        assert built["model_kwargs"]["filter_param"] == "none" and "init" not in built
+    (built,) = campaign.stage_runs(settings, settings["jobs"]["J14x"], "ur10")
+    assert (built["init"], built["init_stage"], built["overrides"]["init_keep_loss_weights"]) == ("J14", "P", True)
+    run = campaign.run_dir(settings)
+    chain = campaign.yaml.safe_load(campaign.write_chain(settings, "J14x", settings["jobs"]["J14x"], "ur10", 1, built,
+                                                         Path("x.parquet"), run).read_text())
+    assert chain["runs"][0]["training_overrides"]["init_from"].endswith("J14/ur10/J14_ur10_s1_P_checkpoint.pt")

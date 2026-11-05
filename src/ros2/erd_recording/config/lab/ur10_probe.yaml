@@ -127,21 +127,28 @@ limits:                                 # A = the URSim-rehearsed values (ur10_s
   # -> e(1) = 18.17 + 1.25 x (18.17 - 4.10) = 35.8 mrad -> max(0.03, 2 x e(1)) = 71.5 mrad -> 0.075 (< 0.08 stop-and-ask).
   abort: {tracking_rad: 0.075, torque_fraction: 0.6, stop_timeout_s: 3.0}
 
-scene:                                  # UR_09 S7 (final, 2026-10-21 14:05)
+scene:                                  # UR_09 S7 (2026-10-21), written from P1/P2 (2026-11-05)
   reviewed: false                       # RR_20: owner re-sets (unchanged from ur10_fast.yaml)
   frame: base_link                      # NOT `base`: computed by FK from the taught joint angles (UR_09 S1)
   clearance: 0.03
   objects:
-    # Welding table top: the base sits on it, top face at z = 0 (6 x 6 m plane,
-    # outline not measured; conservative).
-    - {id: table_top, type: box, size: [6.0, 6.0, 0.2], xyz: [0.0, 0.0, -0.1]}
-    # Owner's boundary P1 = (-0.5386, 0.5249), P2 = (0.3488, -0.6662) m (flange
-    # centres of the taught poses, base_link); workspace direction (-0.8019,
-    # -0.5974), i.e. away from the window; the base axis is 0.118 m on the window
-    # side. GUARD wall parallel to it, face 0.45 m behind the line on the window
-    # side (beyond the arm's own body near the base): local +y = (-0.8019,
-    # -0.5974) faces the robot; 6 m long, 0.2 m thick, z -1 .. 3 m.
-    - {id: guard_behind, type: box, size: [6.0, 0.2, 4.0], xyz: [0.346176, 0.257910, 1.0], rpy: [0.0, 0.0, 2.211106]}
+    # MEASURED VALUES. Edit only these when the cell changes; the boxes are derived at
+    # load (erd_recording/scene_points.py) and equal the previous hand-computed ones
+    # (2026-11-05: yaw identical, centre < 0.05 mm).
+    # Welding table top: the base sits on it (6 x 6 m, outline not measured; conservative).
+    - {id: table_top, type: floor_box, z_top: 0.0}                    # [m]; 0.2 m slab below it
+    # Owner's boundary P1-P2 (flange centres of the taught poses, by FK, base_link).
+    # The base axis is 0.118 m on the window side of the line, so the wall is a GUARD
+    # set back behind the line (beyond the arm's own body near the base); poses, window
+    # and sweeps keep forearm, wrist and tool on the `inside` side.
+    - id: guard_behind
+      type: wall_from_points
+      unit: m
+      p1: [-0.5386, 0.5249]
+      p2: [0.3488, -0.6662]
+      inside: [-0.496, -0.369]    # any point of the workspace, away from the window (here: 0.5 m from the line's midpoint)
+      offset: 0.45                # [m] wall face 0.45 m behind the line, on the window side
+      # defaults: thickness 0.2, length 6.0 (centred between P1 and P2), z [-1.0, 3.0] (all m)
   # Base and shoulder sit on the table top inside the clearance.
   allowed_contacts: [[base_link_inertia, table_top], [shoulder_link, table_top]]
 

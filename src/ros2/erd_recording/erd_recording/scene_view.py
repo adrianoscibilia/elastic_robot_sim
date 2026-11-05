@@ -107,7 +107,7 @@ def scene_marker_specs(scene) -> list[dict[str, Any]]:
         if isinstance(obj, SceneBox):
             specs.append({**base, "ns": "planner_with_clearance", "shape": "cube",
                           "scale": tuple(obj.size), "rgba": red, "label": obj.id})
-            if obj.source_type in ("box", "keep_out"):
+            if obj.source_type in ("box", "keep_out", "wall_from_points", "floor_box"):  # inflated as boxes
                 raw = tuple(max(1e-3, s - 2.0 * clearance) for s in obj.size)
                 specs.append({**base, "ns": "declared", "shape": "cube", "scale": raw, "rgba": orange,
                               "label": None})
